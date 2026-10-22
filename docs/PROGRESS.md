@@ -12,18 +12,16 @@
 
 ## 当前：M0（进行中）
 
-工程地基与 spike 脚本已落地，**等 Windows 实机跑 spike**（步骤见 docs/spike-notes.md §1）。
+第 1 轮 Windows 实机 spike 已完成并整理（结论见 docs/spike-notes.md §2–§8），**等第 2 轮**（§9）。
 
-- [x] `pyproject.toml` + `uv.lock`（Python 3.11，hatchling，src 布局）、ruff、pytest、`CHANGELOG.md`
-- [x] `ci.yml`（ubuntu `lint` + windows `test`）、`dependabot.yml`（actions + uv 周更）
-- [x] `scripts/spike_common.py`：环境变量、脱敏、API 封装、SHA256 提取、`.runner` 解析、stdout 分类（临时正则）
-- [x] `scripts/spike_api.py`：6 个调用在 macOS 上全部通过（classic token）
-- [x] `scripts/spike_runner.py`：install / run / stop-test / procs / remove（仅 Windows，**尚未实机运行**）
-- [x] 私有测试仓库 `nablejohne/runnerdeck-sandbox`（手动触发的 `spike.yml`）
-- [ ] Windows 实机：注册、stdout 样本、5 种停止方式、执行中停止、自更新、两种移除路径
-- [ ] 样本进 `tests/fixtures/`，`classify_line` 换成真实正则，填完 spike-notes §3–§8
+- [x] 工程地基：pyproject / uv.lock / ruff / pytest / CHANGELOG / ci.yml / dependabot
+- [x] spike 脚本：`spike_api.py`、`spike_runner.py`、`spike_console_helper.py`（第 2 轮新增）
+- [x] 私有测试仓库 `nablejohne/runnerdeck-sandbox`
+- [x] 第 1 轮：注册、移除、stdout 真实样本、5 种停止方式 → 样本进 `tests/fixtures/`，`classify_line` 换成真实正则
+- [ ] 第 2 轮：执行中停止、helper 方式 Ctrl+Break、`.env` 执行策略修复、自更新、DELETE 兜底、`.runner` 样本、api fixtures
+- [ ] 填完 spike-notes §8，M0 收尾（评估是否需要调整 PLAN 的 M1/M2）
 
-验证：`uv run ruff check . && uv run ruff format --check . && uv run pytest`（18 passed）；GitHub CI 绿。
+验证：`uv run ruff check . && uv run ruff format --check . && uv run pytest`（22 passed）；GitHub CI 绿。
 
 ## 已完成
 
@@ -34,6 +32,11 @@
 - 创建公开仓库 https://github.com/nablejohne/RunnerDeck，许可证 GPLv3
 
 ## 决策与坑
+
+- 只有和 runner 共享控制台的 Ctrl+Break 能干净停止（11 秒 offline、可立即重启）；`CREATE_NO_WINDOW` 下静默无效；强杀会让旧会话残留约 3 分钟
+- `stdin=DEVNULL` 是硬性要求，否则 Ctrl+Break 会卡在“终止批处理操作吗(Y/N)?”
+- 个人电脑默认执行策略 Restricted，`shell: powershell` 步骤全部失败；候选修复是 runner `.env` 写 `PSExecutionPolicyPreference`
+- `config.cmd remove` 会删掉 `.runner`，必须先读出 `agentId`
 
 - M0 spike 辅助函数放在 `scripts/spike_common.py`，pytest 用 `pythonpath = ["scripts"]` 导入；M1 由 core/ 重写后删除这段配置
 - 下载 runner zip 用不带 Authorization 的独立 httpx client，避免把 PAT 发给 CDN

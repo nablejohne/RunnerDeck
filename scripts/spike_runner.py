@@ -15,6 +15,7 @@ Run from a normal console window (not pythonw); needs RUNNERDECK_TEST_PAT / RUNN
 Stop methods:
   ctrl_break         CTRL_BREAK_EVENT to the process group, child shares our console
   ctrl_break_hidden  same, but child started with CREATE_NO_WINDOW (what a tray app would do)
+  ctrl_break_helper  via spike_console_helper.py, which owns a hidden console shared with run.cmd
   kill_listener      TerminateProcess on Runner.Listener.exe only
   taskkill           taskkill /PID <cmd.exe> /T /F
   taskkill_soft      taskkill /PID <cmd.exe> /T (no /F)
@@ -68,7 +69,15 @@ DEFAULT_DIR = r"D:\runners\spike"
 DEFAULT_LABELS = "runnerdeck-spike"
 WORKFLOW_FILE = "spike.yml"
 CACHE_DIR = SPIKE_OUT / "cache"
-STOP_METHODS = ("ctrl_break", "ctrl_break_hidden", "kill_listener", "taskkill", "taskkill_soft")
+STOP_METHODS = (
+    "ctrl_break",
+    "ctrl_break_hidden",
+    "ctrl_break_helper",
+    "kill_listener",
+    "taskkill",
+    "taskkill_soft",
+)
+HELPER = Path(__file__).with_name("spike_console_helper.py")
 BATCH_PROMPTS = ("Terminate batch job", "终止批处理操作吗")
 
 
@@ -78,9 +87,9 @@ BATCH_PROMPTS = ("Terminate batch job", "终止批处理操作吗")
 class RunnerSession:
     """run.cmd child process with a reader thread that tees and classifies its output."""
 
-    def __init__(self, runner_dir: Path, hidden_console: bool, redact: Redactor) -> None:
+    def __init__(self, runner_dir: Path, console: str, redact: Redactor) -> None:
         self.runner_dir = runner_dir
-        self.hidden_console = hidden_console
+        self.console = console  # shared | hidden | helper
         self.redact = redact
         self.events: queue.Queue[tuple[float, RunnerEvent]] = queue.Queue()
         self.tail: collections.deque[str] = collections.deque(maxlen=2000)
@@ -93,19 +102,26 @@ class RunnerSession:
 
     def start(self) -> None:
         flags = subprocess.CREATE_NEW_PROCESS_GROUP
-        if self.hidden_console:
+        if self.console in ("hidden", "helper"):
             flags |= subprocess.CREATE_NO_WINDOW
+        if self.console == "helper":
+            # The helper owns a hidden console that run.cmd inherits; it relays our "stop".
+            cmd = [sys.executable, str(HELPER), str(self.runner_dir)]
+            stdin = subprocess.PIPE
+        else:
+            cmd = ["cmd.exe", "/c", "run.cmd"]
+            stdin = subprocess.DEVNULL
         SPIKE_OUT.mkdir(parents=True, exist_ok=True)
         self.t0 = time.monotonic()
         self.proc = subprocess.Popen(
-            ["cmd.exe", "/c", "run.cmd"],
+            cmd,
             cwd=self.runner_dir,
-            stdin=subprocess.DEVNULL,
+            stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             creationflags=flags,
         )
-        print(f"started run.cmd pid={self.proc.pid} hidden_console={self.hidden_console}")
+        print(f"started {cmd[-1]} pid={self.proc.pid} console={self.console}")
         print(f"logging to {self.log_base}.log / .raw")
         threading.Thread(target=self._read, daemon=True).start()
 
@@ -212,6 +228,11 @@ class RemotePoller(threading.Thread):
 def apply_stop(method: str, session: RunnerSession) -> str:
     assert session.proc
     pid = session.proc.pid
+    if method == "ctrl_break_helper":
+        assert session.proc.stdin
+        session.proc.stdin.write(b"stop\n")
+        session.proc.stdin.flush()
+        return f"wrote 'stop' to helper pid {pid}"
     if method.startswith("ctrl_break"):
         try:
             os.kill(pid, signal.CTRL_BREAK_EVENT)
@@ -372,6 +393,14 @@ def cmd_install(args: argparse.Namespace) -> int:
         print(f"agentId={info.get('agentId')} agentName={info.get('agentName')}")
         remote = find_runner(client, env, args.name)
         print(f"GitHub sees: {remote and {k: remote[k] for k in ('id', 'status', 'busy')}}")
+
+    env_file = target / ".env"
+    if env_file.exists():
+        print(f".env written by config.cmd:\n{env_file.read_text(encoding='utf-8')}")
+    if args.env:
+        with open(env_file, "a", encoding="utf-8") as f:
+            f.writelines(f"{pair}\n" for pair in args.env)
+        print(f"appended to .env: {args.env}")
     return 0
 
 
@@ -381,7 +410,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     redact = Redactor()
     redact.add(env.pat)
     runner_dir = Path(args.dir)
-    session = RunnerSession(runner_dir, hidden_console=args.console == "hidden", redact=redact)
+    session = RunnerSession(runner_dir, console=args.console, redact=redact)
     poller = RemotePoller(env, runner_name(runner_dir), session, args.poll)
     session.start()
     poller.start()
@@ -397,7 +426,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\nCtrl+C: stopping runner")
     if session.proc and session.proc.poll() is None:
-        method = "ctrl_break" if args.console == "shared" else "taskkill"
+        method = {"shared": "ctrl_break", "helper": "ctrl_break_helper"}.get(
+            args.console, "taskkill"
+        )
         print(apply_stop(method, session))
         if session.wait_exit(15) is None:
             print(f"still running, force cleanup killed {force_cleanup(session)}")
@@ -417,6 +448,8 @@ def cmd_stop_test(args: argparse.Namespace) -> int:
         console = "shared"
     elif args.method == "ctrl_break_hidden":
         console = "hidden"
+    elif args.method == "ctrl_break_helper":
+        console = "helper"
     else:
         console = args.console or "hidden"  # what the tray app will use
     result: dict = {
@@ -425,7 +458,7 @@ def cmd_stop_test(args: argparse.Namespace) -> int:
         "console": console,
         "during_job": args.during_job,
     }
-    session = RunnerSession(runner_dir, hidden_console=console == "hidden", redact=redact)
+    session = RunnerSession(runner_dir, console=console, redact=redact)
     poller = RemotePoller(env, name, session, args.poll)
     session.start()
     poller.start()
@@ -591,10 +624,17 @@ def main() -> int:
     p.add_argument("--name", default=f"{socket.gethostname()}-{repo}")
     p.add_argument("--labels", default=DEFAULT_LABELS)
     p.add_argument("--version", help="runner version without v, default latest")
+    p.add_argument(
+        "--env",
+        action="append",
+        metavar="KEY=VALUE",
+        help="append to the runner's .env (repeatable), "
+        "e.g. PSExecutionPolicyPreference=RemoteSigned",
+    )
     p.set_defaults(func=cmd_install)
 
     p = add("run")
-    p.add_argument("--console", choices=("shared", "hidden"), default="shared")
+    p.add_argument("--console", choices=("shared", "hidden", "helper"), default="shared")
     p.add_argument("--duration", type=float, default=0, help="auto stop after N seconds")
     p.add_argument("--poll", type=float, default=5)
     p.add_argument("--dispatch-seconds", type=int, default=0)

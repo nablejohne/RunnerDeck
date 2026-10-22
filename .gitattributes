@@ -1,0 +1,3 @@
+# Captured runner output must stay byte-for-byte (CRLF, GBK lines).
+tests/fixtures/** -text
+*.raw binary

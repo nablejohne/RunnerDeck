@@ -1,0 +1,12 @@
+已复制         1 个文件。
+
+√ Connected to GitHub
+
+Current runner version: '2.338.0'
+2026-10-22 08:09:45Z: Listening for Jobs
+2026-10-22 08:09:53Z: Running job: spike
+2026-10-22 08:10:02Z: Job spike completed with result: Failed
+Exiting...
+终止批处理操作吗(Y/N)? 
+"Runner listener exit with 0 return code, stop the service, no retry needed."
+"Exiting runner..."

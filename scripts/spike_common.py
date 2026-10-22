@@ -207,15 +207,23 @@ def read_runner_file(path: Path) -> dict:
 
 
 class RunnerEvent(NamedTuple):
-    kind: str  # idle | busy | completed
+    kind: str
     detail: str | None
 
 
-# Provisional patterns taken from the plan; M0 replaces them with what real output shows.
+# Taken from real run.cmd output (runner 2.338.0, see tests/fixtures/stdout/).
+# kinds: connected | conflict | reconnected | version | idle | busy | completed | stopping | exited
 _EVENT_PATTERNS = (
+    (re.compile(r"Connected to GitHub\s*$"), "connected"),
+    (re.compile(r"A session for this runner already exists"), "conflict"),
+    (re.compile(r"Runner reconnected\."), "reconnected"),
+    (re.compile(r"Current runner version: '(?P<detail>[\d.]+)'"), "version"),
     (re.compile(r"Listening for Jobs"), "idle"),
-    (re.compile(r"Running job:\s*(?P<job>.+?)\s*$"), "busy"),
+    (re.compile(r"Running job:\s*(?P<detail>.+?)\s*$"), "busy"),
     (re.compile(r"Job (?P<job>.+?) completed with result:\s*(?P<result>\w+)"), "completed"),
+    (re.compile(r"^Exiting\.\.\.\s*$"), "stopping"),
+    (re.compile(r"Runner listener exit with (?P<detail>-?\d+) return code"), "exited"),
+    (re.compile(r"Exiting after unknown error code: (?P<detail>-?\d+)"), "exited"),
 )
 
 
@@ -226,16 +234,21 @@ def classify_line(line: str) -> RunnerEvent | None:
             groups = m.groupdict()
             if kind == "completed":
                 return RunnerEvent(kind, f"{groups['job']}: {groups['result']}")
-            return RunnerEvent(kind, groups.get("job"))
+            return RunnerEvent(kind, groups.get("detail"))
     return None
 
 
-def decode_output(raw: bytes) -> str:
-    """Runner output is expected to be UTF-8; fall back to the console code page."""
+def decode_output(raw: bytes, fallback: str | None = None) -> str:
+    """Decode one line of run.cmd output.
+
+    Runner lines are UTF-8/ASCII, but cmd.exe's own messages ("已复制 1 个文件", the
+    Ctrl+Break "(Y/N)?" prompt) use the console code page (GBK on zh-CN).
+    """
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
-        return raw.decode("mbcs" if sys.platform == "win32" else "latin-1", errors="replace")
+        encoding = fallback or ("mbcs" if sys.platform == "win32" else "latin-1")
+        return raw.decode(encoding, errors="replace")
 
 
 def find_runner_processes(runner_dir: Path) -> list[Any]:

@@ -7,4 +7,5 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 - M0 spike scripts for the GitHub REST API and runner lifecycle (`scripts/spike_*.py`).
+- Real runner stdout and config samples under `tests/fixtures/`.
 - Project tooling: uv, ruff, pytest, GitHub Actions CI.

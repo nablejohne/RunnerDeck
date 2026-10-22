@@ -1,6 +1,7 @@
 """Tests for the M0 spike helpers (scripts/spike_common.py)."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -9,6 +10,7 @@ from spike_common import (
     RunnerEvent,
     asset_sha256,
     classify_line,
+    decode_output,
     extract_sha256,
     looks_like_pat,
     parse_repo,
@@ -93,21 +95,41 @@ def test_read_runner_file_handles_bom(tmp_path):
     assert read_runner_file(path) == payload
 
 
-# Provisional: patterns come from the plan; M0 replaces these with real stdout samples.
-@pytest.mark.parametrize(
-    ("line", "expected"),
-    [
-        ("2026-10-22 07:00:00Z: Listening for Jobs", RunnerEvent("idle", None)),
-        ("2026-10-22 07:01:00Z: Running job: build", RunnerEvent("busy", "build")),
-        (
-            "2026-10-22 07:02:00Z: Job build completed with result: Succeeded",
-            RunnerEvent("completed", "build: Succeeded"),
-        ),
-        ("Connected to GitHub", None),
-    ],
-)
-def test_classify_line(line, expected):
-    assert classify_line(line) == expected
+STDOUT = Path(__file__).parent / "fixtures" / "stdout"
+
+
+def events_of(name):
+    lines = (STDOUT / name).read_text(encoding="utf-8").splitlines()
+    return [e for e in map(classify_line, lines) if e]
+
+
+def test_classify_job_then_ctrl_break():
+    assert events_of("job_then_ctrl_break.txt") == [
+        RunnerEvent("connected", None),
+        RunnerEvent("version", "2.338.0"),
+        RunnerEvent("idle", None),
+        RunnerEvent("busy", "spike"),
+        RunnerEvent("completed", "spike: Failed"),
+        RunnerEvent("stopping", None),
+        RunnerEvent("exited", "0"),
+    ]
+
+
+def test_classify_session_conflict_then_reconnect():
+    kinds = [e.kind for e in events_of("session_conflict_reconnect.txt")]
+    assert kinds.count("conflict") == 4
+    assert kinds[-3:] == ["reconnected", "version", "idle"]
+
+
+def test_classify_killed_listener_exit_code():
+    assert events_of("conflict_then_kill_listener.txt")[-1] == RunnerEvent("exited", "15")
+
+
+def test_decode_output_falls_back_to_console_codepage():
+    lines = (STDOUT / "job_then_ctrl_break.cp936.raw").read_bytes().splitlines()
+    assert decode_output(lines[0], fallback="gbk").startswith("已复制")
+    assert "(Y/N)" in decode_output(lines[-3], fallback="gbk")
+    assert decode_output(b"Listening for Jobs") == "Listening for Jobs"
 
 
 @pytest.mark.parametrize(
