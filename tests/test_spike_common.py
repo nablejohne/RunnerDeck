@@ -10,6 +10,7 @@ from spike_common import (
     asset_sha256,
     classify_line,
     extract_sha256,
+    looks_like_pat,
     parse_repo,
     pick_asset,
     read_runner_file,
@@ -107,3 +108,16 @@ def test_read_runner_file_handles_bom(tmp_path):
 )
 def test_classify_line(line, expected):
     assert classify_line(line) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "ok"),
+    [
+        ("github_pat_" + "a" * 70, True),
+        ("ghp_" + "b" * 36, True),
+        ("runnerdeck-sandbox", False),
+        ("ghp_short", False),
+    ],
+)
+def test_looks_like_pat(value, ok):
+    assert looks_like_pat(value) is ok

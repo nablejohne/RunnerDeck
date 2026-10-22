@@ -48,11 +48,24 @@ def parse_repo(value: str) -> tuple[str, str]:
     return owner, name
 
 
+_PAT_PREFIXES = ("github_pat_", "ghp_", "gho_", "ghu_")
+
+
+def looks_like_pat(value: str) -> bool:
+    return value.startswith(_PAT_PREFIXES) and len(value) >= 36
+
+
 def load_env() -> SpikeEnv:
     pat = os.environ.get("RUNNERDECK_TEST_PAT", "").strip()
     repo = os.environ.get("RUNNERDECK_TEST_REPO", "").strip()
     if not pat or not repo:
         sys.exit("Set RUNNERDECK_TEST_PAT and RUNNERDECK_TEST_REPO (owner/repo) first.")
+    if not looks_like_pat(pat):
+        # Never echo the value: it may be a real secret pasted with a typo.
+        sys.exit(
+            "RUNNERDECK_TEST_PAT does not look like a GitHub token (expected github_pat_... or "
+            "ghp_...). Paste the token value, not the token's name."
+        )
     try:
         owner, name = parse_repo(repo)
     except ValueError as e:
