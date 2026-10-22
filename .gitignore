@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build
+build/
+dist/
+*.spec.bak
+
+# Runner spike artifacts (never commit runner dirs or credentials)
+actions-runner/
+_work/
+_diag/
+.runner
+.credentials*
+*.zip
+
+# Env / secrets
+.env
+.env.*
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
