@@ -1,0 +1,41 @@
+[project]
+name = "runnerdeck"
+version = "0.0.0"
+description = "Windows tray app for managing repo-level GitHub Actions self-hosted runners"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "httpx>=0.28",
+    "psutil>=7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.14",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/runnerdeck"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# M0: spike helpers live in scripts/ and are tested in place; core/ replaces them in M1.
+pythonpath = ["scripts"]
+addopts = "-ra"
+markers = [
+    "integration: needs RUNNERDECK_TEST_PAT / RUNNERDECK_TEST_REPO, skipped otherwise",
+]

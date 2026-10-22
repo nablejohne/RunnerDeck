@@ -292,7 +292,7 @@ runnerdeck/
 约定：
 
 - 全部 workflow 顶层 `permissions: contents: read`，需要写权限的 job 单独声明。
-- 第三方 action 固定主版本（`actions/checkout@v4`、`astral-sh/setup-uv@v6` 等），由 dependabot 每周提升级 PR。
+- 第三方 action 固定主版本（`actions/checkout@v7`、`astral-sh/setup-uv@v10` 等），由 dependabot 每周提升级 PR。
 - 不在 CI 里放 PAT secret，集成测试只在本机跑；fork PR 本来也拿不到 secret。
 - 仓库开启 Secret scanning + Push protection（公开仓库免费），兜底防 PAT 误提交。
 - `main` 开分支保护：要求 `lint`、`test` 通过才能合并（个人项目可允许管理员直推，但 CI 红了必须先修）。

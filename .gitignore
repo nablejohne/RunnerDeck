@@ -29,3 +29,6 @@ _diag/
 Thumbs.db
 .idea/
 .vscode/
+
+# Spike outputs (logs may contain repo/runner details; curated samples go to tests/fixtures)
+spike-out/
