@@ -39,6 +39,7 @@
 - 下载 runner zip 用不带 Authorization 的独立 httpx client，避免把 PAT 发给 CDN
 - fixture 只保留测试仓库的条目和最少字段，其他私有仓库名不进公开仓库
 - 已发现：`registration-token` 的 `expires_at` 带 `+08:00` 偏移；release asset 自带 `digest` 字段可直接做 SHA256 校验
+- `astral-sh/setup-uv` 没有浮动主版本 tag，必须写完整版本（首次 CI 因 `@v10` 失败）
 - spike 的 `workflow_dispatch` 需要 PAT 有 Actions: Read and write，产品本身只要 Read
 
 - 公开仓库的 CI / 发布只跑 GitHub 托管 runner，不用自托管 runner（fork PR 可在本机执行代码）
