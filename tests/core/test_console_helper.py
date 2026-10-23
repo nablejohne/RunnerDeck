@@ -354,3 +354,10 @@ def test_windows_helper_exit_code_follows_run_cmd(tmp_path: Path) -> None:
             winproc.kill_tree(proc.pid)
     assert rc == 0
     assert '"Exiting after unknown error code: 15"' in read_all(proc)
+
+
+def test_module_entry_uses_os_exit() -> None:
+    # Normal interpreter teardown with the stdin thread blocked in readline() crashed the helper
+    # on Windows (exit 0xC0000005 instead of run.cmd's code).
+    source = Path(console_helper.__file__).read_text(encoding="utf-8")
+    assert "os._exit(main())" in source

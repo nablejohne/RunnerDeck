@@ -13,7 +13,9 @@ Protocol on stdin (bytes, one command per line):
 - `stop`: send CTRL_BREAK_EVENT to run.cmd's process group, keep waiting for it to exit.
 - EOF (the GUI died or closed the pipe): stop the runner the same way, hard-kill the tree if
   it is still there after ORPHAN_STOP_TIMEOUT_S, then exit.
-The exit code is run.cmd's. Nothing is printed by the helper itself.
+The exit code is run.cmd's. Nothing is printed by the helper itself. The process ends with
+os._exit() (see the bottom of the file): a daemon thread blocked in a pipe read crashes the
+interpreter's normal teardown on Windows.
 
 Standard library only: the frozen helper exe must not drag Qt in, and nothing here may import
 the rest of runnerdeck (this file is also a PyInstaller entry point). The Windows-specific calls
@@ -138,4 +140,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Real (2026-10-23, Windows): sys.exit() crashed the helper with 0xC0000005 while the
+    # daemon thread was still blocked in stdin.readline() during interpreter teardown, and the
+    # GUI then saw that code instead of run.cmd's. There is nothing to flush or finalize here,
+    # so skip teardown altogether.
+    os._exit(main())
