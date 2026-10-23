@@ -50,7 +50,13 @@ def log_dir() -> Path:
 
 
 def default_runners_root() -> Path:
-    """Short root to stay clear of the 260-char path limit: D:\\runners, else C:\\runners."""
+    """Short root to stay clear of the 260-char path limit: D:\\runners, else C:\\runners.
+
+    Under RUNNERDECK_HOME (dev/test) it is `<home>/runners`, so nothing leaks outside.
+    """
+    override = _override()
+    if override is not None:
+        return override / "runners"
     if sys.platform == "win32":
         return Path("D:\\runners") if Path("D:\\").exists() else Path("C:\\runners")
     return Path.home() / "runners"

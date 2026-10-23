@@ -12,6 +12,9 @@ dependencies = [
     "pydantic>=2.9",
 ]
 
+[project.scripts]
+runnerdeck-cli = "runnerdeck.core.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
@@ -43,3 +46,12 @@ addopts = "-ra"
 markers = [
     "integration: needs RUNNERDECK_TEST_PAT / RUNNERDECK_TEST_REPO, skipped otherwise",
 ]
+
+[tool.coverage.run]
+source = ["runnerdeck"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "if __name__ == .__main__.:"]

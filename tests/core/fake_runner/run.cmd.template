@@ -1,0 +1,5 @@
+@echo off
+rem Fake run.cmd for tests/core/test_process.py. The test fills in the @...@ placeholders
+rem and writes the result as run.cmd into a temporary runner directory.
+"@PYTHON@" "@LISTENER@" @MODE@ "@PIDFILE@"
+exit /b %ERRORLEVEL%

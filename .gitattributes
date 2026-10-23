@@ -1,3 +1,4 @@
 # Captured runner output must stay byte-for-byte (CRLF, GBK lines).
 tests/fixtures/** -text
 *.raw binary
+tests/core/fake_runner/*.template -text
