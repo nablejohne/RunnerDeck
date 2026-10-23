@@ -1706,7 +1706,7 @@ def test_mask_proxy() -> None:
 
 def test_console_survives_unencodable_output() -> None:
     raw = io.BytesIO()
-    stream = io.TextIOWrapper(raw, encoding="ascii")
+    stream = io.TextIOWrapper(raw, encoding="ascii", newline="\n")  # no \r\n on Windows
     Console(stream, stream).print("状态 ok")
     stream.flush()
     assert raw.getvalue() == b"?? ok\n"

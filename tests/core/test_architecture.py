@@ -9,8 +9,9 @@ import pytest
 
 CORE = Path(__file__).resolve().parents[2] / "src" / "runnerdeck" / "core"
 BANNED_IN_CORE = ("PyQt5", "qfluentwidgets", "runnerdeck.app", "runnerdeck.ui")
-# Only these modules may invoke config.cmd / run.cmd (CLAUDE.md 架构规则).
-CMD_SCRIPT_OWNERS = {"installer.py", "process.py"}
+# Only these modules may invoke config.cmd / run.cmd (CLAUDE.md 架构规则). winproc only
+# supplies the absolute cmd.exe path (winproc.cmd_exe) and never runs a script itself.
+CMD_SCRIPT_OWNERS = {"installer.py", "process.py", "winproc.py"}
 # Only github_client talks HTTP.
 HTTP_OWNERS = {"github_client.py"}
 

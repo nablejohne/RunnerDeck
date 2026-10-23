@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -93,24 +94,80 @@ def find_runner_processes(runner_dir: Path) -> list[psutil.Process]:
 
 
 def kill_tree(pid: int, *, timeout: float = 5.0) -> list[int]:
-    """Kill `pid` and all its descendants (TerminateProcess). Returns the pids killed."""
+    """Kill `pid` and all its descendants (TerminateProcess). Returns the pids now gone."""
+    return kill_tree_report(pid, timeout=timeout)[0]
+
+
+def kill_tree_report(pid: int, *, timeout: float = 5.0) -> tuple[list[int], list[int]]:
+    """Like kill_tree, but returns (gone, still_alive) so callers can report failures."""
     import psutil
 
     try:
         root = psutil.Process(pid)
     except psutil.NoSuchProcess:
-        return []
+        return [], []
     procs = [root]
     with contextlib.suppress(psutil.Error):
         procs = [*root.children(recursive=True), root]
-    return kill_processes(procs, timeout=timeout)
+    return kill_processes_report(procs, timeout=timeout)
 
 
 def kill_processes(procs: list[psutil.Process], *, timeout: float = 5.0) -> list[int]:
+    """Kill the given processes. Returns the pids now gone (not merely signalled)."""
+    return kill_processes_report(procs, timeout=timeout)[0]
+
+
+def kill_processes_report(
+    procs: list[psutil.Process], *, timeout: float = 5.0
+) -> tuple[list[int], list[int]]:
     import psutil
 
     for proc in procs:
         with contextlib.suppress(psutil.Error):
             proc.kill()
-    psutil.wait_procs(procs, timeout=timeout)
-    return [p.pid for p in procs]
+    gone, alive = psutil.wait_procs(procs, timeout=timeout)
+    return sorted(p.pid for p in gone), sorted(p.pid for p in alive)
+
+
+# --- child process environment / command interpreter -----------------------------
+
+# Never hand these to config.cmd / run.cmd: workflow jobs (possibly from fork PRs) inherit
+# run.cmd's environment and could read them.
+SENSITIVE_ENV_VARS = frozenset(
+    {
+        "RUNNERDECK_PAT",
+        "RUNNERDECK_TEST_PAT",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    }
+)
+
+
+def child_environment(
+    overrides: Mapping[str, str] | None = None, *, base: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Environment for config.cmd / run.cmd: `base` (default os.environ) minus
+    SENSITIVE_ENV_VARS, then `overrides` on top. Keys compare case-insensitively on
+    Windows, where environment variable names are case-insensitive."""
+
+    def norm(key: str) -> str:
+        return key.upper() if IS_WINDOWS else key
+
+    sensitive = {norm(k) for k in SENSITIVE_ENV_VARS}
+    env = {k: v for k, v in (os.environ if base is None else base).items()}
+    env = {k: v for k, v in env.items() if norm(k) not in sensitive}
+    for key, value in (overrides or {}).items():
+        for existing in [k for k in env if norm(k) == norm(key)]:
+            del env[existing]
+        env[key] = value
+    return env
+
+
+def cmd_exe() -> str:
+    """Absolute path of cmd.exe, so a planted cmd.exe in the cwd / PATH is never used."""
+    if not IS_WINDOWS:
+        return "cmd.exe"  # tests only; nothing runs it off Windows
+    system_root = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR") or "C:\\Windows"
+    return os.path.join(system_root, "System32", "cmd.exe")
