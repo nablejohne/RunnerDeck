@@ -222,4 +222,28 @@ def main(argv: Sequence[str] | None = None) -> int
 
 ## 10. 实现后的修订（以代码为准）
 
-（整合与评审后填写。）
+**controller.py**
+- §4 同时写了属性 `logged_in: bool` 和信号 `logged_in(GitHubUser)`，一个 QObject 放不下两个同名成员：属性改名 **`is_logged_in`**，信号保留 **`logged_in(object)`**（UI 和测试按此）。
+- `failed` 是三参数 **`failed(op: str, message: str, exc: object)`**：添加向导需要 `InstallError.output` 展示 config.cmd 输出；同步拒绝（busy、未知 id、未运行）时 `exc=None`。两参数槽也能连（PyQt 丢弃多余参数）。
+- 构造函数多两个注入点：`client_factory(pat, proxy) -> GitHubClient`、`open_url`（测试不真开 Finder）。新增只读 `manager`、`refreshing` + 信号 `refreshing_changed(bool)`；刷新进行中再次 `refresh_statuses()` 被忽略。
+- `start()`：`manager.process_for` 在主线程调（只读 config.json），只有 `proc.start()` 进工作线程；进程先登记进 `_processes` 再启动，被替换的旧进程的迟到回调会被过滤。
+- `remove()` 需要先停止时先 emit `remove_progress("stop", …)`（`controller.STEP_STOP`，不是 `manager.Step`）。`open_dir()` 在目录不存在 / 打开失败时 emit `failed("open_dir", …)`。
+- Task 在主线程收到 finished/failed 前保存在 `workers._LIVE_TASKS`，否则线程池会在 `run()` 结束后立刻删掉 C++ 侧对象、结果丢失。
+- 构造时读 config.json，损坏则抛 `StoreError`（不重置文件）；`__main__` 的 excepthook 负责显示。
+- `shutdown()` 自身没有总超时（每个 `RunnerProcess.stop` 自限：超时 + 10 s kill + 5 s 读线程），执行 job 的 runner 最长约 105 s。
+
+**ui/**
+- `LoginDialog` 本地先用 `account.validate_pat_format`（core/account 再导出，ui 不能 import `core.secrets`）做格式检查，再交给 controller。`MessageBoxBase` 必须有父窗口：`LoginDialog(controller, parent)`、`LogDialog(controller, id, name, parent)`。
+- `MainWindow(controller, parent=None, *, prompt_login=True)`：`prompt_login=False` 供 `--smoke-test` 跳过模态登录框（否则 exec() 永不返回，smoke 挂死——整合时实测）。
+- `BADGE_LEVELS`：BUSY 用 `InfoLevel.ATTENTION` 与 IDLE 的 SUCCESS 区分。`RunnerCard` 多一个 `open_dir_requested(str)` 信号（卡片不持有 controller）。向导第 2 步按钮文案“检查”→ `plan_ready` 后“开始添加”；改名称/标签/PS 选项会作废当前 plan；无 `runner_env` 时隐藏 env 行。
+- `ui/compat.py`：`disable_mac_native_frameless()`——qframelesswindow 的 macOS 后端在离屏平台下解引用 `winId()` 会段错误（exit 139）；tests/ui 和 `--smoke-test` 在 macOS 上调用它，Windows 上空操作。
+
+**打包 / 入口**
+- `--smoke-test` 不走 `exec()`：`processEvents` 驱动 show → switchTo 三页 → close → `controller.shutdown()`，可在 pytest 里跑。
+- `build.ps1` 用 .NET `ZipFile` 而不是 `Compress-Archive`（5.1 写反斜杠路径）；原生命令按 `$LASTEXITCODE` 判定。**真机只有 Windows PowerShell 5.1 且执行策略 Restricted**：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1`。
+- `runnerdeck-cli.exe` 入口是 `scripts/entry_cli.py`。spec 额外 `collect_submodules("keyring.backends")`、`collect_submodules("win32ctypes")`、`copy_metadata("keyring")`。
+- **锁文件必须覆盖 Windows**：`pyqt5-qt5` 5.15.2 之后不再发 win_amd64 wheel，macOS 上 `uv lock` 会选 5.15.19 导致 Windows `uv sync --locked` 失败；`pyproject` 加 `tool.uv.required-environments = ["sys_platform == 'win32' and platform_machine == 'AMD64'"]`，锁里同时保留 5.15.2（Windows）和 5.15.19（其他）。
+
+**CI / 发布**
+- `release.yml` 先 `uv sync` 再做 tag/版本校验（校验用项目 Python 的 tomllib）；`gh release create --verify-tag`；预发布 tag 要求 `pyproject` 版本字面量一致（如 `0.1.0-rc1`）。
+- `changelog_section.py` 在任意 `## ` 二级标题和 `[x]: url` 链接块处截止，接受 `v` 前缀，空段落视为失败。发布前必须把 `## [Unreleased]` 改成 `## [X.Y.Z] - 日期`。

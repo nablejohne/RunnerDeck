@@ -243,7 +243,7 @@ def test_winproc_helper_command_from_source(monkeypatch: pytest.MonkeyPatch) -> 
         "runnerdeck.core.console_helper",
     ]
     monkeypatch.setattr(winproc.sys, "executable", "/usr/bin/python3")
-    assert winproc.helper_command()[0] == "/usr/bin/python3"
+    assert winproc.helper_command()[0] == str(Path("/usr/bin/python3"))
 
 
 def test_winproc_helper_command_frozen(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
