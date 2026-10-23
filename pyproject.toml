@@ -10,16 +10,24 @@ dependencies = [
     "keyring>=25",
     "psutil>=7.0",
     "pydantic>=2.9",
+    "pyqt-fluent-widgets>=1.7",
+    "pyqt5>=5.15.10,<5.16",
     "truststore>=0.10",
 ]
 
 [project.scripts]
 runnerdeck-cli = "runnerdeck.core.cli:main"
+runnerdeck-helper = "runnerdeck.core.console_helper:main"
+
+[project.gui-scripts]
+runnerdeck = "runnerdeck.__main__:main"
 
 [dependency-groups]
 dev = [
+    "pyinstaller>=6.11",
     "pytest>=8.3",
     "pytest-cov>=6",
+    "pytest-qt>=4.4",
     "respx>=0.22",
     "ruff>=0.14",
 ]
@@ -44,6 +52,7 @@ testpaths = ["tests"]
 # M0: spike helpers live in scripts/ and are tested in place; core/ replaces them in M1.
 pythonpath = ["scripts"]
 addopts = "-ra"
+qt_api = "pyqt5"
 markers = [
     "integration: needs RUNNERDECK_TEST_PAT / RUNNERDECK_TEST_REPO, skipped otherwise",
 ]

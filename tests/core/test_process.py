@@ -26,6 +26,7 @@ from runnerdeck.core.models import LocalState
 from runnerdeck.core.process import (
     EventKind,
     ExternalStop,
+    Launch,
     OutputStateMachine,
     RunnerEvent,
     RunnerProcess,
@@ -278,12 +279,48 @@ class FakePipe:
         self.closed = True
 
 
+class HelperStdin:
+    """The console helper's stdin pipe (Launch.HELPER): "stop" makes the fake helper exit."""
+
+    def __init__(self, proc: FakeProc, tail: bytes | None) -> None:
+        self._proc = proc
+        self._tail = tail  # None: the helper ignores "stop" (run.cmd hung)
+        self.writes: list[bytes] = []
+        self.closed = False
+        self.broken = False
+
+    def write(self, data: bytes) -> int:
+        if self.broken or self.closed:
+            raise BrokenPipeError(32, "pipe closed")
+        self.writes.append(data)
+        return len(data)
+
+    def flush(self) -> None:
+        if self.broken or self.closed:
+            raise BrokenPipeError(32, "pipe closed")
+        if b"stop\n" in b"".join(self.writes) and self._tail is not None:
+            threading.Timer(0.02, self._proc.finish, args=(0, self._tail)).start()
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeProc:
-    def __init__(self, args: list[str], kwargs: dict[str, Any], pid: int, data: bytes) -> None:
+    def __init__(
+        self,
+        args: list[str],
+        kwargs: dict[str, Any],
+        pid: int,
+        data: bytes,
+        helper_tail: bytes | None = None,
+    ) -> None:
         self.args = args
         self.kwargs = kwargs
         self.pid = pid
         self.stdout = FakePipe(data)
+        self.stdin = (
+            HelperStdin(self, helper_tail) if kwargs.get("stdin") is subprocess.PIPE else None
+        )
         self.returncode: int | None = None
         self._exited = threading.Event()
 
@@ -312,11 +349,14 @@ class FakePopen:
         self.exit_code = exit_code
         self.procs: list[FakeProc] = []
         self.error: Exception | None = None
+        self.helper_tail: bytes | None = HELPER_STOP_TAIL  # what "stop" to the helper yields
 
     def __call__(self, args: list[str], **kwargs: Any) -> FakeProc:
         if self.error is not None:
             raise self.error
-        proc = FakeProc(args, kwargs, pid=40000 + len(self.procs), data=self.data)
+        proc = FakeProc(
+            args, kwargs, pid=40000 + len(self.procs), data=self.data, helper_tail=self.helper_tail
+        )
         self.procs.append(proc)
         if self.exit_code is not None:
             proc.finish(self.exit_code)
@@ -325,6 +365,12 @@ class FakePopen:
     @property
     def last(self) -> FakeProc:
         return self.procs[-1]
+
+
+HELPER_STOP_TAIL = (
+    b'Exiting...\r\n"Runner listener exit with 0 return code, stop the service, no retry needed."'
+    b'\r\n"Exiting runner..."\r\n'
+)
 
 
 class FakeWin:
@@ -1100,6 +1146,115 @@ def test_start_cleans_up_when_reader_thread_cannot_start(
     assert win.called("kill_tree") == [popen.last.pid]
     assert proc.state == S.ERROR
     assert not proc.is_running()
+
+
+# --- Launch.HELPER: run.cmd behind the console helper -----------------------------------------
+
+
+@pytest.fixture
+def helper_cmd(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    cmd = ["C:\\app\\runnerdeck-helper.exe"]
+    monkeypatch.setattr(winproc, "helper_command", lambda: list(cmd))
+    return cmd
+
+
+def test_helper_launch_flags(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, helper_cmd: list[str]
+) -> None:
+    proc = make(runner_dir, popen, rec, launch=Launch.HELPER, env={"https_proxy": "http://p:1"})
+    assert proc.launch is Launch.HELPER
+    proc.start()
+    try:
+        fake = popen.last
+        assert fake.args == [*helper_cmd, str(runner_dir)]
+        kw = fake.kwargs
+        assert kw["cwd"] is None  # the helper sets run.cmd's cwd; a job can write to that dir
+        assert kw["stdin"] is subprocess.PIPE
+        assert kw["stdout"] is subprocess.PIPE
+        assert kw["stderr"] is subprocess.STDOUT
+        assert kw["creationflags"] & winproc.CREATE_NEW_PROCESS_GROUP
+        assert kw["creationflags"] & winproc.CREATE_NO_WINDOW  # hidden console of its own
+        assert kw["env"]["https_proxy"] == "http://p:1"
+        assert "RUNNERDECK_PAT" not in kw["env"]
+        assert proc.pid == fake.pid
+    finally:
+        proc.stop()
+
+
+def test_helper_stop_is_graceful_without_our_console(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, helper_cmd: list[str]
+) -> None:
+    win.console = False  # the GUI has none; the helper relays Ctrl+Break anyway
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT, launch=Launch.HELPER)
+    wait_until(lambda: proc.state == S.IDLE)
+    result = proc.stop(timeout=5)
+    assert result == StopResult(True, StopMethod.CTRL_BREAK, 0, [])
+    assert popen.last.stdin is not None
+    assert popen.last.stdin.writes == [b"stop\n"]
+    assert popen.last.stdin.closed  # released once the run is over
+    assert win.called("ctrl_break") == []
+    assert win.called("kill_tree") == []
+    assert proc.state == S.STOPPED
+    assert proc.last_stop_forced is False
+    assert "Exiting..." in proc.output()
+    assert rec.states[-2:] == [(S.STOPPING, None), (S.STOPPED, None)]
+
+
+def test_helper_ignoring_stop_is_killed(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, helper_cmd: list[str]
+) -> None:
+    popen.helper_tail = None
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT, launch=Launch.HELPER)
+    result = proc.stop(timeout=0.2)
+    assert result.graceful is False
+    assert result.method == StopMethod.KILL
+    assert win.called("kill_tree") == [popen.last.pid]  # the helper is the root of the tree
+    assert proc.last_stop_forced is True
+    assert proc.state == S.STOPPED
+
+
+def test_helper_broken_stdin_pipe_falls_back_to_kill(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, helper_cmd: list[str]
+) -> None:
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT, launch=Launch.HELPER)
+    assert popen.last.stdin is not None
+    popen.last.stdin.broken = True
+    result = proc.stop(timeout=5)
+    assert result.graceful is False
+    assert win.called("kill_tree") == [popen.last.pid]
+    assert proc.state == S.STOPPED
+
+
+def test_helper_exit_on_its_own_closes_stdin(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, helper_cmd: list[str]
+) -> None:
+    popen.data = fixture_bytes("job_then_ctrl_break.txt")
+    popen.exit_code = 0
+    proc = make(runner_dir, popen, rec, launch=Launch.HELPER)
+    proc.start()
+    assert proc.wait(5) == 0
+    assert proc.state == S.STOPPED
+    assert popen.last.stdin is not None and popen.last.stdin.closed
+
+
+def test_helper_command_failure_is_a_process_error(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, monkeypatch: Any
+) -> None:
+    def missing() -> list[str]:
+        raise ProcessError("找不到 runnerdeck-helper.exe，安装不完整")
+
+    monkeypatch.setattr(winproc, "helper_command", missing)
+    proc = make(runner_dir, popen, rec, launch=Launch.HELPER)
+    with pytest.raises(ProcessError, match="安装不完整"):
+        proc.start()
+    assert popen.procs == []
+    assert not proc.is_running()
+
+
+def test_launch_accepts_strings(runner_dir: Path, popen: FakePopen) -> None:
+    assert RunnerProcess(runner_dir, popen=popen, launch="helper").launch is Launch.HELPER  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        RunnerProcess(runner_dir, popen=popen, launch="tray")  # type: ignore[arg-type]
 
 
 # --- stop() ----------------------------------------------------------------------------------
@@ -1990,3 +2145,43 @@ def test_stop_default_timeout_depends_on_running_job(
         assert waited >= 0.9
     else:
         assert waited < 0.9
+
+
+@windows_only
+def test_windows_helper_launch_graceful_stop(tmp_path: Path, real_processes: Any) -> None:
+    # The GUI path: no console of our own needed. Real helper, real cmd.exe, fake listener.
+    runner_dir, pid_file = make_fake_runner_dir(tmp_path, "idle")
+    rec = Recorder()
+    proc = RunnerProcess(runner_dir, launch=Launch.HELPER, **rec.callbacks())
+    real_processes.append(proc)
+    proc.start()
+    wait_until(lambda: proc.state == S.IDLE, 30)
+    child = listener_pid(pid_file)
+    assert psutil.pid_exists(child)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(winproc, "has_console", lambda: False)  # must not matter in HELPER mode
+        result = proc.stop(timeout=15)
+    assert result.graceful is True
+    assert result.method == StopMethod.CTRL_BREAK
+    assert result.exit_code == 0
+    assert proc.state == S.STOPPED
+    assert "Exiting..." in proc.output()
+    assert proc.listener_exit_code == 0
+    wait_until(lambda: not psutil.pid_exists(child), 10)
+    assert rec.states[-1] == (S.STOPPED, None)
+
+
+@windows_only
+def test_windows_helper_launch_restart_after_stop(tmp_path: Path, real_processes: Any) -> None:
+    runner_dir, pid_file = make_fake_runner_dir(tmp_path, "idle")
+    proc = RunnerProcess(runner_dir, launch=Launch.HELPER)
+    real_processes.append(proc)
+    proc.start()
+    wait_until(lambda: proc.state == S.IDLE, 30)
+    assert proc.stop(timeout=15).graceful
+    pid_file.unlink()
+    proc.start()  # no leftover process blocks the restart
+    wait_until(lambda: proc.state == S.IDLE, 30)
+    child = listener_pid(pid_file)
+    assert proc.stop(timeout=15).graceful
+    wait_until(lambda: not psutil.pid_exists(child), 10)

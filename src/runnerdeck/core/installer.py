@@ -470,6 +470,16 @@ def _discard_extracted(target: Path, *, created: bool) -> None:
 # --- .env --------------------------------------------------------------------------------
 
 
+def validate_env_updates(updates: Mapping[str, str | None]) -> dict[str, str | None]:
+    """Check `.env` keys / values up front (plan_add); returns a plain copy."""
+    for key, value in updates.items():
+        if not _ENV_KEY_RE.fullmatch(key):
+            raise InvalidInputError(f"环境变量名不合法：{key!r}")
+        if value is not None and ("\n" in value or "\r" in value):
+            raise InvalidInputError(f"环境变量 {key} 的值不能包含换行")
+    return dict(updates)
+
+
 def write_env_file(runner_dir: Path, updates: Mapping[str, str | None]) -> None:
     """Merge `updates` into `<runner_dir>/.env` (KEY=VALUE lines read by Runner.Listener).
 
@@ -477,11 +487,7 @@ def write_env_file(runner_dir: Path, updates: Mapping[str, str | None]) -> None:
     first matching line is rewritten in place, later duplicates of an updated key are dropped,
     every other line keeps its position, new keys are appended. Written atomically.
     """
-    for key, value in updates.items():
-        if not _ENV_KEY_RE.fullmatch(key):
-            raise InvalidInputError(f"环境变量名不合法：{key!r}")
-        if value is not None and ("\n" in value or "\r" in value):
-            raise InvalidInputError(f"环境变量 {key} 的值不能包含换行")
+    validate_env_updates(updates)
     if not updates:
         return
     if not runner_dir.is_dir():

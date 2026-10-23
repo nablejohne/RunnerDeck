@@ -1,6 +1,6 @@
 # RunnerDeck
 
-Windows 托盘应用：管理多个仓库级 GitHub Actions self-hosted runner。完整方案见 docs/PLAN.md，runner 实测结论见 docs/spike-notes.md，core 层接口见 docs/m1-design.md，进度见 docs/PROGRESS.md。
+Windows 托盘应用：管理多个仓库级 GitHub Actions self-hosted runner。完整方案见 docs/PLAN.md，runner 实测结论见 docs/spike-notes.md，core 层接口见 docs/m1-design.md，M2 的 app/ui/打包契约见 docs/m2-design.md，进度见 docs/PROGRESS.md。
 
 ## 技术栈
 - Python 3.11, PyQt5 5.15, PyQt-Fluent-Widgets (import qfluentwidgets)
@@ -20,7 +20,8 @@ Windows 托盘应用：管理多个仓库级 GitHub Actions self-hosted runner�
 - 依赖方向只能是 ui -> app -> core；core 不得 import PyQt5 或 qfluentwidgets
 - UI 线程不得做网络或子进程调用；耗时操作放 app/workers.py，结果通过信号返回
 - GitHub 调用只能经过 core/github_client.py
-- 调用 config.cmd / run.cmd 的代码只能在 core/installer.py 和 core/process.py
+- 调用 config.cmd / run.cmd 的代码只能在 core/installer.py、core/process.py 和 core/console_helper.py（GUI 的 Ctrl+Break 中继，只用标准库）
+- ui 只能通过 app/controller.py 使用 core（可直接 import 的只有 models / status / errors / paths / account / redact 这类纯数据模块）
 - config.json 一律原子写（临时文件 + os.replace）
 
 ## 安全

@@ -166,8 +166,21 @@ class OutputStateMachine:
 # --- process control -----------------------------------------------------------------------
 
 
+class Launch(StrEnum):
+    """How run.cmd is started (docs/m2-design.md §1).
+
+    CONSOLE: directly, sharing this process's console (the CLI); Ctrl+Break goes to run.cmd's
+    process group. HELPER: through core/console_helper.py started with CREATE_NO_WINDOW, which
+    owns a hidden console that run.cmd shares (the GUI has no console); "stop" on the helper's
+    stdin makes it send the Ctrl+Break. Measured in spike §10: 0.91 s graceful stop.
+    """
+
+    CONSOLE = "console"
+    HELPER = "helper"
+
+
 class StopMethod(StrEnum):
-    CTRL_BREAK = "ctrl_break"
+    CTRL_BREAK = "ctrl_break"  # directly or relayed by the console helper
     KILL = "kill"
 
 
@@ -226,6 +239,7 @@ class RunnerProcess:
         on_job_finished: Callable[[str, str], None] | None = None,
         popen: PopenFn = subprocess.Popen,
         max_lines: int = 2000,
+        launch: Launch = Launch.CONSOLE,
     ) -> None:
         if max_lines < 1:
             raise ValueError("max_lines must be >= 1")
@@ -235,6 +249,7 @@ class RunnerProcess:
         self._on_state = on_state
         self._on_job_finished = on_job_finished
         self._popen = popen
+        self._launch = Launch(launch)
 
         self._lock = threading.Lock()  # guards every field below
         self._control_lock = threading.Lock()  # serialises start() / stop()
@@ -272,6 +287,10 @@ class RunnerProcess:
         return self._runner_dir
 
     @property
+    def launch(self) -> Launch:
+        return self._launch
+
+    @property
     def state(self) -> LocalState:
         with self._lock:
             return self._state
@@ -294,7 +313,8 @@ class RunnerProcess:
 
     @property
     def pid(self) -> int | None:
-        """PID of the run.cmd cmd.exe while running, else None."""
+        """PID of the process we spawned while running, else None: run.cmd's cmd.exe
+        (Launch.CONSOLE) or the console helper (Launch.HELPER), the root of the tree to kill."""
         with self._lock:
             return self._proc.pid if self._active and self._proc is not None else None
 
@@ -378,16 +398,29 @@ class RunnerProcess:
                     f"（PID {', '.join(map(str, others))}），可能由其他终端或服务启动；请先停止它"
                 )
             try:
-                proc = self._popen(
+                if self._launch is Launch.HELPER:
+                    # The helper owns a hidden console (CREATE_NO_WINDOW) that run.cmd shares;
+                    # it passes our stdout on to run.cmd and sets run.cmd's cwd itself. Our
+                    # cwd is deliberately not the runner dir: a job can write there.
+                    args = [*winproc.helper_command(), str(self._runner_dir)]
+                    cwd = None
+                    stdin = subprocess.PIPE
+                    flags = winproc.CREATE_NEW_PROCESS_GROUP | winproc.CREATE_NO_WINDOW
+                else:
                     # Absolute cmd.exe: never one planted in the runner dir or on PATH.
-                    [winproc.cmd_exe(), "/c", RUN_SCRIPT],
-                    cwd=str(self._runner_dir),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
+                    args = [winproc.cmd_exe(), "/c", RUN_SCRIPT]
+                    cwd = str(self._runner_dir)
+                    stdin = subprocess.DEVNULL
                     # Own process group so CTRL_BREAK can target it; deliberately NOT
                     # CREATE_NO_WINDOW, which makes CTRL_BREAK silently ineffective (spike §5).
-                    creationflags=winproc.CREATE_NEW_PROCESS_GROUP,
+                    flags = winproc.CREATE_NEW_PROCESS_GROUP
+                proc = self._popen(
+                    args,
+                    cwd=cwd,
+                    stdin=stdin,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    creationflags=flags,
                     # Always explicit: workflow jobs inherit run.cmd's environment, so the
                     # PAT variables (RUNNERDECK_PAT, GH_TOKEN, ...) must not be in it.
                     env=winproc.child_environment(self._env),
@@ -471,17 +504,22 @@ class RunnerProcess:
 
             pid = proc.pid
             graceful = False
-            if winproc.has_console():
+            if self._launch is Launch.HELPER:
+                requested = self._request_helper_stop(proc)
+            elif winproc.has_console():
+                requested = True
                 try:
                     winproc.send_ctrl_break(pid)
                 except ProcessError as e:
+                    requested = False
                     log.warning("Ctrl+Break to %s failed, killing instead: %s", pid, e)
-                else:
-                    graceful = self._wait_proc(proc, max(timeout, 0.0))
-                    if not graceful:
-                        log.warning("%s ignored Ctrl+Break for %.1fs, killing", pid, timeout)
             else:
+                requested = False
                 log.info("no console: Ctrl+Break cannot reach pid %s, killing", pid)
+            if requested:
+                graceful = self._wait_proc(proc, max(timeout, 0.0))
+                if not graceful:
+                    log.warning("%s ignored Ctrl+Break for %.1fs, killing", pid, timeout)
 
             with self._lock:
                 if self._killed_elsewhere:
@@ -602,6 +640,7 @@ class RunnerProcess:
             if gen != self._gen or not self._active:
                 return False
             self._active = False
+            _close_stdin(self._proc)
             self._exit_code = rc
             self._stopped_at = _now()
             if error is None and not self._stop_requested:
@@ -734,6 +773,20 @@ class RunnerProcess:
             return False
         return True
 
+    def _request_helper_stop(self, proc: subprocess.Popen[bytes]) -> bool:
+        """Ask the console helper to send Ctrl+Break; False if it cannot be asked (-> kill)."""
+        stdin = proc.stdin
+        if stdin is None:
+            log.warning("helper %s has no stdin pipe, killing instead", proc.pid)
+            return False
+        try:
+            stdin.write(winproc.HELPER_STOP_COMMAND + b"\n")
+            stdin.flush()
+        except (OSError, ValueError) as e:  # helper gone / pipe closed
+            log.warning("cannot ask helper %s to stop (%s), killing instead", proc.pid, e)
+            return False
+        return True
+
     def _external_pids(self) -> list[int]:
         import psutil
 
@@ -782,6 +835,14 @@ class RunnerProcess:
             [p.pid for p in leftovers],
         )
         return _kill_checked(leftovers)
+
+
+def _close_stdin(proc: subprocess.Popen[bytes] | None) -> None:
+    """Release the helper's stdin pipe once the run is over (no-op for DEVNULL)."""
+    stdin = getattr(proc, "stdin", None)
+    if stdin is not None:
+        with contextlib.suppress(OSError, ValueError):
+            stdin.close()
 
 
 # --- processes not owned by a RunnerProcess -----------------------------------------------

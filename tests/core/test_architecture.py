@@ -11,7 +11,7 @@ CORE = Path(__file__).resolve().parents[2] / "src" / "runnerdeck" / "core"
 BANNED_IN_CORE = ("PyQt5", "qfluentwidgets", "runnerdeck.app", "runnerdeck.ui")
 # Only these modules may invoke config.cmd / run.cmd (CLAUDE.md 架构规则). winproc only
 # supplies the absolute cmd.exe path (winproc.cmd_exe) and never runs a script itself.
-CMD_SCRIPT_OWNERS = {"installer.py", "process.py", "winproc.py"}
+CMD_SCRIPT_OWNERS = {"installer.py", "process.py", "winproc.py", "console_helper.py"}
 # Only github_client talks HTTP.
 HTTP_OWNERS = {"github_client.py"}
 
@@ -28,6 +28,25 @@ def _imports(path: Path) -> list[str]:
 
 
 CORE_FILES = sorted(CORE.glob("*.py"))
+SRC = CORE.parent
+APP_FILES = sorted((SRC / "app").glob("*.py"))
+UI_FILES = sorted((SRC / "ui").rglob("*.py"))
+# ui/ talks to core only through app/controller.py (CLAUDE.md: the UI thread never does
+# network or subprocess work); the pure data / text modules are fine to import directly.
+BANNED_IN_UI = (
+    "runnerdeck.core.manager",
+    "runnerdeck.core.github_client",
+    "runnerdeck.core.process",
+    "runnerdeck.core.installer",
+    "runnerdeck.core.release",
+    "runnerdeck.core.store",
+    "runnerdeck.core.secrets",
+    "runnerdeck.core.winproc",
+    "runnerdeck.core.cli",
+    "httpx",
+    "subprocess",
+)
+BANNED_IN_APP = ("runnerdeck.ui", "qfluentwidgets")
 
 
 def test_core_files_found() -> None:
@@ -68,3 +87,37 @@ def test_only_github_client_imports_httpx(path: Path) -> None:
     assert not [n for n in _imports(path) if n == "httpx" or n.startswith("httpx.")], (
         f"{path.name} imports httpx; GitHub calls must go through github_client.py"
     )
+
+
+def test_console_helper_is_stdlib_only() -> None:
+    """It is a PyInstaller entry point of its own and must not drag runnerdeck / Qt in."""
+    import sys
+
+    names = _imports(CORE / "console_helper.py")
+    assert names
+    assert all(n.split(".")[0] in sys.stdlib_module_names for n in names), names
+
+
+def test_cli_is_console_launch_only() -> None:
+    text = (CORE / "cli.py").read_text(encoding="utf-8")
+    assert "Launch.HELPER" not in text  # the CLI shares its console with run.cmd
+
+
+@pytest.mark.parametrize("path", UI_FILES, ids=lambda p: str(p.relative_to(SRC)))
+def test_ui_only_reaches_core_through_the_controller(path: Path) -> None:
+    bad = [
+        name
+        for name in _imports(path)
+        if any(name == b or name.startswith(b + ".") for b in BANNED_IN_UI)
+    ]
+    assert not bad, f"{path.relative_to(SRC)} imports {bad}"
+
+
+@pytest.mark.parametrize("path", APP_FILES, ids=lambda p: p.name)
+def test_app_does_not_import_ui(path: Path) -> None:
+    bad = [
+        name
+        for name in _imports(path)
+        if any(name == b or name.startswith(b + ".") for b in BANNED_IN_APP)
+    ]
+    assert not bad, f"app/{path.name} imports {bad}"

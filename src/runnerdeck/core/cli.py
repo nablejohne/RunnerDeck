@@ -41,7 +41,17 @@ import psutil
 from pydantic import ValidationError
 
 from runnerdeck import __version__
-from runnerdeck.core import logs, paths, process, runner_file, secret_input, secrets, winproc
+from runnerdeck.core import (
+    account,
+    logs,
+    paths,
+    process,
+    runner_file,
+    secret_input,
+    secrets,
+    winproc,
+)
+from runnerdeck.core.account import format_expiry, permission_hints
 from runnerdeck.core.errors import (
     InvalidInputError,
     NotFoundError,
@@ -75,14 +85,13 @@ from runnerdeck.core.store import ConfigStore, resolve_runner
 log = logging.getLogger(__name__)
 
 PROG = "runnerdeck-cli"
-ENV_PAT = "RUNNERDECK_PAT"
+ENV_PAT = account.ENV_PAT
 
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 
-EXPIRY_WARN_DAYS = 7  # warn when the PAT expires sooner than this
 # Own log file: the tray app (and later the CLI next to it) must not rotate a file another
 # process holds open, which fails on Windows (WinError 32).
 LOG_FILE_NAME = "runnerdeck-cli.log"
@@ -111,10 +120,6 @@ EXTERNAL_EXIT_HINT = (
 ReadFn = Callable[[str], str]
 CliClientFactory = Callable[[str, str | None], GitHubClient]  # (pat, proxy) -> client
 ManagerFactory = Callable[[ConfigStore, ClientFactory], RunnerManager]
-
-
-class NotLoggedInError(RunnerDeckError):
-    """No PAT: neither RUNNERDECK_PAT nor a stored PAT for config.account."""
 
 
 class UsageError(Exception):
@@ -331,26 +336,11 @@ class _Context:
     def pat(self) -> tuple[str, str]:
         """(PAT, where it came from). RUNNERDECK_PAT wins over the stored one."""
         if self._pat is None:
-            env_value = self.deps.environ.get(ENV_PAT, "").strip()
-            if env_value:
-                register_secret(env_value)
-                try:
-                    value = secrets.validate_pat_format(env_value)
-                except InvalidInputError as e:
-                    raise InvalidInputError(f"环境变量 {ENV_PAT}：{e}") from None
-                self._pat = (value, f"环境变量 {ENV_PAT}")
-            else:
-                account = self.config().account
-                if not account:
-                    raise NotLoggedInError(
-                        f"还没有登录：请先运行 {PROG} login（或设置环境变量 {ENV_PAT}）"
-                    )
-                stored = secrets.load_pat(account)
-                if stored is None:
-                    raise NotLoggedInError(
-                        f"系统凭据管理器里没有 {account} 的 PAT，请重新运行 {PROG} login"
-                    )
-                self._pat = (stored, "系统凭据管理器")
+            self._pat = account.resolve_pat(
+                self.config().account,
+                self.deps.environ,
+                login_hint=f"请先运行 {PROG} login（或设置环境变量 {ENV_PAT}）",
+            )
         return self._pat
 
     def client(self) -> GitHubClient:
@@ -401,50 +391,12 @@ def _unique(records: Sequence[RunnerRecord]) -> list[RunnerRecord]:
     return out
 
 
-def _format_expiry(expires_at: datetime | None, now: datetime) -> tuple[str, bool]:
-    """(text, needs attention)."""
-    if expires_at is None:
-        return "GitHub 没有返回过期时间（可能设置为永不过期）", False
-    stamp = expires_at.isoformat(sep=" ", timespec="minutes")
-    remaining = expires_at - now
-    if remaining.total_seconds() <= 0:
-        return f"{stamp}（已过期，请在 GitHub 重新生成）", True
-    days = remaining.days
-    if days < EXPIRY_WARN_DAYS:
-        left = f"{days} 天" if days else "不到 1 天"
-        return f"{stamp}（即将过期：还剩 {left}，请及时在 GitHub 重新生成）", True
-    return f"{stamp}（还剩 {days} 天）", False
-
-
-def permission_hints(user: GitHubUser) -> list[str]:
-    """What the PAT needs for RunnerDeck, phrased for its kind (PLAN “PAT 权限”)."""
-    if user.token_kind == "fine-grained":
-        return [
-            "fine-grained PAT 需要：Repository access 里选中要添加 runner 的仓库；"
-            "Repository permissions 里 Administration: Read and write（必需），"
-            "Metadata: Read（自动包含）"
-        ]
-    if user.token_kind == "classic":
-        scopes = user.scopes or []
-        if "repo" in scopes:
-            return [
-                "classic PAT 已有 repo 权限，可以管理所有仓库的 runner；"
-                "更推荐只授权选定仓库的 fine-grained PAT"
-            ]
-        shown = ", ".join(scopes) if scopes else "无"
-        return [
-            f"classic PAT 缺少 repo 权限（当前：{shown}），注册和移除 runner 会失败；"
-            "请在 GitHub 上为这个 token 勾选 repo"
-        ]
-    return [
-        "无法判断 token 类型。需要的权限：fine-grained PAT 为 Administration: Read and write"
-        " + Metadata: Read；classic PAT 为 repo"
-    ]
+_format_expiry = format_expiry  # kept under the old names for tests / callers
 
 
 def _print_token_info(ctx: _Context, user: GitHubUser) -> None:
     console = ctx.console
-    kinds = {"fine-grained": "fine-grained PAT", "classic": "classic PAT", "unknown": "未知"}
+    kinds = account.TOKEN_KIND_LABELS
     console.print(f"token 类型：{kinds.get(user.token_kind, user.token_kind)}")
     if user.token_kind == "classic":
         console.print(f"权限范围：{', '.join(user.scopes) if user.scopes else '无'}")

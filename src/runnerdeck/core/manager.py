@@ -32,6 +32,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 
 import psutil
 
@@ -58,7 +59,7 @@ from runnerdeck.core.models import (
     validate_owner_repo,
     validate_runner_name,
 )
-from runnerdeck.core.process import PopenFn, RunnerProcess
+from runnerdeck.core.process import Launch, PopenFn, RunnerProcess
 from runnerdeck.core.redact import redact, register_secret
 from runnerdeck.core.release import ReleaseCache
 from runnerdeck.core.status import (
@@ -81,6 +82,13 @@ _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)")
 _MB = 1024 * 1024
 _DOWNLOAD_UNKNOWN_STEP = 10 * _MB  # progress granularity when the size is unknown
 
+# Real (spike §10): on a personal PC the default execution policy is Restricted, so every
+# `shell: powershell` step fails. Written to the runner's `.env` it only affects that runner's
+# jobs (process scope), not the system. The GUI's add wizard offers it, on by default.
+POWERSHELL_POLICY_ENV: Mapping[str, str] = MappingProxyType(
+    {"PSExecutionPolicyPreference": "RemoteSigned"}
+)
+
 
 class Step(StrEnum):
     """Progress step ids passed as the first argument of ProgressFn."""
@@ -91,6 +99,7 @@ class Step(StrEnum):
     EXTRACT = "extract"
     TOKEN = "token"
     CONFIGURE = "configure"
+    ENV = "env"  # only when the plan has runner_env
     VERIFY = "verify"
     ROLLBACK = "rollback"
     # remove_runner
@@ -140,6 +149,8 @@ class AddPlan:
     already registered in the repo on GitHub (config.cmd --replace takes it over).
     same_repo_runners: names of runners already recorded locally for this repo.
     warnings: Chinese texts the caller must show before add_runner.
+    runner_env: KEY=VALUE pairs written to the runner's `.env` after registration (e.g.
+    POWERSHELL_POLICY_ENV); empty means the file is left alone.
     """
 
     owner: str
@@ -153,6 +164,7 @@ class AddPlan:
     remote_conflict: RemoteRunner | None = None
     same_repo_runners: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    runner_env: tuple[tuple[str, str], ...] = ()
 
     @property
     def full_name(self) -> str:
@@ -401,6 +413,7 @@ class RunnerManager:
         labels: Sequence[str] | None = None,
         root: str | os.PathLike[str] | None = None,
         version: str | None = None,
+        runner_env: Mapping[str, str] | None = None,
     ) -> AddPlan:
         """Read-only preparation of add_runner.
 
@@ -409,9 +422,11 @@ class RunnerManager:
         target directory under `root` (default `settings.runners_root`) and checks GitHub for a
         runner with the same name. A local record with the same name in the same repo raises
         InvalidInputError (registering again would take over its registration).
+        runner_env: validated here (installer's `.env` rules), written by add_runner.
         """
         owner, repo = validate_owner_repo(owner.strip(), repo.strip())
         version = _normalize_version(version)
+        env_pairs = tuple(installer.validate_env_updates(runner_env or {}).items())
         config = self._store.load()
         with closing(self._client_factory()) as client:
             info = client.get_repo(owner, repo)
@@ -445,6 +460,7 @@ class RunnerManager:
             version=version,
             remote_conflict=remote_conflict,
             same_repo_runners=same_repo,
+            runner_env=env_pairs,
         )
         warnings: list[str] = []
         if not plan.private:
@@ -540,6 +556,11 @@ class RunnerManager:
                 registered = _registration_happened(runner_dir, e)
                 raise
             registered = True
+
+            if plan.runner_env:
+                keys = ", ".join(k for k, _ in plan.runner_env)
+                report(Step.ENV, f"写入 runner 环境变量（.env：{keys}）")
+                installer.write_env_file(runner_dir, dict(plan.runner_env))
 
             report(Step.VERIFY, "读取 .runner")
             file_info = runner_file.read_runner_file(runner_dir)
@@ -1086,13 +1107,15 @@ class RunnerManager:
         on_state: Callable[[LocalState, str | None], None] | None = None,
         on_job_finished: Callable[[str, str], None] | None = None,
         max_lines: int = 2000,
+        launch: Launch = Launch.CONSOLE,
     ) -> RunnerProcess:
         """A (not yet started) RunnerProcess for `record`, using the injected popen.
 
         With `settings.proxy` set, run.cmd gets https_proxy / http_proxy so the runner reaches
         GitHub through it. Only these overrides are passed; RunnerProcess builds the full child
         environment (without secrets such as RUNNERDECK_PAT) itself. Callbacks run on
-        background threads (see RunnerProcess).
+        background threads (see RunnerProcess). launch: Launch.HELPER for a caller without a
+        console (the GUI), see process.Launch.
         """
         proxy = self._store.load().settings.proxy
         return RunnerProcess(
@@ -1103,4 +1126,5 @@ class RunnerManager:
             on_job_finished=on_job_finished,
             popen=self._popen,
             max_lines=max_lines,
+            launch=launch,
         )

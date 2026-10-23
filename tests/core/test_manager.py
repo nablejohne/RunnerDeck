@@ -1952,3 +1952,58 @@ def test_occupied_treats_unreadable_dirs_as_taken(
     monkeypatch.setattr(Path, "iterdir", boom)
     assert manager_mod._occupied(target)
     assert not manager_mod._occupied(tmp_path / "missing")
+
+
+# --- runner_env (M2: the add wizard's PowerShell execution policy option) ---------------------
+
+
+def test_plan_add_runner_env_is_validated_and_kept(env: Env) -> None:
+    plan = env.manager.plan_add(OWNER, REPO, runner_env=manager_mod.POWERSHELL_POLICY_ENV)
+    assert plan.runner_env == (("PSExecutionPolicyPreference", "RemoteSigned"),)
+    assert env.manager.plan_add(OWNER, REPO).runner_env == ()
+    with pytest.raises(InvalidInputError, match="环境变量名不合法"):
+        env.manager.plan_add(OWNER, REPO, runner_env={"BAD KEY": "x"})
+    with pytest.raises(InvalidInputError, match="换行"):
+        env.manager.plan_add(OWNER, REPO, runner_env={"KEY": "a\nb"})
+
+
+def test_add_runner_writes_env_file_after_registration(env: Env) -> None:
+    plan = env.manager.plan_add(OWNER, REPO, runner_env=manager_mod.POWERSHELL_POLICY_ENV)
+    progress, report = collect()
+    record = env.manager.add_runner(plan, progress=report)
+    env_file = Path(record.path) / ".env"
+    assert env_file.read_text(encoding="utf-8").splitlines() == [
+        "PSExecutionPolicyPreference=RemoteSigned"
+    ]
+    steps = steps_of(progress)
+    assert steps.index(Step.ENV) == steps.index(Step.CONFIGURE) + 1
+    assert steps.index(Step.ENV) < steps.index(Step.VERIFY)
+    assert "PSExecutionPolicyPreference" in dict(progress)[Step.ENV]
+
+
+def test_add_runner_without_runner_env_leaves_no_env_file(env: Env) -> None:
+    progress, report = collect()
+    record = env.manager.add_runner(env.manager.plan_add(OWNER, REPO), progress=report)
+    assert not (Path(record.path) / ".env").exists()
+    assert Step.ENV not in steps_of(progress)
+
+
+def test_add_runner_env_write_failure_rolls_back(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(runner_dir: Path, updates: Mapping[str, str | None]) -> None:
+        raise InstallError("磁盘已满")
+
+    monkeypatch.setattr(installer, "write_env_file", broken)
+    plan = env.manager.plan_add(OWNER, REPO, runner_env=manager_mod.POWERSHELL_POLICY_ENV)
+    with pytest.raises(InstallError, match="磁盘已满"):
+        env.manager.add_runner(plan)
+    assert_rolled_back(env, plan)
+    assert env.client.count("create_remove_token") == 1  # the registration was undone
+
+
+def test_process_for_launch_passthrough(env: Env) -> None:
+    from runnerdeck.core.process import Launch
+
+    record = env.seed(path=str(make_runner_dir(env.root / "h")))
+    manager = RunnerManager(env.store, env.factory, cache=env.cache)  # type: ignore[arg-type]
+    assert manager.process_for(record).launch is Launch.CONSOLE
+    assert manager.process_for(record, launch=Launch.HELPER).launch is Launch.HELPER

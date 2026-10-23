@@ -171,3 +171,28 @@ def cmd_exe() -> str:
         return "cmd.exe"  # tests only; nothing runs it off Windows
     system_root = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR") or "C:\\Windows"
     return os.path.join(system_root, "System32", "cmd.exe")
+
+
+# --- console helper (GUI stop path) ----------------------------------------------------
+
+HELPER_EXE_NAME = "runnerdeck-helper.exe"  # built next to RunnerDeck.exe by RunnerDeck.spec
+HELPER_MODULE = "runnerdeck.core.console_helper"
+HELPER_STOP_COMMAND = b"stop"  # console_helper.STOP_COMMAND (not imported: it is stdlib-only)
+
+
+def helper_command() -> list[str]:
+    """Command that starts core/console_helper.py (append the runner dir).
+
+    Frozen (PyInstaller): the console exe next to this one. From source: this interpreter
+    (python.exe even when we run under pythonw.exe, which has no console subsystem) with
+    `-I` so that neither the cwd nor PYTHONPATH can plant a module in front of ours.
+    """
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).with_name(HELPER_EXE_NAME)
+        if not exe.is_file():
+            raise ProcessError(f"找不到 {exe}，安装不完整")
+        return [str(exe)]
+    python = Path(sys.executable)
+    if python.name.lower() == "pythonw.exe":
+        python = python.with_name("python.exe")
+    return [str(python), "-I", "-m", HELPER_MODULE]
