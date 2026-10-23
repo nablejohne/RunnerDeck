@@ -597,7 +597,9 @@ class Harness:
 
     def _kill_tree(self, pid: int) -> tuple[list[int], list[int]]:
         self.tree_kills.append(pid)
-        procs = self.start_manager.procs.values() if self.start_manager is not None else []
+        if self.start_manager is None:  # real processes (Windows-only tests): really kill them
+            return winproc.kill_tree_report(pid)
+        procs = self.start_manager.procs.values()
         for proc in procs:
             if proc.pid == pid:
                 return ([pid], []) if proc.kill() else ([], [pid])
