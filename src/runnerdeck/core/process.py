@@ -6,6 +6,9 @@ Grounded in docs/spike-notes.md:
 - §5: only CTRL_BREAK delivered through a console shared with run.cmd stops the listener cleanly
   (it deletes its session, a restart works at once). Every other way is a hard kill and leaves
   the GitHub session behind for ~3 minutes.
+- §5: run.cmd ends with `exit /b 0` whatever the Listener returned (kill_listener: Listener
+  code 15, cmd.exe rc=0). The Listener's own exit code is only visible in run-helper's output
+  ("Exiting after unknown error code: 15"), so an unexpected exit is detected from that line.
 - §8: stdin must be DEVNULL so cmd.exe's "Terminate batch job (Y/N)?" prompt ends by itself, and
   the child must not get CREATE_NO_WINDOW or CTRL_BREAK silently stops reaching it.
 """
@@ -36,7 +39,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-RUN_COMMAND = ("cmd.exe", "/c", "run.cmd")
+RUN_SCRIPT = "run.cmd"  # run as `<abs cmd.exe> /c run.cmd` with cwd = runner dir
 DEFAULT_STOP_TIMEOUT_S = 15.0  # spike §8: Ctrl+Break normally ends run.cmd in ~0.4 s
 KILL_WAIT_S = 10.0  # after kill_tree, how long to wait for cmd.exe to be gone
 READER_JOIN_TIMEOUT_S = 5.0  # after exit, grace for the reader to drain the pipe
@@ -62,7 +65,8 @@ class EventKind(StrEnum):
 class RunnerEvent:
     """One recognised run.cmd output line.
 
-    detail: runner version (VERSION), job name (BUSY, COMPLETED) or exit code (EXITED).
+    detail: runner version (VERSION), job name (BUSY, COMPLETED) or the Listener's exit code
+    as reported by run-helper (EXITED).
     result: job result such as "Failed" / "Succeeded" (COMPLETED only).
     """
 
@@ -88,6 +92,18 @@ _EVENT_PATTERNS: tuple[tuple[re.Pattern[str], EventKind], ...] = (
     (re.compile(r"Exiting after unknown error code: (?P<detail>-?\d+)"), EventKind.EXITED),
 )
 
+# run-helper.cmd's other Listener-exit lines carry no number; each stands for one Listener exit
+# code (actions/runner src/Misc/layoutroot/run-helper.cmd.template). Not captured in a spike yet
+# (only the "unknown error code" line is, §5): an unmatched wording only loses the detection.
+# Codes 2/3/4 make run.cmd relaunch the Listener, whose own exit line then replaces the code.
+_HELPER_EXIT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"Runner listener exit with terminated error"), "1"),
+    (re.compile(r"Runner listener exit with retryable error"), "2"),
+    (re.compile(r"Runner listener exit because of updating, re-launch ephemeral runner"), "4"),
+    (re.compile(r"Runner listener exit because of updating"), "3"),
+    (re.compile(r"Runner listener exit with Session Conflict error"), "5"),
+)
+
 
 def parse_line(line: str) -> RunnerEvent | None:
     """Classify one decoded output line; None for everything else (banners, cmd.exe prompts)."""
@@ -96,6 +112,9 @@ def parse_line(line: str) -> RunnerEvent | None:
         if m:
             groups = m.groupdict()
             return RunnerEvent(kind, groups.get("detail"), groups.get("result"))
+    for pattern, code in _HELPER_EXIT_PATTERNS:
+        if pattern.search(line):
+            return RunnerEvent(EventKind.EXITED, code)
     return None
 
 
@@ -130,7 +149,8 @@ class OutputStateMachine:
                 self.runner_version = event.detail
             case _:
                 # CONNECTED is also printed on every conflict retry, so it proves nothing;
-                # EXITED is handled by RunnerProcess from the real exit code.
+                # EXITED leaves the state alone: RunnerProcess records the Listener's code from
+                # it and decides STOPPED / ERROR when run.cmd ends (cmd.exe itself exits 0).
                 pass
         return (self.state, self.current_job, self.last_job) != before
 
@@ -171,16 +191,8 @@ def _format_exit_code(rc: int) -> str:
     return f"{rc} (0x{rc & 0xFFFFFFFF:08X})" if rc < 0 or rc > 0xFFFF else str(rc)
 
 
-def _merge_env(overrides: Mapping[str, str] | None) -> dict[str, str] | None:
-    if not overrides:
-        return None
-    merged = dict(os.environ)
-    if winproc.IS_WINDOWS:
-        # Windows env names are case-insensitive; two spellings in one block is undefined.
-        upper = {key.upper() for key in overrides}
-        merged = {k: v for k, v in merged.items() if k.upper() not in upper}
-    merged.update(overrides)
-    return merged
+def _survivor_error(pids: list[int]) -> str:
+    return f"无法结束 runner 进程（PID {', '.join(map(str, pids))}）"
 
 
 class RunnerProcess:
@@ -235,11 +247,13 @@ class RunnerProcess:
         self._current_job: str | None = None
         self._state_since = _now()
         self._exit_code: int | None = None
+        self._listener_exit: int | None = None
         self._last_error: str | None = None
         self._last_line: str | None = None
         self._started_at: datetime | None = None
         self._stopped_at: datetime | None = None
         self._last_stop_forced = False
+        self._killed_elsewhere = False  # note_forced_kill() during the current run
         self._last_stop: tuple[int, StopResult] | None = None
 
     # --- thread-safe read access --------------------------------------------------------------
@@ -277,9 +291,20 @@ class RunnerProcess:
 
     @property
     def exit_code(self) -> int | None:
-        """Exit code of the most recent run; None while running or before the first run."""
+        """Exit code of the run.cmd cmd.exe of the most recent run; None while running or before
+        the first run. Normally 0 even after a Listener crash (spike §5): see listener_exit_code.
+        """
         with self._lock:
             return self._exit_code
+
+    @property
+    def listener_exit_code(self) -> int | None:
+        """Listener exit code that run-helper last reported in the current / most recent run.
+
+        None until such a line appears (a hard kill of the cmd.exe chain prints none).
+        """
+        with self._lock:
+            return self._listener_exit
 
     @property
     def last_error(self) -> str | None:
@@ -305,7 +330,7 @@ class RunnerProcess:
 
     @property
     def last_stop_forced(self) -> bool:
-        """True if the most recent run was ended by a hard kill from stop() (session lingers)."""
+        """True if the most recent run was ended by a hard kill (session lingers ~3 min)."""
         with self._lock:
             return self._last_stop_forced
 
@@ -334,7 +359,7 @@ class RunnerProcess:
             with self._lock:
                 if self._active:
                     raise ProcessError(f"runner 已在运行（PID {self._proc_pid_locked()}）")
-            run_cmd = self._runner_dir / RUN_COMMAND[-1]
+            run_cmd = self._runner_dir / RUN_SCRIPT
             if not run_cmd.is_file():
                 raise ProcessError(f"找不到 {run_cmd}，这不是一个 runner 目录")
             others = self._external_pids()
@@ -345,7 +370,8 @@ class RunnerProcess:
                 )
             try:
                 proc = self._popen(
-                    list(RUN_COMMAND),
+                    # Absolute cmd.exe: never one planted in the runner dir or on PATH.
+                    [winproc.cmd_exe(), "/c", RUN_SCRIPT],
                     cwd=str(self._runner_dir),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
@@ -353,7 +379,9 @@ class RunnerProcess:
                     # Own process group so CTRL_BREAK can target it; deliberately NOT
                     # CREATE_NO_WINDOW, which makes CTRL_BREAK silently ineffective (spike §5).
                     creationflags=winproc.CREATE_NEW_PROCESS_GROUP,
-                    env=_merge_env(self._env),
+                    # Always explicit: workflow jobs inherit run.cmd's environment, so the
+                    # PAT variables (RUNNERDECK_PAT, GH_TOKEN, ...) must not be in it.
+                    env=winproc.child_environment(self._env),
                 )
             except (OSError, ValueError, subprocess.SubprocessError) as e:
                 raise ProcessError(f"无法启动 {run_cmd}：{e}") from e
@@ -366,11 +394,13 @@ class RunnerProcess:
                 self._stop_requested = False
                 self._machine = OutputStateMachine()
                 self._exit_code = None
+                self._listener_exit = None
                 self._last_error = None
                 self._last_line = None
                 self._started_at = _now()
                 self._stopped_at = None
                 self._last_stop_forced = False
+                self._killed_elsewhere = False
                 self._publish_locked(LocalState.STARTING, None)
                 reader = threading.Thread(
                     target=self._read_loop,
@@ -383,10 +413,22 @@ class RunnerProcess:
             try:
                 reader.start()
             except RuntimeError as e:  # interpreter cannot create threads any more
-                self._kill(proc.pid)
+                self._kill(proc.pid)  # best effort; the run is reported as ERROR anyway
                 self._finalize(gen, None, error=f"无法启动输出读取线程：{e}")
                 raise ProcessError(f"无法启动输出读取线程：{e}") from e
         self._emit()
+
+    def note_forced_kill(self) -> None:
+        """Record that the caller is about to hard-kill this run's process tree itself.
+
+        Used by the CLI's second Ctrl+C, which kills run.cmd while stop() is still waiting
+        for Ctrl+Break: without this, stop() would see the exit and report it as graceful.
+        Safe from any thread; does not take the control lock held by a running stop().
+        """
+        with self._lock:
+            if self._active:
+                self._killed_elsewhere = True
+                self._last_stop_forced = True
 
     def stop(self, timeout: float = DEFAULT_STOP_TIMEOUT_S) -> StopResult:
         """Stop the runner: Ctrl+Break first, hard kill if that fails. Final state STOPPED.
@@ -394,7 +436,10 @@ class RunnerProcess:
         Blocks up to `timeout` (+ kill/drain time). Idempotent: when not running, returns the
         result of the stop that ended the latest run, or graceful=True / exit_code=None.
         Safe to call from any thread except from inside this object's callbacks.
-        Raises ProcessError only if the process survives the kill (state stays STOPPING).
+        Raises ProcessError naming the PIDs that could not be killed:
+        - run.cmd's cmd.exe survives the kill: state stays STOPPING, a later stop() retries;
+        - run.cmd ended but Runner.* processes under the dir survive (e.g. access denied): the
+          run is over, state becomes ERROR with that message in last_error.
         """
         self._forbid_in_callback("stop")
         with self._control_lock:
@@ -423,14 +468,17 @@ class RunnerProcess:
             else:
                 log.info("no console: Ctrl+Break cannot reach pid %s, killing", pid)
 
+            with self._lock:
+                if self._killed_elsewhere:
+                    graceful = False  # the wait ended because note_forced_kill()'s caller killed it
             if graceful:
-                killed = self._kill_leftovers()
+                killed, survivors = self._kill_leftovers()
             else:
                 with self._lock:
                     self._last_stop_forced = True
-                killed = self._kill(pid)
+                killed, survivors = self._kill(pid)
                 if not self._wait_proc(proc, KILL_WAIT_S):
-                    message = f"无法结束 runner 进程（PID {pid}）"
+                    message = _survivor_error(sorted({pid, *survivors}))
                     with self._lock:
                         self._last_error = message
                     raise ProcessError(message)
@@ -445,6 +493,10 @@ class RunnerProcess:
             )
             with self._lock:
                 self._last_stop = (gen, result)
+            if survivors:
+                message = _survivor_error(survivors)
+                self._fail_ended_run(gen, message)
+                raise ProcessError(message)
             log.info("stopped %s: %s", self._runner_dir, result)
             return result
 
@@ -514,6 +566,9 @@ class RunnerProcess:
     def _apply_event_locked(self, event: RunnerEvent) -> None:
         machine = self._machine
         machine.feed(event)
+        if event.kind == EventKind.EXITED and event.detail is not None:
+            # A relaunch (codes 2/3/4) prints a new line when that Listener exits.
+            self._listener_exit = int(event.detail)
         if event.kind == EventKind.COMPLETED and machine.last_job is not None:
             if self._on_job_finished is not None:
                 self._pending.append(("job", machine.last_job))
@@ -532,20 +587,46 @@ class RunnerProcess:
             self._active = False
             self._exit_code = rc
             self._stopped_at = _now()
-            if error is None and (self._stop_requested or rc == 0):
+            if error is None and not self._stop_requested:
+                error = self._unexpected_exit_locked(rc)
+            if error is None:
                 state = LocalState.STOPPED
             else:
-                if error is None:
-                    code = "未知" if rc is None else _format_exit_code(rc)
-                    error = f"runner 意外退出（退出码 {code}）"
-                    if self._last_line:
-                        error += f"：{self._last_line[:200]}"
                 self._last_error = error
                 state = LocalState.ERROR
             self._publish_locked(state, None)
-        log.info("%s exited with %s -> %s", self._runner_dir, rc, state)
+            listener = self._listener_exit
+        log.info("%s exited with %s (listener %s) -> %s", self._runner_dir, rc, listener, state)
         self._emit()
         return True
+
+    def _unexpected_exit_locked(self, rc: int | None) -> str | None:
+        """Error text for a run that ended without stop(), or None if it ended cleanly.
+
+        cmd.exe's rc alone says nothing: run.cmd returns 0 after any Listener exit (spike §5),
+        so a non-zero Listener code from run-helper's line counts as well.
+        """
+        listener = self._listener_exit
+        if rc == 0 and not listener:
+            return None
+        codes = []
+        if rc != 0:
+            codes.append(f"退出码 {'未知' if rc is None else _format_exit_code(rc)}")
+        if listener:
+            codes.append(f"Listener 退出码 {_format_exit_code(listener)}")
+        error = f"runner 意外退出（{'，'.join(codes)}）"
+        if self._last_line:
+            error += f"：{self._last_line[:200]}"
+        return error
+
+    def _fail_ended_run(self, gen: int, message: str) -> None:
+        """Mark the already finalized run `gen` as ERROR (stop() left runner processes behind)."""
+        with self._lock:
+            if gen != self._gen or self._active:
+                return
+            self._last_error = message
+            self._publish_locked(LocalState.ERROR, None)
+        self._emit()
 
     def _join_reader(self, reader: threading.Thread | None, gen: int, rc: int | None) -> None:
         """After the process exited: let the reader drain, finalize ourselves if it is stuck.
@@ -639,34 +720,46 @@ class RunnerProcess:
         except (psutil.Error, OSError) as e:
             raise ProcessError(f"无法检查 {self._runner_dir} 下的 runner 进程：{e}") from e
 
-    def _kill(self, pid: int) -> list[int]:
+    def _kill(self, pid: int) -> tuple[list[int], list[int]]:
+        """Kill the run.cmd tree, then leftovers. (gone pids, surviving Runner.* pids).
+
+        Whether cmd.exe itself is gone is left to the caller (it waits on the Popen).
+        """
         import psutil
 
         killed: list[int] = []
         try:
-            killed.extend(winproc.kill_tree(pid))
+            gone, alive = winproc.kill_tree_report(pid)
+            killed.extend(gone)
+            if alive:
+                log.warning("still alive after kill_tree(%s): %s", pid, alive)
         except (psutil.Error, OSError) as e:
             log.warning("kill_tree(%s) failed: %s", pid, e)
-        killed.extend(self._kill_leftovers())
-        return list(dict.fromkeys(killed))
+        gone, survivors = self._kill_leftovers()
+        killed.extend(gone)
+        return list(dict.fromkeys(killed)), survivors
 
-    def _kill_leftovers(self) -> list[int]:
-        """Kill Runner.* processes still under the dir (e.g. a Worker that outlived its parent)."""
+    def _kill_leftovers(self) -> tuple[list[int], list[int]]:
+        """Kill Runner.* processes still under the dir (e.g. a Worker that outlived its parent).
+
+        Returns (gone pids, surviving pids). If the process scan itself fails nothing is known
+        to survive, so ([], []).
+        """
         import psutil
 
         try:
             leftovers = winproc.find_runner_processes(self._runner_dir)
-            if not leftovers:
-                return []
-            log.warning(
-                "killing leftover runner processes in %s: %s",
-                self._runner_dir,
-                [p.pid for p in leftovers],
-            )
-            return winproc.kill_processes(leftovers)
         except (psutil.Error, OSError) as e:
             log.warning("cleaning up leftovers in %s failed: %s", self._runner_dir, e)
-            return []
+            return [], []
+        if not leftovers:
+            return [], []
+        log.warning(
+            "killing leftover runner processes in %s: %s",
+            self._runner_dir,
+            [p.pid for p in leftovers],
+        )
+        return _kill_checked(leftovers)
 
 
 # --- processes not owned by a RunnerProcess -----------------------------------------------
@@ -680,18 +773,35 @@ def running_processes(runner_dir: Path) -> list[psutil.Process]:
     return winproc.find_runner_processes(runner_dir)
 
 
-def stop_external(runner_dir: Path) -> list[int]:
+@dataclass(frozen=True)
+class ExternalStop:
+    """Outcome of stop_external()."""
+
+    killed: list[int]  # pids confirmed gone
+    survivors: list[int]  # Runner.*.exe / run.cmd cmd.exe pids still alive after the kill
+
+    @property
+    def ok(self) -> bool:
+        return not self.survivors
+
+
+def stop_external(runner_dir: Path) -> ExternalStop:
     """Hard-kill a runner started elsewhere (another terminal, double-clicked run.cmd).
 
     Kills each runner process together with its launching cmd.exe chain (only cmd.exe whose
     command line runs run.cmd / run-helper.cmd) and their descendants, like `taskkill /T /F`.
-    Always a hard kill: the GitHub session lingers ~3 minutes (spike §5). Returns killed PIDs.
+    Always a hard kill: the GitHub session lingers ~3 minutes (spike §5).
+    Never kills this process or its ancestors; runner processes among them count as survivors.
+    No runner processes -> ExternalStop([], []). Raises ProcessError if the scan fails.
     """
     import psutil
 
-    procs = winproc.find_runner_processes(runner_dir)
+    try:
+        procs = winproc.find_runner_processes(runner_dir)
+    except (psutil.Error, OSError) as e:
+        raise ProcessError(f"无法检查 {runner_dir} 下的 runner 进程：{e}") from e
     if not procs:
-        return []
+        return ExternalStop([], [])
     protected = _own_lineage()
     runner_pids = {p.pid for p in procs}
     roots: dict[int, psutil.Process] = {}
@@ -700,27 +810,74 @@ def stop_external(runner_dir: Path) -> list[int]:
             continue  # e.g. Worker under Listener: covered by the Listener's tree
         root = _launcher_root(proc)
         roots.setdefault(root.pid, root)
+    shells = {pid for pid in roots if pid not in runner_pids and pid not in protected}
 
-    killed: list[int] = []
-    for pid in roots:
+    is_gone: dict[int, bool] = {}  # latest observation per pid, in kill order
+
+    def observe(gone: list[int], alive: list[int]) -> None:
+        is_gone.update(dict.fromkeys(gone, True))
+        is_gone.update(dict.fromkeys(alive, False))
+
+    for pid, root in roots.items():
         if pid in protected:
             log.warning("not killing %s: it is this process or one of its ancestors", pid)
             continue
-        if pid in killed:
+        if is_gone.get(pid):
             continue
         try:
-            killed.extend(winproc.kill_tree(pid))
+            observe(*winproc.kill_tree_report(pid))
         except (psutil.Error, OSError) as e:
             log.warning("kill_tree(%s) failed: %s", pid, e)
+            observe([], [pid] if _still_running(root) else [])
+
+    # The rescan is the truth for runner processes: kill what the trees missed (or what was
+    # started meanwhile); runner processes it no longer finds are gone.
     try:
-        leftovers = [p for p in winproc.find_runner_processes(runner_dir) if p.pid not in protected]
-        if leftovers:
-            killed.extend(winproc.kill_processes(leftovers))
+        leftovers = winproc.find_runner_processes(runner_dir)
     except (psutil.Error, OSError) as e:
-        log.warning("cleaning up leftovers in %s failed: %s", runner_dir, e)
-    result = list(dict.fromkeys(killed))
-    log.info("stop_external(%s) killed %s", runner_dir, result)
+        log.warning("rescanning %s failed: %s", runner_dir, e)
+        leftovers = [p for p in procs if _still_running(p)]
+    leftover_pids = {p.pid for p in leftovers}
+    observe(sorted(runner_pids - leftover_pids), sorted(leftover_pids))
+    runner_pids |= leftover_pids
+    targets = [p for p in leftovers if p.pid not in protected]
+    if targets:
+        observe(*_kill_checked(targets))
+    result = ExternalStop(
+        [pid for pid, gone in is_gone.items() if gone],
+        sorted(
+            pid
+            for pid, gone in is_gone.items()
+            if not gone and (pid in runner_pids or pid in shells)
+        ),
+    )
+    log.info("stop_external(%s): %s", runner_dir, result)
     return result
+
+
+def _kill_checked(procs: list[psutil.Process]) -> tuple[list[int], list[int]]:
+    """winproc.kill_processes_report that never hides a survivor behind an error.
+
+    psutil's wait raises AccessDenied on Windows for a process we may not open (e.g. one
+    started elevated); such a process was not killed either, so check what is still running.
+    """
+    import psutil
+
+    try:
+        return winproc.kill_processes_report(procs)
+    except (psutil.Error, OSError) as e:
+        log.warning("killing %s failed: %s", [p.pid for p in procs], e)
+    alive = sorted(p.pid for p in procs if _still_running(p))
+    return sorted(p.pid for p in procs if p.pid not in alive), alive
+
+
+def _still_running(proc: psutil.Process) -> bool:
+    import psutil
+
+    try:
+        return proc.is_running()
+    except psutil.Error:  # cannot tell: never report it as gone
+        return True
 
 
 def _parent_pid(proc: psutil.Process) -> int | None:

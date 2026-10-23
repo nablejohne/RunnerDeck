@@ -14,8 +14,10 @@ import io
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from collections.abc import Callable, Iterator
@@ -30,7 +32,9 @@ from pydantic import SecretStr
 
 from runnerdeck.core import cli, secrets, winproc
 from runnerdeck.core.cli import (
+    EXTERNAL_EXIT_HINT,
     LINGER_HINT,
+    PROG,
     RECONNECTING_HINT,
     CliDeps,
     Console,
@@ -57,7 +61,7 @@ from runnerdeck.core.models import (
     RunnerRecord,
     RunnerToken,
 )
-from runnerdeck.core.process import StopMethod, StopResult
+from runnerdeck.core.process import ExternalStop, StopMethod, StopResult
 from runnerdeck.core.redact import register_secret
 from runnerdeck.core.store import ConfigStore
 
@@ -313,19 +317,67 @@ def release_json(data: bytes) -> dict[str, Any]:
 # --- fake processes for `start` ---------------------------------------------------------------
 
 
+def press_ctrl_c() -> None:
+    """What a Ctrl+C in the console does to us: SIGINT, handled on the main thread.
+
+    Called from another thread it behaves like Windows, where the console's control thread
+    trips the signal while the main thread is busy elsewhere. From another thread it is
+    skipped when only Python's default handler is installed: nothing in `start` would catch
+    that KeyboardInterrupt, it would hit pytest itself.
+    """
+    if (
+        threading.current_thread() is not threading.main_thread()
+        and signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    ):
+        return
+    signal.raise_signal(signal.SIGINT)
+
+
+def blocking_wait(event: threading.Event, timeout: float) -> bool:
+    """Wait like Popen.wait() on Windows (WaitForSingleObject): a Ctrl+C that arrives during
+    the wait is only raised once the wait is over, never in the middle of it."""
+    deadline = time.monotonic() + timeout
+    pending: BaseException | None = None
+    while True:
+        try:
+            done = event.wait(max(0.0, deadline - time.monotonic()))
+        except KeyboardInterrupt as e:
+            pending = e
+            continue
+        if done or time.monotonic() >= deadline:
+            break
+    if pending is not None:
+        raise pending
+    return done
+
+
 @dataclass
 class Script:
-    """What a FakeProcess does: output on start, how it ends, what stop() returns."""
+    """What a FakeProcess does: output on start, how it ends, how it takes stop() and kills."""
 
     lines: list[str] = field(default_factory=list)
     states: list[tuple[LocalState, str | None]] = field(default_factory=list)
     start_error: BaseException | None = None
     exit_code: int | None = None  # set: the runner exits on its own right after start
     last_error: str | None = None
-    stop_results: list[StopResult | BaseException] = field(default_factory=list)
+    stop_results: list[StopResult | BaseException] = field(default_factory=list)  # scripted
+    ignore_ctrl_break: bool = False  # stop() blocks for its whole timeout unless killed
+    survive_kill: bool = False  # killing it fails (e.g. it belongs to another account)
+    hang_in_stop: bool = False  # stop() does not return for a long time, whatever happens
+    ctrl_c_in_start: bool = False  # the user presses Ctrl+C while start() runs
+    interrupt_in_start: bool = False  # a KeyboardInterrupt escapes start() after the spawn
+    ctrl_c_in_stop: bool = False  # the user presses Ctrl+C again while stop() waits
+    ctrl_c_on_kill: bool = False  # ... and again while the supervisor kills it
 
 
 class FakeProcess:
+    """Stands in for RunnerProcess, including how its stop() blocks.
+
+    The real stop() sends Ctrl+Break and then waits in Popen.wait(timeout), on Windows a
+    WaitForSingleObject that Ctrl+C cannot interrupt. Only the process exiting (it honours
+    Ctrl+Break, or it is killed) or the timeout ends that wait; here too (blocking_wait).
+    """
+
     _next_pid = 1000
 
     def __init__(self, record: RunnerRecord, script: Script, on_line: Any, on_state: Any) -> None:
@@ -339,35 +391,74 @@ class FakeProcess:
         self.exit_code: int | None = None
         self.last_error: str | None = None
         self.stop_calls: list[float] = []
+        self.stop_threads: list[threading.Thread] = []
+        self.kill_calls = 0
+        self.forced_noted = False
+        self.exited = threading.Event()
 
     def start(self) -> None:
         if self.script.start_error is not None:
             raise self.script.start_error
-        self.running = True
+        self.running = True  # run.cmd exists from here on
         for line in self.script.lines:
             self.on_line(line)
         for state, job in self.script.states:
             self.on_state(state, job)
+        if self.script.ctrl_c_in_start:
+            press_ctrl_c()
+        if self.script.interrupt_in_start:
+            raise KeyboardInterrupt
         if self.script.exit_code is not None:
-            self.running = False
-            self.exit_code = self.script.exit_code
             self.last_error = self.script.last_error
+            self.exit(self.script.exit_code)
+
+    def exit(self, code: int | None) -> None:
+        self.running = False
+        self.exit_code = code
+        self.exited.set()
 
     def is_running(self) -> bool:
         return self.running
 
+    def note_forced_kill(self) -> None:
+        self.forced_noted = True
+
+    def kill(self) -> bool:
+        """What killing its process tree does to it; False if it survives."""
+        self.kill_calls += 1
+        if self.script.ctrl_c_on_kill:
+            press_ctrl_c()
+        if self.script.survive_kill:
+            return False
+        self.exit(1)
+        return True
+
     def stop(self, timeout: float = 15.0) -> StopResult:
         self.stop_calls.append(timeout)
-        result = (
-            self.script.stop_results.pop(0)
-            if self.script.stop_results
-            else StopResult(True, StopMethod.CTRL_BREAK, 0, [])
-        )
-        if isinstance(result, BaseException):
-            raise result
-        self.running = False
-        self.exit_code = result.exit_code
-        return result
+        self.stop_threads.append(threading.current_thread())
+        if not self.running:
+            return StopResult(True, StopMethod.CTRL_BREAK, self.exit_code, [])
+        if self.script.stop_results:
+            result = self.script.stop_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            self.exit(result.exit_code)
+            return result
+        if self.script.hang_in_stop:
+            blocking_wait(self.exited, 5.0)
+            raise ProcessError(f"无法结束 runner 进程（PID {self.pid}）")
+        if not self.script.ignore_ctrl_break:
+            self.exit(0)
+            return StopResult(True, StopMethod.CTRL_BREAK, 0, [])
+        if self.script.ctrl_c_in_stop:
+            threading.Timer(0.05, press_ctrl_c).start()  # lands while we are blocked below
+        if blocking_wait(self.exited, timeout):  # killed meanwhile
+            if self.forced_noted:  # like RunnerProcess: a noted forced kill is not graceful
+                return StopResult(False, StopMethod.KILL, self.exit_code, [])
+            return StopResult(True, StopMethod.CTRL_BREAK, self.exit_code, [])
+        if self.kill():
+            return StopResult(False, StopMethod.KILL, 1, [self.pid])
+        raise ProcessError(f"无法结束 runner 进程（PID {self.pid}）")
 
 
 class FakeStartManager:
@@ -446,8 +537,11 @@ class Harness:
         self.client.release_json = release_json(build_runner_zip(zip_path))
         self.cache = FakeCache(zip_path)
         self.running: dict[str, list[Any]] = {}
-        self.stop_results: dict[str, list[int] | BaseException] = {}
+        self.stop_results: dict[str, ExternalStop | BaseException] = {}
         self.stopped: list[Path] = []
+        self.tree_kills: list[int] = []
+        self.stop_timeout_s = 7.5
+        self.stop_grace_s = cli.STOP_GRACE_S
         self.sleep_fn: Callable[[float], None] = lambda s: None
         self.sleeps: list[float] = []
         self.popen: Any = subprocess.Popen
@@ -494,12 +588,20 @@ class Harness:
     def _find(self, runner_dir: Path) -> list[Any]:
         return self.running.get(str(runner_dir), [])
 
-    def _stop_external(self, runner_dir: Path) -> list[int]:
+    def _stop_external(self, runner_dir: Path) -> ExternalStop:
         self.stopped.append(runner_dir)
-        value = self.stop_results.get(str(runner_dir), [])
+        value = self.stop_results.get(str(runner_dir), ExternalStop([], []))
         if isinstance(value, BaseException):
             raise value
         return value
+
+    def _kill_tree(self, pid: int) -> tuple[list[int], list[int]]:
+        self.tree_kills.append(pid)
+        procs = self.start_manager.procs.values() if self.start_manager is not None else []
+        for proc in procs:
+            if proc.pid == pid:
+                return ([pid], []) if proc.kill() else ([], [pid])
+        return [], []
 
     def _sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
@@ -516,10 +618,12 @@ class Harness:
             client_factory=self._client_factory,
             manager_factory=self._manager_factory,
             stop_external=self._stop_external,
+            kill_tree=self._kill_tree,
             sleep=self._sleep,
             clock=lambda: NOW,
             poll_interval_s=0.01,
-            stop_timeout_s=7.5,
+            stop_timeout_s=self.stop_timeout_s,
+            stop_grace_s=self.stop_grace_s,
         )
 
     def run(self, *argv: str) -> Result:
@@ -550,10 +654,18 @@ class Harness:
         self.store.save(config)
         return record
 
+    def release(self) -> None:
+        """End every fake runner, so no stop() thread a test gave up on outlives the test."""
+        if self.start_manager is not None:
+            for proc in self.start_manager.procs.values():
+                proc.exited.set()
+
 
 @pytest.fixture
-def h(isolated_home: Path, memory_keyring: Any) -> Harness:
-    return Harness(isolated_home, memory_keyring)
+def h(isolated_home: Path, memory_keyring: Any) -> Iterator[Harness]:
+    harness = Harness(isolated_home, memory_keyring)
+    yield harness
+    harness.release()
 
 
 # --- argument parsing -------------------------------------------------------------------------
@@ -1184,6 +1296,7 @@ def test_start_runners_that_exit_on_their_own(h: Harness) -> None:
     assert result.code == 1
     assert "[ok] 已退出（退出码 0）" in result.out
     assert "错误：[bad] runner 意外退出（退出码 3）：boom" in result.err
+    assert f"[bad] {EXTERNAL_EXIT_HINT.format(prog=PROG, key='bad')}" in result.err
     assert h.sleeps == []  # nothing left running, no waiting
     assert "收到 Ctrl+C" not in result.out
 
@@ -1227,30 +1340,137 @@ def test_start_nothing_started(h: Harness) -> None:
     assert "按 Ctrl+C" not in result.out
 
 
-def test_start_second_ctrl_c_forces(h: Harness) -> None:
-    forced = StopResult(False, StopMethod.KILL, 1, [5])
+def _press_on_sleep(seconds: float) -> None:
+    press_ctrl_c()  # a real SIGINT during the poll sleep, as the console delivers it
+
+
+def test_start_second_ctrl_c_kills_without_waiting_for_ctrl_break(h: Harness) -> None:
+    # Both ignore Ctrl+Break. Their stop() blocks like the real one, which a 2nd Ctrl+C cannot
+    # interrupt; the supervisor must kill them instead of waiting out the 30 s.
     _start_scripts(
         h,
         {
-            "alpha": Script(stop_results=[KeyboardInterrupt(), forced]),
-            "beta": Script(stop_results=[forced]),
+            "alpha": Script(ignore_ctrl_break=True, ctrl_c_in_stop=True),
+            "beta": Script(ignore_ctrl_break=True),
         },
     )
-    h.sleep_fn = lambda s: (_ for _ in ()).throw(KeyboardInterrupt())
+    h.stop_timeout_s = 30.0
+    h.sleep_fn = _press_on_sleep
+    began = time.monotonic()
     result = h.run("start", "alpha", "beta")
-    assert result.code == 0
+    elapsed = time.monotonic() - began
+    assert result.code == 0, result.text
+    assert elapsed < 15, elapsed
     procs = h.start_manager.procs  # type: ignore[union-attr]
-    assert procs["alpha"].stop_calls == [7.5, 0.0]
-    assert procs["beta"].stop_calls == [0.0]  # no more waiting for the rest
+    alpha, beta = procs["alpha"], procs["beta"]
     assert "再次收到 Ctrl+C" in result.out
+    assert sorted(h.tree_kills) == sorted([alpha.pid, beta.pid])
+    assert f"[alpha] 已强制结束（PID {alpha.pid}）" in result.out
+    assert f"[beta] 已强制结束（PID {beta.pid}）" in result.out
     assert LINGER_HINT in result.out
+    # One graceful attempt each, at the same time, off the main thread.
+    assert alpha.stop_calls == beta.stop_calls == [30.0]
+    main = threading.main_thread()
+    assert all(t is not main for t in (*alpha.stop_threads, *beta.stop_threads))
+    assert not alpha.running and not beta.running
 
 
-def test_start_third_ctrl_c_gives_up(h: Harness) -> None:
-    _start_scripts(h, {"alpha": Script(stop_results=[KeyboardInterrupt(), KeyboardInterrupt()])})
+def test_start_third_ctrl_c_lists_runners_still_alive(h: Harness) -> None:
+    _start_scripts(
+        h,
+        {
+            "alpha": Script(
+                ignore_ctrl_break=True, survive_kill=True, ctrl_c_in_stop=True, ctrl_c_on_kill=True
+            ),
+            "beta": Script(ignore_ctrl_break=True, survive_kill=True),
+            "gamma": Script(),
+        },
+    )
+    h.stop_timeout_s = 30.0
+    h.sleep_fn = _press_on_sleep
+    began = time.monotonic()
+    result = h.run("start", "--all")
+    assert time.monotonic() - began < 15
+    assert result.code == 130
+    procs = h.start_manager.procs  # type: ignore[union-attr]
+    assert "又收到 Ctrl+C" in result.err
+    assert "[gamma] 已停止" in result.out
+    for name in ("alpha", "beta"):
+        pid = procs[name].pid
+        assert f"错误：[{name}] 强制结束失败，这些进程还在：PID {pid}" in result.err
+        assert f"[{name}] 没能确认已停止，可能仍在运行（PID {pid}）" in result.err
+        assert f"请执行 {PROG} stop {name} 结束它" in result.err
+    assert "gamma" not in result.err
+    assert LINGER_HINT not in result.out  # nothing was killed
+
+
+def test_start_kill_failure_never_exits_0(h: Harness) -> None:
+    _start_scripts(h, {"alpha": Script(ignore_ctrl_break=True, survive_kill=True)})
+    h.stop_timeout_s = 0.2
     h.sleep_fn = lambda s: (_ for _ in ()).throw(KeyboardInterrupt())
     result = h.run("start", "alpha")
-    assert result.code == 130
+    assert result.code == 1
+    pid = h.start_manager.procs["alpha"].pid  # type: ignore[union-attr]
+    assert f"错误：[alpha] 无法结束 runner 进程（PID {pid}）" in result.err
+    assert f"[alpha] 没能确认已停止，可能仍在运行（PID {pid}）" in result.err
+    assert f"{PROG} stop alpha" in result.err
+
+
+def test_start_stop_phase_is_bounded(h: Harness) -> None:
+    _start_scripts(h, {"stuck": Script(hang_in_stop=True), "fine": Script()})
+    h.stop_timeout_s = 0.1
+    h.stop_grace_s = 0.2
+    h.sleep_fn = _press_on_sleep
+    began = time.monotonic()
+    result = h.run("start", "stuck", "fine")
+    assert time.monotonic() - began < 3
+    assert result.code == 1
+    assert "错误：等了 0.3 秒，仍有 runner 没有停下" in result.err
+    pid = h.start_manager.procs["stuck"].pid  # type: ignore[union-attr]
+    assert f"[stuck] 没能确认已停止，可能仍在运行（PID {pid}）" in result.err
+    assert "[fine] 已停止" in result.out
+
+
+def test_start_ctrl_c_while_launching_stops_what_was_started(h: Harness) -> None:
+    _start_scripts(h, {"a": Script(), "b": Script(ctrl_c_in_start=True), "c": Script()})
+    result = h.run("start", "a", "b", "c")
+    assert result.code == 0, result.text
+    procs = h.start_manager.procs  # type: ignore[union-attr]
+    assert "c" not in procs  # not launched after the Ctrl+C
+    assert "没有启动：c" in result.out
+    assert procs["a"].stop_calls == procs["b"].stop_calls == [7.5]
+    assert not procs["a"].running and not procs["b"].running
+    assert "[b] 已停止" in result.out
+    assert h.sleeps == []
+    assert "按 Ctrl+C 停止所有 runner" not in result.out
+
+
+def test_start_interrupt_escaping_start_still_stops_that_runner(h: Harness) -> None:
+    # Without the SIGINT handler (off the main thread) a KeyboardInterrupt can still escape
+    # start() after run.cmd was spawned; that runner must be stopped like the others.
+    _start_scripts(h, {"a": Script(), "b": Script(interrupt_in_start=True)})
+    result = h.run("start", "a", "b")
+    assert result.code == 0, result.text
+    procs = h.start_manager.procs  # type: ignore[union-attr]
+    assert procs["b"].stop_calls == [7.5]
+    assert not procs["a"].running and not procs["b"].running
+
+
+def test_start_counts_ctrl_c_instead_of_raising_and_restores_handler(h: Harness) -> None:
+    _start_scripts(h, {"alpha": Script()})
+    before = signal.getsignal(signal.SIGINT)
+    during: list[Any] = []
+
+    def sleep(seconds: float) -> None:
+        during.append(signal.getsignal(signal.SIGINT))
+        press_ctrl_c()  # must not raise here
+
+    h.sleep_fn = sleep
+    result = h.run("start", "alpha")
+    assert result.code == 0, result.text
+    assert during and during[0] is not before
+    assert signal.getsignal(signal.SIGINT) is before
+    assert "[alpha] 已停止" in result.out
 
 
 def test_start_stop_failure_is_reported(h: Harness) -> None:
@@ -1261,6 +1481,24 @@ def test_start_stop_failure_is_reported(h: Harness) -> None:
     result = h.run("start", "alpha")
     assert result.code == 1
     assert "错误：[alpha] 无法结束 runner 进程（PID 9）" in result.err
+    assert f"{PROG} stop alpha" in result.err  # still running: say how to end it
+
+
+def test_start_reports_runner_ended_from_outside(h: Harness) -> None:
+    _start_scripts(h, {"alpha": Script()})
+    proc_of = h.start_manager.procs  # type: ignore[union-attr]
+
+    def killed_from_another_terminal(seconds: float) -> None:
+        proc = proc_of["alpha"]
+        proc.last_error = "runner 意外退出（退出码 15）：Exiting after unknown error code: 15"
+        proc.exit(15)
+
+    h.sleep_fn = killed_from_another_terminal
+    result = h.run("start", "alpha")
+    assert result.code == 1
+    assert "错误：[alpha] runner 意外退出（退出码 15）" in result.err
+    assert f"[alpha] {EXTERNAL_EXIT_HINT.format(prog=PROG, key='alpha')}" in result.err
+    assert "收到 Ctrl+C" not in result.out
 
 
 def test_start_reconnecting_hint_once_per_runner(h: Harness) -> None:
@@ -1333,9 +1571,82 @@ def test_start_with_real_runner_process_and_fake_popen(
     assert "[real] 状态：运行中：spike" in out
     assert "[real] 已退出（退出码 0）" in out
     ((args, kwargs),) = h.popen.calls
-    assert args == ["cmd.exe", "/c", "run.cmd"]
+    assert args == [winproc.cmd_exe(), "/c", "run.cmd"]
     assert kwargs["cwd"] == record.path
     assert kwargs["stdin"] is subprocess.DEVNULL
+
+
+class BlockingPopenProc:
+    """A run.cmd that keeps running until Ctrl+Break or a kill, like the real one."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+        self._exited = threading.Event()
+        read_fd, write_fd = os.pipe()
+        self.stdout = os.fdopen(read_fd, "rb")
+        self._pipe = os.fdopen(write_fd, "wb")
+        self._pipe.write(b"2026-10-22 08:09:45Z: Listening for Jobs\r\n")
+        self._pipe.flush()
+
+    def exit(self, rc: int) -> None:
+        if self.returncode is None:
+            self.returncode = rc
+            self._pipe.close()
+            self._exited.set()
+
+    def wait(self, timeout: float | None = None) -> int:
+        if not self._exited.wait(timeout):
+            raise subprocess.TimeoutExpired("run.cmd", timeout or 0.0)
+        assert self.returncode is not None
+        return self.returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+class BlockingPopen:
+    """Spawns BlockingPopenProc; optionally "presses Ctrl+C" while spawning one runner."""
+
+    def __init__(self, ctrl_c_while_spawning: str | None = None) -> None:
+        self.ctrl_c_while_spawning = ctrl_c_while_spawning
+        self.procs: dict[int, BlockingPopenProc] = {}
+
+    def __call__(self, args: list[str], **kwargs: Any) -> BlockingPopenProc:
+        proc = BlockingPopenProc(50_000 + len(self.procs))
+        self.procs[proc.pid] = proc
+        if Path(kwargs["cwd"]).name == self.ctrl_c_while_spawning:
+            # Ctrl+C during CreateProcess: Python raises it right after, still inside Popen,
+            # when the child already exists but nobody holds its handle yet.
+            signal.raise_signal(signal.SIGINT)
+        return proc
+
+    def ctrl_break(self, pid: int) -> None:
+        self.procs[pid].exit(0)
+
+    def kill_tree(self, pid: int, *, timeout: float = 5.0) -> tuple[list[int], list[int]]:
+        self.procs[pid].exit(1)
+        return [pid], []
+
+
+def test_start_ctrl_c_during_spawn_with_real_runner_process(
+    h: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    popen = BlockingPopen(ctrl_c_while_spawning="b")
+    h.popen = popen
+    monkeypatch.setattr(winproc, "find_runner_processes", lambda runner_dir: [])
+    monkeypatch.setattr(winproc, "has_console", lambda: True)
+    monkeypatch.setattr(winproc, "send_ctrl_break", popen.ctrl_break)
+    monkeypatch.setattr(winproc, "kill_tree_report", popen.kill_tree)
+    monkeypatch.setattr(winproc, "kill_tree", lambda pid, **kw: popen.kill_tree(pid)[0])
+    for name in ("a", "b"):
+        h.seed(name=name, path=str(make_runner_dir(h.root / name)))
+    result = h.run("start", "a", "b")
+    assert result.code == 0, result.text
+    assert len(popen.procs) == 2
+    assert all(proc.returncode is not None for proc in popen.procs.values())  # no orphan
+    assert "[a] 已停止" in result.out
+    assert "[b] 已停止" in result.out
 
 
 def test_every_local_state_has_a_label() -> None:
@@ -1354,7 +1665,7 @@ def test_every_local_state_has_a_label() -> None:
 
 def test_stop_kills_and_prints_linger_hint(h: Harness) -> None:
     record = h.seed()
-    h.stop_results[record.path] = [11, 12]
+    h.stop_results[record.path] = ExternalStop([11, 12], [])
     result = h.run("stop", DEFAULT_NAME)
     assert result.code == 0
     assert h.stopped == [Path(record.path)]
@@ -1376,6 +1687,36 @@ def test_stop_failure(h: Harness) -> None:
     result = h.run("stop", DEFAULT_NAME)
     assert result.code == 1
     assert f"错误：无法结束 runner {DEFAULT_NAME}" in result.err
+
+
+@pytest.mark.parametrize(("killed", "partial"), [([11], True), ([], False)])
+def test_stop_survivors_are_an_error(h: Harness, killed: list[int], partial: bool) -> None:
+    record = h.seed()
+    h.stop_results[record.path] = ExternalStop(killed, [12])
+    result = h.run("stop", DEFAULT_NAME)
+    assert result.code == 1
+    assert ("部分进程（PID 11）" in result.out) is partial
+    assert f"错误：无法结束 runner {DEFAULT_NAME} 的进程（PID 12），它仍在运行" in result.err
+    assert f"{PROG} stop {DEFAULT_NAME}" in result.err
+    assert "没有在运行" not in result.text
+    assert "已强制结束" not in result.out
+    assert LINGER_HINT not in result.out
+
+
+def test_stop_one_failure_does_not_stop_the_others(h: Harness) -> None:
+    bad = h.seed(name="bad", repo="bad", path=str(h.root / "bad"))
+    scan = h.seed(name="scan", repo="scan", path=str(h.root / "scan"))
+    good = h.seed(name="good", repo="good", path=str(h.root / "good"))
+    h.stop_results[bad.path] = ExternalStop([], [21])
+    h.stop_results[scan.path] = ProcessError("无法检查 runner 进程：拒绝访问")
+    h.stop_results[good.path] = ExternalStop([31, 32], [])
+    result = h.run("stop", "bad", "scan", "good")
+    assert result.code == 1
+    assert h.stopped == [Path(bad.path), Path(scan.path), Path(good.path)]
+    assert "错误：无法结束 runner bad 的进程（PID 21）" in result.err
+    assert "错误：无法结束 runner scan：无法检查 runner 进程：拒绝访问" in result.err
+    assert "已强制结束 runner good（PID 31, 32）" in result.out
+    assert LINGER_HINT in result.out  # good really was killed
 
 
 # --- remove -------------------------------------------------------------------------------------
@@ -1446,6 +1787,34 @@ def test_remove_warnings_are_printed(h: Harness) -> None:
     assert result.code == 0, result.err
     assert "注意：目录未删除" in result.out
     assert runner_dir.exists()
+
+
+def test_remove_invisible_repo_suggests_local_only(h: Harness) -> None:
+    h.login()
+    runner_dir = make_runner_dir(h.root / REPO)
+    h.seed(path=str(runner_dir))
+    for name in ("create_remove_token", "delete_runner", "get_repo", "list_runners"):
+        h.client.failures[name] = NotFoundError("仓库不存在或 PAT 没有访问权限", status=404)
+    result = h.run("remove", DEFAULT_NAME, "-y")
+    assert result.code == 1
+    assert f"remove {DEFAULT_NAME} --local-only" in result.err
+    assert runner_dir.exists()
+    assert len(h.config().runners) == 1
+
+
+def test_remove_local_only_skips_github(h: Harness) -> None:
+    h.login()
+    runner_dir = make_runner_dir(h.root / REPO)
+    h.seed(path=str(runner_dir))
+    calls_before = list(h.client.calls)
+    result = h.run("remove", DEFAULT_NAME, "--local-only", "-y")
+    assert result.code == 0, result.err
+    assert "不会访问 GitHub" in result.out
+    assert "GitHub：未处理（--local-only）" in result.out
+    assert "注意：没有在 GitHub 上注销" in result.out
+    assert h.client.calls == calls_before
+    assert not runner_dir.exists()
+    assert h.config().runners == []
 
 
 def test_remove_while_running_suggests_stop(h: Harness) -> None:
@@ -1608,9 +1977,9 @@ def test_internal_error_points_to_log(h: Harness) -> None:
     result = h.run("whoami")
     assert result.code == 1
     assert "内部错误：RuntimeError: bug in the client" in result.err
-    assert "runnerdeck.log" in result.err
+    assert "runnerdeck-cli.log" in result.err
     assert "Traceback" not in result.err
-    log_file = h.home / "logs" / "runnerdeck.log"
+    log_file = h.home / "logs" / "runnerdeck-cli.log"
     for handler in logging.getLogger("runnerdeck").handlers:
         handler.flush()
     assert "command whoami crashed" in log_file.read_text(encoding="utf-8")
@@ -1630,7 +1999,7 @@ def test_debug_prints_traceback_and_logs_to_stream(h: Harness) -> None:
     err = io.StringIO()
     deps.stderr = err
     assert main(["--debug", "whoami"], deps) == 1
-    assert calls == [{"level": logging.DEBUG, "stream": True}]
+    assert calls == [{"level": logging.DEBUG, "stream": True, "file_name": "runnerdeck-cli.log"}]
     assert "Traceback" in err.getvalue()
     assert "fake.log" in err.getvalue()
 
@@ -1650,7 +2019,10 @@ def test_logging_failure_does_not_stop_the_command(h: Harness) -> None:
 
 def test_logging_goes_to_log_dir(h: Harness) -> None:
     assert h.run("list").code == 0
-    assert (h.home / "logs" / "runnerdeck.log").is_file()
+    # Not the tray app's runnerdeck.log: on Windows a file another process holds open cannot
+    # be rotated.
+    assert (h.home / "logs" / "runnerdeck-cli.log").is_file()
+    assert not (h.home / "logs" / "runnerdeck.log").exists()
 
 
 def test_registered_secrets_never_reach_stdout_or_stderr(h: Harness) -> None:
@@ -1696,6 +2068,7 @@ def test_default_factories(tmp_path: Path) -> None:
     deps = CliDeps()
     assert deps.environ is os.environ
     assert deps.stop_external is cli.process.stop_external
+    assert deps.kill_tree is winproc.kill_tree_report
 
 
 def test_mask_proxy() -> None:
@@ -1776,11 +2149,13 @@ def make_fake_runner_dir(path: Path, mode: str) -> Path:
 
 
 def _guarded_sleep(h: Harness, limit_s: float, until: Callable[[], bool] | None = None) -> Any:
+    """Poll sleep that presses Ctrl+C (a real SIGINT) once `until()` holds."""
     deadline = time.monotonic() + limit_s
 
     def sleep(seconds: float) -> None:
         if until is not None and until():
-            raise KeyboardInterrupt
+            press_ctrl_c()
+            return
         if time.monotonic() > deadline:
             raise AssertionError("timed out waiting for the fake runner")
         time.sleep(seconds)
@@ -1796,7 +2171,9 @@ def test_windows_start_reports_crash(h: Harness) -> None:
     result = h.run("start", "crashy")
     assert result.code == 1, result.text
     assert "[crashy] 状态：空闲" in result.out
-    assert "退出码 3" in result.err
+    # The fake Listener dies with 15 (like a psutil kill); run.cmd itself still exits 0.
+    assert "Listener 退出码 15" in result.err
+    assert f"[crashy] {EXTERNAL_EXIT_HINT.format(prog=PROG, key='crashy')}" in result.err
 
 
 @windows_only
@@ -1809,6 +2186,59 @@ def test_windows_start_then_ctrl_c_stops_runner(h: Harness) -> None:
     # Graceful when pytest has a console, otherwise killed (spike §5).
     assert "[idler] 已停止" in result.out or LINGER_HINT in result.out
     pid_file = h.root / "idler.pid"
+    pid = int(pid_file.read_text(encoding="ascii"))
+    deadline = time.monotonic() + 15
+    while psutil.pid_exists(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not psutil.pid_exists(pid)
+
+
+_STUBBORN_LISTENER = """\
+import os, signal, sys, time
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="ascii")
+signal.signal(signal.SIGBREAK, signal.SIG_IGN)  # a listener that does not react to Ctrl+Break
+sys.stdout.buffer.write(b"2026-10-22 08:09:45Z: Listening for Jobs\\r\\n")
+sys.stdout.buffer.flush()
+time.sleep(120)
+"""
+
+
+@windows_only
+def test_windows_second_ctrl_c_cuts_the_graceful_wait_short(h: Harness) -> None:
+    if not winproc.has_console():
+        pytest.skip("Ctrl+Break needs a console shared with the runner (spike §5)")
+    runner_dir = h.root / "stubborn"
+    runner_dir.mkdir(parents=True)
+    (runner_dir / "listener.py").write_text(_STUBBORN_LISTENER, encoding="utf-8")
+    pid_file = h.root / "stubborn.pid"
+    script = f'@echo off\r\n"{_python_for_fake_runner()}" listener.py "{pid_file}"\r\n'
+    (runner_dir / "run.cmd").write_bytes(script.encode("ascii"))
+    h.seed(name="stubborn", path=str(runner_dir))
+    h.stop_timeout_s = 60.0  # what the wait would take without the 2nd Ctrl+C
+
+    def second_press_once_stopping() -> None:
+        deadline = time.monotonic() + 60
+        while "收到 Ctrl+C，正在停止" not in h.out.getvalue():
+            if time.monotonic() > deadline:
+                return  # never press outside the stop phase: nothing would catch it
+            time.sleep(0.05)
+        time.sleep(1.0)  # well inside the 60 s Ctrl+Break wait
+        press_ctrl_c()
+
+    presser = threading.Thread(target=second_press_once_stopping, daemon=True)
+    presser.start()
+    h.sleep_fn = _guarded_sleep(h, 60, until=lambda: "[stubborn] 状态：空闲" in h.out.getvalue())
+    began = time.monotonic()
+    result = h.run("start", "stubborn")
+    elapsed = time.monotonic() - began
+    presser.join(5)
+    assert result.code == 0, result.text
+    assert elapsed < 40, elapsed
+    assert "再次收到 Ctrl+C" in result.out
+    assert "[stubborn] 已强制结束" in result.out
+    assert LINGER_HINT in result.out
     pid = int(pid_file.read_text(encoding="ascii"))
     deadline = time.monotonic() + 15
     while psutil.pid_exists(pid) and time.monotonic() < deadline:

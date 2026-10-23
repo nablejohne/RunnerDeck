@@ -6,7 +6,10 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import socketserver
+import ssl
+import subprocess
 import threading
 import urllib.request
 import uuid
@@ -20,6 +23,7 @@ import httpcore
 import httpx
 import pytest
 import respx
+import truststore
 from httpcore._backends.sync import SyncBackend
 
 from runnerdeck.core import github_client as gc
@@ -904,6 +908,234 @@ def test_typical_no_proxy_builds_a_client(monkeypatch: pytest.MonkeyPatch) -> No
         },
     )
     GitHubClient(FINE_PAT).close()
+
+
+@pytest.mark.parametrize(
+    "socks",
+    [
+        "socks4://127.0.0.1:1080",  # what urllib derives from a SOCKS-only Windows system proxy
+        pytest.param(
+            "socks5://127.0.0.1:7891",
+            marks=pytest.mark.skipif(find_spec("socksio") is not None, reason="socksio installed"),
+        ),
+    ],
+)
+def test_unusable_socks_entry_is_ignored_when_https_proxy_carries_traffic(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, socks: str
+) -> None:
+    # Clash / v2rayN style: HTTPS_PROXY + HTTP_PROXY + ALL_PROXY=socks5://...
+    monkeypatch.setattr(logging.getLogger("runnerdeck"), "propagate", True)
+    caplog.set_level(logging.WARNING, logger=gc.__name__)
+    monkeypatch.setattr(
+        gc,
+        "_getproxies",
+        lambda: {"https": "http://127.0.0.1:7890", "http": "http://127.0.0.1:7890", "all": socks},
+    )
+    with GitHubClient(FINE_PAT) as c:
+        patterns = {p.pattern for p in c._http._mounts}
+    assert patterns == {"https://", "http://"}
+    scheme = socks.split("://")[0]
+    assert f"ignoring unsupported {scheme}:// proxy from ALL_PROXY" in caplog.text
+
+
+def test_unusable_socks_http_proxy_is_ignored_when_https_goes_direct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gc, "_getproxies", lambda: {"http": "socks4://127.0.0.1:1080"})
+    with GitHubClient(FINE_PAT) as c:
+        assert c._http._mounts == {}
+
+
+@pytest.mark.parametrize(
+    ("proxies", "var"),
+    [
+        # Windows registry with only "socks=127.0.0.1:1080": urllib maps http/https to socks4://.
+        (
+            {"http": "socks4://u:FAKEsockspw@127.0.0.1:1080", "https": "socks4://127.0.0.1:1080"},
+            "HTTPS_PROXY",
+        ),
+        ({"all": "socks4://u:FAKEsockspw@127.0.0.1:1080", "no": "localhost"}, "ALL_PROXY"),
+    ],
+)
+def test_unusable_socks_proxy_carrying_https_is_refused_by_name(
+    monkeypatch: pytest.MonkeyPatch, proxies: dict[str, str], var: str
+) -> None:
+    monkeypatch.setattr(gc, "_getproxies", lambda: proxies)
+    with pytest.raises(InvalidInputError) as ei:
+        GitHubClient(FINE_PAT)
+    message = str(ei.value)
+    assert f"系统代理 {var}" in message
+    assert "不支持 SOCKS 代理" in message
+    assert "FAKEsockspw" not in message
+
+
+# --- TLS trust ----------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def made_contexts(monkeypatch: pytest.MonkeyPatch) -> list[ssl.SSLContext]:
+    """Record every context gc._ssl_context() hands out."""
+    made: list[ssl.SSLContext] = []
+    factory = gc._ssl_context
+
+    def recording() -> ssl.SSLContext:
+        made.append(factory())
+        return made[-1]
+
+    monkeypatch.setattr(gc, "_ssl_context", recording)
+    return made
+
+
+def _pools(http: httpx.Client) -> list[Any]:
+    transports = [http._transport, *(t for t in http._mounts.values() if t is not None)]
+    return [t._pool for t in transports]
+
+
+def test_env_proxy_client_and_download_share_one_os_trust_store_context(
+    monkeypatch: pytest.MonkeyPatch, made_contexts: list[ssl.SSLContext]
+) -> None:
+    monkeypatch.setattr(
+        gc,
+        "_getproxies",
+        lambda: {
+            "https": "https://127.0.0.1:7443",
+            "http": "http://127.0.0.1:7890",
+            "no": "localhost",
+        },
+    )
+    with GitHubClient(FINE_PAT) as c:
+        download = c._new_client(headers={}, follow_redirects=True, for_download=True)
+        with download:
+            pools = _pools(c._http) + _pools(download)
+    assert len(made_contexts) == 1
+    ctx = made_contexts[0]
+    assert isinstance(ctx, truststore.SSLContext)
+    assert len(pools) == 6  # direct + https:// + http:// proxy, for each client
+    assert all(pool._ssl_context is ctx for pool in pools)
+    https_proxy = [p for p in pools if getattr(p, "_proxy_url", None) and p._proxy_url.port == 7443]
+    assert len(https_proxy) == 2
+    assert all(p._proxy_ssl_context is ctx for p in https_proxy)
+
+
+def test_explicit_proxy_uses_the_os_trust_store_context(
+    made_contexts: list[ssl.SSLContext],
+) -> None:
+    with GitHubClient(FINE_PAT, proxy="https://127.0.0.1:7443") as c:
+        pools = _pools(c._http)
+    (ctx,) = made_contexts
+    assert isinstance(ctx, truststore.SSLContext)
+    assert len(pools) == 2
+    assert all(pool._ssl_context is ctx for pool in pools)
+    assert pools[1]._proxy_ssl_context is ctx
+
+
+def test_unloadable_ssl_cert_file_is_ignored_with_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(logging.getLogger("runnerdeck"), "propagate", True)
+    caplog.set_level(logging.WARNING, logger=gc.__name__)
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing.pem"))
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    GitHubClient(FINE_PAT).close()  # httpx's own context would raise FileNotFoundError here
+    assert "ignoring SSL_CERT_FILE" in caplog.text
+
+
+_OPENSSL_CONFIG = """\
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = placeholder
+[ca]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+[leaf]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid
+"""
+
+
+@pytest.fixture
+def private_ca(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """(ca.pem, leaf.pem, leaf.key): a throwaway CA no trust store knows, leaf for localhost."""
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl not on PATH")
+    cfg = tmp_path / "openssl.cnf"
+    cfg.write_text(_OPENSSL_CONFIG, encoding="ascii")
+    ca, ca_key = tmp_path / "ca.pem", tmp_path / "ca.key"
+    leaf, leaf_key, csr = tmp_path / "leaf.pem", tmp_path / "leaf.key", tmp_path / "leaf.csr"
+    common = ["-config", str(cfg), "-newkey", "rsa:2048", "-nodes"]
+    for args in (
+        ["req", "-x509", *common, "-keyout", str(ca_key), "-out", str(ca), "-days", "2"]
+        + ["-subj", "/CN=RunnerDeck Test CA", "-extensions", "ca"],
+        ["req", "-new", *common, "-keyout", str(leaf_key), "-out", str(csr)]
+        + ["-subj", "/CN=localhost"],
+        ["x509", "-req", "-in", str(csr), "-CA", str(ca), "-CAkey", str(ca_key)]
+        + ["-set_serial", "2", "-days", "2", "-out", str(leaf)]
+        + ["-extfile", str(cfg), "-extensions", "leaf"],
+    ):
+        subprocess.run([openssl, *args], check=True, capture_output=True, timeout=60)
+    return ca, leaf, leaf_key
+
+
+class TlsStub:
+    """Local HTTPS server answering every request with a canned response."""
+
+    def __init__(self, cert: Path, key: Path, reply: bytes) -> None:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                try:
+                    with context.wrap_socket(self.request, server_side=True) as conn:
+                        reader = conn.makefile("rb")
+                        while reader.readline(65536) not in (b"", b"\r\n", b"\n"):
+                            pass
+                        conn.sendall(reply)
+                except OSError:  # the client rejected our certificate
+                    pass
+
+        self._server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    @property
+    def base_url(self) -> str:
+        return f"https://localhost:{self._server.server_address[1]}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def test_tls_handshake_through_truststore_honours_ssl_cert_file(
+    private_ca: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ca, leaf, leaf_key = private_ca
+    stub = TlsStub(
+        leaf, leaf_key, _reply("200 OK", json.dumps({"login": "octo", "id": 1}).encode())
+    )
+    try:
+        monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+        with (
+            GitHubClient(FINE_PAT, base_url=stub.base_url) as c,
+            pytest.raises(NetworkError, match="无法连接到 GitHub"),  # mapping unchanged
+        ):
+            c.get_user()
+
+        monkeypatch.setenv("SSL_CERT_FILE", str(ca))  # added on top of the OS store
+        with GitHubClient(FINE_PAT, base_url=stub.base_url) as c:
+            assert c.get_user().login == "octo"
+    finally:
+        stub.close()
 
 
 # --- download -----------------------------------------------------------------------------------

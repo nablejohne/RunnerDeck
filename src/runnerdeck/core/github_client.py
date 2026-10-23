@@ -15,6 +15,15 @@ Proxy and retry wiring, checked against the httpx 0.28.1 / httpcore 1.0.9 source
   never a request that got an HTTP status.
 - respx patches httpcore's `ConnectionPool` / `HTTPProxy.handle_request`, so it intercepts requests
   through these transports (direct or proxied) without a transport being injected.
+- A SOCKS entry httpx cannot use (socks5 without socksio, or the socks4:// that urllib derives from
+  a SOCKS-only Windows system proxy) is skipped with a warning when it does not carry https://
+  traffic; only when it does is the client refused (InvalidInputError naming the variable).
+
+TLS trust: httpx's default `verify=True` trusts only the certifi bundle (or SSL_CERT_FILE /
+SSL_CERT_DIR), never the OS store, so TLS-inspecting proxies and local GitHub accelerators whose
+root CA sits in the Windows certificate store would fail every call. Each client therefore uses a
+`truststore.SSLContext` (the OS store, plus SSL_CERT_FILE / SSL_CERT_DIR on top), shared by the
+direct transport, every proxy mount (also for TLS to an https:// proxy) and the download client.
 """
 
 from __future__ import annotations
@@ -22,7 +31,9 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import logging
+import os
 import re
+import ssl
 import time
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -33,6 +44,7 @@ from types import TracebackType
 from typing import Any, Literal, Self, TypeVar
 
 import httpx
+import truststore
 from pydantic import BaseModel, ValidationError
 
 from runnerdeck import __version__
@@ -69,6 +81,12 @@ _RUNNER_RELEASES = "/repos/actions/runner/releases"
 _VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+)")
 _MESSAGE_MAX = 300
 _BAD_PROXY = "代理地址不合法：只支持 http:// 或 https:// 代理，例如 http://127.0.0.1:7890"
+_BAD_ENV_PROXY = (
+    "系统代理设置不可用（HTTPS_PROXY / HTTP_PROXY / ALL_PROXY / NO_PROXY），"
+    "请修正，或在设置里填写代理地址"
+)
+# env_proxy_map() pattern -> where the value usually comes from (named in messages and logs).
+_ENV_PROXY_VARS = {"https://": "HTTPS_PROXY", "http://": "HTTP_PROXY", "all://": "ALL_PROXY"}
 _EXPIRATION_FORMATS = ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%d %H:%M %z")
 
 ProgressFn = Callable[[int, int | None], None]
@@ -137,8 +155,71 @@ def _normalize_proxy(proxy: str | None) -> str | None:
     return value if "://" in value else f"http://{value}"
 
 
-def _retrying_transport(proxy: str | None = None) -> httpx.HTTPTransport:
-    return httpx.HTTPTransport(proxy=proxy, retries=CONNECT_RETRIES)
+def _ssl_context() -> ssl.SSLContext:
+    """TLS trust for one client: the OS store via truststore, plus SSL_CERT_FILE / SSL_CERT_DIR.
+
+    httpx's default context uses those variables in place of certifi; here they are added on top
+    of the OS store, so a CA bundle exported as a workaround keeps working. One that cannot be
+    loaded is skipped with a warning (httpx would have failed to build the client at all).
+    """
+    ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    for var, kind in (("SSL_CERT_FILE", "cafile"), ("SSL_CERT_DIR", "capath")):
+        location = os.environ.get(var, "").strip()
+        if not location:
+            continue
+        try:
+            if kind == "cafile":
+                ctx.load_verify_locations(cafile=location)
+            else:
+                ctx.load_verify_locations(capath=location)
+        except (OSError, ValueError) as e:  # ssl.SSLError is an OSError
+            log.warning("ignoring %s: cannot load CA certificates (%s)", var, type(e).__name__)
+    return ctx
+
+
+def _retrying_transport(
+    ssl_context: ssl.SSLContext, proxy: str | None = None
+) -> httpx.HTTPTransport:
+    proxy_config: httpx.Proxy | str | None = proxy
+    if proxy is not None and httpx.URL(proxy).scheme == "https":
+        # TLS to the proxy itself; httpcore rejects a proxy ssl_context for http:// proxies.
+        proxy_config = httpx.Proxy(proxy, ssl_context=ssl_context)
+    return httpx.HTTPTransport(verify=ssl_context, proxy=proxy_config, retries=CONNECT_RETRIES)
+
+
+def _env_mounts(ssl_context: ssl.SSLContext) -> dict[str, httpx.BaseTransport | None]:
+    """Mounts for the environment / system proxy (see env_proxy_map).
+
+    An unusable SOCKS entry is dropped with a warning unless it is the one https:// requests
+    would use (the "https://" entry, else "all://"); then the client cannot be built.
+    """
+    proxies = env_proxy_map()
+    https_carrier = "https://" if "https://" in proxies else "all://"
+    mounts: dict[str, httpx.BaseTransport | None] = {}
+    for pattern, url in proxies.items():
+        if url is None:
+            mounts[pattern] = None
+            continue
+        try:
+            mounts[pattern] = _retrying_transport(ssl_context, url)
+        except (httpx.InvalidURL, ValueError, ImportError) as e:
+            scheme = url.split("://", 1)[0].strip().lower()
+            if not scheme.startswith("socks"):
+                raise
+            var = _ENV_PROXY_VARS.get(pattern, pattern)
+            if pattern != https_carrier:
+                log.warning(
+                    "ignoring unsupported %s:// proxy from %s (or the system proxy); "
+                    "https requests do not use it",
+                    scheme,
+                    var,
+                )
+                continue
+            raise InvalidInputError(
+                f"系统代理 {var}（或系统代理设置）是 {scheme}:// 代理，"
+                "RunnerDeck 不支持 SOCKS 代理；请改用 http:// 代理，或在设置里填写代理地址"
+            ) from e
+    return mounts
 
 
 class _SharedTransport(httpx.BaseTransport):
@@ -286,6 +367,8 @@ class GitHubClient:
                 raise InvalidInputError(_BAD_PROXY)
         self._timeout = httpx.Timeout(timeout)
         self._transport = transport
+        # Shared by the API client and every download client (unused with an injected transport).
+        self._ssl_context = _ssl_context()
         self._http = self._new_client(
             base_url=base_url,
             headers={
@@ -487,30 +570,25 @@ class GitHubClient:
                 follow_redirects=follow_redirects,
                 transport=transport,
             )
+        ssl_context = self._ssl_context
         try:
             mounts: dict[str, httpx.BaseTransport | None]
             if self._proxy is not None:
-                mounts = {"all://": _retrying_transport(self._proxy)}
+                mounts = {"all://": _retrying_transport(ssl_context, self._proxy)}
             else:
-                mounts = {
-                    pattern: None if url is None else _retrying_transport(url)
-                    for pattern, url in env_proxy_map().items()
-                }
+                mounts = _env_mounts(ssl_context)
             return httpx.Client(
                 base_url=base_url,
                 headers=headers,
                 timeout=self._timeout,
                 follow_redirects=follow_redirects,
-                transport=_retrying_transport(),
+                transport=_retrying_transport(ssl_context),
                 mounts=mounts,
             )
         except (httpx.InvalidURL, ValueError, ImportError) as e:
             if self._proxy is not None:
                 raise InvalidInputError(_BAD_PROXY) from e
-            raise InvalidInputError(
-                "系统代理设置不可用（HTTPS_PROXY / HTTP_PROXY / ALL_PROXY / NO_PROXY），"
-                "请修正，或在设置里填写代理地址"
-            ) from e
+            raise InvalidInputError(_BAD_ENV_PROXY) from e
 
     def _request(
         self,

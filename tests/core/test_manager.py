@@ -12,15 +12,17 @@ import hashlib
 import io
 import json
 import logging
+import os
 import subprocess
 import zipfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import psutil
 import pytest
 from pydantic import SecretStr
@@ -41,6 +43,7 @@ from runnerdeck.core.errors import (
     RunnerNotFoundError,
     StoreError,
 )
+from runnerdeck.core.github_client import GitHubClient
 from runnerdeck.core.manager import (
     AddPlan,
     RemoteRemoval,
@@ -96,7 +99,12 @@ def remote(id: int, name: str, status: str = "offline", *, busy: bool = False) -
 
 
 class FakeClient:
-    """Records every call; per-method failures via `failures`, per-repo list failures too."""
+    """Records every call; per-method failures via `failures`, per-repo list failures too.
+
+    `hidden`: repos the PAT cannot see. Like GitHub, every repo endpoint then answers 404:
+    NotFoundError, except get_runner / delete_runner, which (like GitHubClient) map 404 to
+    None / False unless `hidden_runner_raises` is set.
+    """
 
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -105,6 +113,8 @@ class FakeClient:
         self.runners: dict[tuple[str, str], list[RemoteRunner]] = {}
         self.failures: dict[str, BaseException] = {}
         self.list_failures: dict[tuple[str, str], BaseException] = {}
+        self.hidden: set[tuple[str, str]] = set()
+        self.hidden_runner_raises = False
         self.release_json: dict[str, Any] = {}
         self.download_bytes = b""
         self.closed = 0
@@ -115,6 +125,22 @@ class FakeClient:
         exc = self.failures.get(name)
         if exc is not None:
             raise exc
+
+    def _is_hidden(
+        self, method: str, owner: str, repo: str, suffix: str = "", *, maps_404: bool = False
+    ) -> bool:
+        """True if hidden and the caller maps the 404 to None / False; raises otherwise."""
+        if _key(owner, repo) not in self.hidden:
+            return False
+        if maps_404 and not self.hidden_runner_raises:
+            return True
+        path = f"/repos/{owner}/{repo}{suffix}"
+        raise NotFoundError(
+            f"仓库不存在或 PAT 没有访问权限（{method} {path} -> 404：Not Found）",
+            status=404,
+            method=method,
+            path=path,
+        )
 
     def names(self) -> list[str]:
         return [c[0] for c in self.calls]
@@ -127,6 +153,7 @@ class FakeClient:
 
     def get_repo(self, owner: str, repo: str) -> Repo:
         self._call("get_repo", owner, repo)
+        self._is_hidden("GET", owner, repo)
         try:
             return self.repos[_key(owner, repo)]
         except KeyError:
@@ -134,6 +161,7 @@ class FakeClient:
 
     def list_runners(self, owner: str, repo: str) -> list[RemoteRunner]:
         self._call("list_runners", owner, repo)
+        self._is_hidden("GET", owner, repo, "/actions/runners")
         exc = self.list_failures.get(_key(owner, repo))
         if exc is not None:
             raise exc
@@ -141,18 +169,24 @@ class FakeClient:
 
     def get_runner(self, owner: str, repo: str, runner_id: int) -> RemoteRunner | None:
         self._call("get_runner", owner, repo, runner_id)
+        if self._is_hidden("GET", owner, repo, f"/actions/runners/{runner_id}", maps_404=True):
+            return None
         return next((r for r in self.runners.get(_key(owner, repo), []) if r.id == runner_id), None)
 
     def create_registration_token(self, owner: str, repo: str) -> RunnerToken:
         self._call("create_registration_token", owner, repo)
+        self._is_hidden("POST", owner, repo, "/actions/runners/registration-token")
         return RunnerToken(token=SecretStr(REG_TOKEN), expires_at=NOW + timedelta(hours=1))
 
     def create_remove_token(self, owner: str, repo: str) -> RunnerToken:
         self._call("create_remove_token", owner, repo)
+        self._is_hidden("POST", owner, repo, "/actions/runners/remove-token")
         return RunnerToken(token=SecretStr(REMOVE_TOKEN), expires_at=NOW + timedelta(hours=1))
 
     def delete_runner(self, owner: str, repo: str, runner_id: int) -> bool:
         self._call("delete_runner", owner, repo, runner_id)
+        if self._is_hidden("DELETE", owner, repo, f"/actions/runners/{runner_id}", maps_404=True):
+            return False
         runners = self.runners.get(_key(owner, repo), [])
         for r in runners:
             if r.id == runner_id:
@@ -434,6 +468,13 @@ def _propagate_logs() -> Iterator[None]:
     logger.propagate = previous
 
 
+@pytest.fixture(autouse=True)
+def _no_inherited_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Dev machines may set HTTPS_PROXY; child environments are compared exactly below.
+    for name in ("https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def env(tmp_path: Path) -> Env:
     events: list[str] = []
@@ -477,6 +518,34 @@ def env(tmp_path: Path) -> Env:
 def collect() -> tuple[list[tuple[str, str]], Callable[[str, str], None]]:
     seen: list[tuple[str, str]] = []
     return seen, lambda step, text: seen.append((step, text))
+
+
+def is_cmd_exe(arg: str) -> bool:
+    return os.path.basename(arg).lower() == "cmd.exe"  # absolute %SystemRoot% path on Windows
+
+
+def proxy_vars(child_env: Mapping[str, str]) -> dict[str, str]:
+    return {
+        k.lower(): v for k, v in child_env.items() if k.lower() in ("https_proxy", "http_proxy")
+    }
+
+
+def both_proxies(url: str) -> dict[str, str]:
+    return {"https_proxy": url, "http_proxy": url}
+
+
+def set_proxy(env: Env, proxy: str | None) -> None:
+    config = env.config()
+    config.settings.proxy = proxy
+    env.store.save(config)
+
+
+def assert_no_repo_access(err: BaseException, full_name: str, kept: str) -> None:
+    text = str(err)
+    assert isinstance(err, NotFoundError)
+    assert f"PAT 无法访问仓库 {full_name}" in text
+    assert "Administration: Read and write" in text
+    assert kept in text
 
 
 def steps_of(progress: list[tuple[str, str]]) -> list[str]:
@@ -680,7 +749,8 @@ def test_add_runner_happy_path(env: Env, monkeypatch: pytest.MonkeyPatch) -> Non
         "config.cmd configure",
     ]
     args, kwargs = env.cmd.calls[0]
-    assert args[:4] == ["cmd.exe", "/c", "config.cmd", "--unattended"]
+    assert is_cmd_exe(args[0])
+    assert args[1:4] == ["/c", "config.cmd", "--unattended"]
     assert args[args.index("--url") + 1] == URL
     assert args[args.index("--token") + 1] == REG_TOKEN
     assert args[args.index("--name") + 1] == DEFAULT_NAME
@@ -1014,6 +1084,45 @@ def test_rollback_incomplete_raises_rollback_error(env: Env) -> None:
     assert_rolled_back(env, plan)
 
 
+@pytest.mark.parametrize("runner_raises", [False, True])
+def test_rollback_api_404_on_invisible_repo_is_not_reported_as_undone(
+    env: Env, runner_raises: bool
+) -> None:
+    # The PAT loses access to the repo while config.cmd runs; DELETE then answers 404.
+    plan = env.manager.plan_add(OWNER, REPO)
+    env.store.fail_saves = 1
+    env.client.hidden_runner_raises = runner_raises
+    env.cmd.on_configure = lambda: env.client.hidden.add(_key(OWNER, REPO))
+    with pytest.raises(RollbackError) as info:
+        env.manager.add_runner(plan)
+    assert isinstance(info.value.original, StoreError)
+    (problem,) = info.value.problems
+    assert "GitHub 上可能残留" in problem and DEFAULT_NAME in problem
+    assert "PAT" in problem and "访问" in problem
+    assert ("delete_runner", OWNER, REPO, AGENT_ID) in env.client.calls
+    assert [r.id for r in env.client.runners[_key(OWNER, REPO)]] == [AGENT_ID]
+    assert_rolled_back(env, plan)  # the local side is still undone
+
+
+def test_rollback_api_404_with_visible_repo_counts_as_undone(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = env.manager.plan_add(OWNER, REPO)
+    env.store.fail_saves = 1
+    env.cmd.remove_mode = "fail"
+
+    def already_gone(owner: str, repo: str, runner_id: int) -> bool:
+        env.client.calls.append(("delete_runner", owner, repo, runner_id))
+        env.client.runners[_key(owner, repo)].clear()
+        return False
+
+    monkeypatch.setattr(env.client, "delete_runner", already_gone)
+    with pytest.raises(StoreError):  # rollback complete -> original error type
+        env.manager.add_runner(plan)
+    assert_rolled_back(env, plan)
+    assert env.client.names()[-2:] == ["delete_runner", "list_runners"]
+
+
 def test_rollback_reports_directory_that_cannot_be_deleted(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1127,6 +1236,29 @@ def test_failing_progress_does_not_break_rollback_or_done(env: Env) -> None:
     assert env.config().runners == [record]
 
 
+# --- config.cmd environment ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("proxy", "expected"),
+    [(None, None), ("127.0.0.1:7890", "http://127.0.0.1:7890"), ("http://p:8080", "http://p:8080")],
+)
+def test_config_cmd_gets_the_proxy(env: Env, proxy: str | None, expected: str | None) -> None:
+    # The runner reads https_proxy / http_proxy when it registers and unregisters, not only
+    # in run.cmd, so every config.cmd call needs the RunnerDeck proxy.
+    set_proxy(env, proxy)
+    record = env.manager.add_runner(env.manager.plan_add(OWNER, REPO))  # configure
+    env.manager.remove_runner(record.id)  # config.cmd remove
+    env.cmd.configure_mode = "partial"
+    with pytest.raises(InstallError):  # configure, then the rollback's config.cmd remove
+        env.manager.add_runner(env.manager.plan_add(OWNER, REPO))
+
+    assert [("remove" in args) for args, _ in env.cmd.calls] == [False, True, False, True]
+    want = {} if expected is None else both_proxies(expected)
+    for _, kwargs in env.cmd.calls:
+        assert proxy_vars(kwargs.get("env") or {}) == want
+
+
 # --- remove_runner ---------------------------------------------------------------------------
 
 
@@ -1155,7 +1287,8 @@ def test_remove_runner_happy_path(env: Env) -> None:
     assert env.client.runners[_key(OWNER, REPO)] == []
     assert env.client.count("delete_runner") == 0
     args = env.cmd.calls[0][0]
-    assert args == ["cmd.exe", "/c", "config.cmd", "remove", "--token", REMOVE_TOKEN]
+    assert is_cmd_exe(args[0])
+    assert args[1:] == ["/c", "config.cmd", "remove", "--token", REMOVE_TOKEN]
     assert steps_of(progress) == [
         Step.CHECK,
         Step.READ,
@@ -1231,6 +1364,124 @@ def test_remove_runner_404_counts_as_removed(env: Env) -> None:
     assert result.remote is RemoteRemoval.ALREADY_GONE
     assert result.runner_id == 77
     assert env.config().runners == []
+    # the 404 only counts once the repo's runner list proved the PAT can see the repo
+    assert env.client.names() == ["delete_runner", "list_runners"]
+
+
+KEPT_ON_REMOVE = "目录和记录都保留"
+
+
+def test_remove_runner_invisible_repo_keeps_everything(env: Env) -> None:
+    # e.g. a fine-grained PAT that no longer selects the repo: every repo endpoint is 404
+    record = seed_runner(env)
+    env.client.hidden.add(_key(OWNER, REPO))
+    progress, report = collect()
+    with pytest.raises(NotFoundError) as info:
+        env.manager.remove_runner(record.id, progress=report)
+    assert_no_repo_access(info.value, f"{OWNER}/{REPO}", KEPT_ON_REMOVE)
+    assert env.cmd.calls == []  # config.cmd remove never ran
+    assert env.client.count("delete_runner") == 0
+    assert Path(record.path, ".runner").is_file()
+    assert Path(record.path, ".credentials").is_file()
+    assert env.config().runners == [record]
+    assert [r.id for r in env.client.runners[_key(OWNER, REPO)]] == [AGENT_ID]
+    assert Step.DELETE_DIR not in steps_of(progress) and Step.DONE not in steps_of(progress)
+
+
+def test_remove_runner_local_only_is_the_way_out_for_an_invisible_repo(env: Env) -> None:
+    # Repo deleted / access revoked: every GitHub call is 404, so only a local removal works.
+    record = seed_runner(env)
+    env.client.hidden.add(_key(OWNER, REPO))
+    progress, report = collect()
+    result = env.manager.remove_runner(record.id, local_only=True, progress=report)
+    assert result.remote is RemoteRemoval.SKIPPED
+    assert env.client.calls == []  # GitHub was not touched at all
+    assert env.cmd.calls == []
+    assert result.dir_removed and not Path(record.path).exists()
+    assert env.config().runners == []
+    assert any("没有在 GitHub 上注销" in w for w in result.warnings)
+    assert Step.UNCONFIGURE not in steps_of(progress) and Step.API_DELETE not in steps_of(progress)
+
+
+def test_remove_runner_local_only_still_refuses_while_running(env: Env) -> None:
+    record = seed_runner(env)
+    env.running[record.path] = [SimpleNamespace(pid=4242)]
+    with pytest.raises(ProcessError):
+        env.manager.remove_runner(record.id, local_only=True)
+    assert env.config().runners == [record]
+
+
+@pytest.mark.parametrize(
+    ("runner_id", "runner_raises"),
+    [(77, False), (77, True), (None, False)],
+    ids=["delete-404", "delete-raises", "no-id"],
+)
+def test_remove_runner_dir_gone_invisible_repo_keeps_record(
+    env: Env, runner_id: int | None, runner_raises: bool
+) -> None:
+    record = env.seed(path=str(env.root / "gone"), github_runner_id=runner_id)
+    env.client.runners[_key(OWNER, REPO)] = [remote(77, DEFAULT_NAME)]
+    env.client.hidden.add(_key(OWNER, REPO))
+    env.client.hidden_runner_raises = runner_raises
+    with pytest.raises(NotFoundError) as info:
+        env.manager.remove_runner(record.id)
+    assert_no_repo_access(info.value, f"{OWNER}/{REPO}", KEPT_ON_REMOVE)
+    assert env.config().runners == [record]
+
+
+def test_remove_runner_404_while_github_still_lists_it(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = env.seed(path=str(env.root / "gone"), github_runner_id=77)
+    env.client.runners[_key(OWNER, REPO)] = [remote(77, DEFAULT_NAME)]
+    monkeypatch.setattr(env.client, "delete_runner", lambda owner, repo, runner_id: False)
+    with pytest.raises(RunnerDeckError, match="仍有它"):
+        env.manager.remove_runner(record.id)
+    assert env.config().runners == [record]
+
+
+def test_remove_token_404_on_a_visible_repo_still_falls_back_to_the_api(env: Env) -> None:
+    record = seed_runner(env)
+    env.client.failures["create_remove_token"] = NotFoundError("Not Found", status=404)
+    result = env.manager.remove_runner(record.id)
+    assert result.remote is RemoteRemoval.API_DELETED
+    assert env.client.names() == ["create_remove_token", "list_runners", "delete_runner"]
+    assert any("config.cmd remove 失败" in w for w in result.warnings)
+    assert env.config().runners == []
+
+
+@pytest.mark.parametrize("dir_exists", [True, False])
+def test_remove_runner_invisible_repo_with_the_real_client(env: Env, dir_exists: bool) -> None:
+    """GitHubClient on a transport where every request answers 404 like an invisible repo."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    client = GitHubClient("github_pat_" + "F" * 40, transport=httpx.MockTransport(handler))
+    manager = RunnerManager(
+        env.store,
+        lambda: client,
+        cache=env.cache,  # type: ignore[arg-type]
+        hostname=HOST,
+        installer_run=env.cmd,
+        find_processes=env.finder,
+    )
+    if dir_exists:
+        record = seed_runner(env)
+    else:
+        record = env.seed(path=str(env.root / "gone"), github_runner_id=AGENT_ID)
+    with pytest.raises(NotFoundError) as info:
+        manager.remove_runner(record.id)
+    assert_no_repo_access(info.value, f"{OWNER}/{REPO}", KEPT_ON_REMOVE)
+    assert env.cmd.calls == []
+    assert env.config().runners == [record]
+    if dir_exists:
+        assert Path(record.path, ".runner").is_file()
+        assert seen[0] == f"POST /repos/{OWNER}/{REPO}/actions/runners/remove-token"
+    else:
+        assert seen[0] == f"DELETE /repos/{OWNER}/{REPO}/actions/runners/{AGENT_ID}"
 
 
 def test_remove_runner_without_any_id_matches_by_name(env: Env) -> None:
@@ -1363,6 +1614,36 @@ def test_import_runner_missing_on_github(env: Env) -> None:
         env.manager.import_runner(path)
     assert type(info.value) is RunnerDeckError
     assert env.config().runners == []
+    # "gone" only after the repo's runner list proved the PAT can see the repo
+    assert env.client.names() == ["get_runner", "list_runners"]
+
+
+@pytest.mark.parametrize("runner_raises", [False, True])
+def test_import_runner_invisible_repo_does_not_advise_deleting(
+    env: Env, runner_raises: bool
+) -> None:
+    # The PAT covers only octo/demo; the directory is a working runner of someone/repoB.
+    path = make_runner_dir(env.tmp / "manual", url="https://github.com/someone/repoB")
+    env.client.runners[_key("someone", "repoB")] = [remote(AGENT_ID, DEFAULT_NAME, "online")]
+    env.client.hidden.add(_key("someone", "repoB"))
+    env.client.hidden_runner_raises = runner_raises
+    with pytest.raises(NotFoundError) as info:
+        env.manager.import_runner(path)
+    assert_no_repo_access(info.value, "someone/repoB", "请不要删除该目录")
+    assert "重新添加" not in str(info.value)
+    assert env.config().runners == []
+    assert Path(path, ".runner").is_file()
+
+
+def test_import_runner_trusts_the_list_over_a_404(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = make_runner_dir(env.tmp / "manual")
+    env.client.runners[_key(OWNER, REPO)] = [remote(AGENT_ID, DEFAULT_NAME)]
+    monkeypatch.setattr(env.client, "get_runner", lambda owner, repo, runner_id: None)
+    record = env.manager.import_runner(path)
+    assert record.github_runner_id == AGENT_ID
+    assert env.config().runners == [record]
 
 
 @pytest.mark.parametrize(
@@ -1586,9 +1867,7 @@ class _Proc:
     ],
 )
 def test_process_for(env: Env, proxy: str | None, expected: str | None) -> None:
-    config = env.config()
-    config.settings.proxy = proxy
-    env.store.save(config)
+    set_proxy(env, proxy)
     record = env.seed(path=str(make_runner_dir(env.root / "p")))
     popen_calls: list[tuple[list[str], dict[str, Any]]] = []
 
@@ -1604,13 +1883,12 @@ def test_process_for(env: Env, proxy: str | None, expected: str | None) -> None:
     proc.start()
     assert proc.wait(5) == 0
     args, kwargs = popen_calls[0]
-    assert args == ["cmd.exe", "/c", "run.cmd"]
+    assert is_cmd_exe(args[0])
+    assert args[1:] == ["/c", "run.cmd"]
     assert kwargs["cwd"] == record.path
-    env_arg = kwargs["env"]
-    if expected is None:
-        assert env_arg is None
-    else:
-        assert env_arg["https_proxy"] == expected and env_arg["http_proxy"] == expected
+    # process.py builds the full child environment from the overrides process_for passes
+    child_env = kwargs["env"] or {}
+    assert proxy_vars(child_env) == ({} if expected is None else both_proxies(expected))
     assert lines == ["√ Connected to GitHub", "2026-10-22Z: Listening for Jobs"]
 
 

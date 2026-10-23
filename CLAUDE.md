@@ -1,6 +1,6 @@
 # RunnerDeck
 
-Windows 托盘应用：管理多个仓库级 GitHub Actions self-hosted runner。完整方案见 docs/PLAN.md，runner 实测结论见 docs/spike-notes.md。
+Windows 托盘应用：管理多个仓库级 GitHub Actions self-hosted runner。完整方案见 docs/PLAN.md，runner 实测结论见 docs/spike-notes.md，core 层接口见 docs/m1-design.md，进度见 docs/PROGRESS.md。
 
 ## 技术栈
 - Python 3.11, PyQt5 5.15, PyQt-Fluent-Widgets (import qfluentwidgets)
@@ -10,7 +10,7 @@ Windows 托盘应用：管理多个仓库级 GitHub Actions self-hosted runner�
 ## 常用命令
 - 安装依赖：uv sync
 - 运行：uv run python -m runnerdeck
-- 调试 CLI：uv run python -m runnerdeck.core.cli --help
+- 调试 CLI：uv run runnerdeck-cli --help（或 uv run python -m runnerdeck.core.cli --help）
 - 测试：uv run pytest
 - 检查：uv run ruff check . ; uv run ruff format --check .
 - 打包：./scripts/build.ps1

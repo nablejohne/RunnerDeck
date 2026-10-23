@@ -3,6 +3,10 @@
 Spike §3: config.cmd prints an ASCII banner followed by `√ ...` lines; success is judged by
 those lines, not by the exit code alone. Output is decoded per line (UTF-8 first, console
 code page second) and redacted before it reaches an exception, a log or the caller.
+
+config.cmd gets winproc.child_environment(): our environment minus the PAT variables, plus the
+caller's overrides (the RunnerDeck proxy). A freshly unpacked runner directory gets a protected
+DACL on Windows (harden_runner_dir), so other local users cannot tamper with its scripts.
 """
 
 from __future__ import annotations
@@ -51,6 +55,16 @@ UNCONFIGURE_SUCCESS_LINES: tuple[str | tuple[str, ...], ...] = ("Runner removed 
 # After killing the process tree on timeout, how long to wait for the output pipe to close.
 _DRAIN_TIMEOUT_S = 5.0
 _MESSAGE_LINE_MAX = 200
+
+# harden_runner_dir: whoami / icacls finish in well under a second; this only bounds a hang.
+_ACL_TIMEOUT_S = 30.0
+# Full control, inherited by every file and subdirectory, for exactly these principals
+# (SIDs, not names: group names are localized, e.g. on zh-CN Windows).
+_SYSTEM_SID = "S-1-5-18"
+_ADMINISTRATORS_SID = "S-1-5-32-544"
+_SID_RE = re.compile(r"^S-1-\d+(?:-\d+)+$")
+# `whoami /user /fo csv /nh` prints `"<domain>\<user>","<SID>"`.
+_WHOAMI_SID_RE = re.compile(rb'"(S-1-\d+(?:-\d+)+)"\s*$')
 
 # Everything placed on the `cmd.exe /c config.cmd ...` line must be free of cmd.exe
 # metacharacters (& | < > ^ % " spaces ...). Name and labels are checked in models.py.
@@ -120,6 +134,12 @@ def _check_token(token: str) -> None:
         raise InvalidInputError("runner token 格式不合法（只能包含字母、数字、. _ -，长度 8–256）")
 
 
+# Why only cmd.exe is an absolute path (winproc.cmd_exe): CreateProcess looks a bare
+# "cmd.exe" up in *our* current directory before System32, so a cmd.exe planted wherever the
+# user started RunnerDeck would receive the token. The bare "config.cmd" is resolved by
+# cmd.exe itself, which searches its own current directory before PATH; that is
+# `cwd=runner_dir`, so it finds the runner's own config.cmd (_run_config checks it exists).
+# Only with NoDefaultCurrentDirectoryInExePath set would cmd.exe skip that directory.
 def build_config_command(
     *,
     url: str,
@@ -140,7 +160,7 @@ def build_config_command(
     name = validate_runner_name(name)
     label_list = normalize_labels(labels if isinstance(labels, str) else list(labels))
 
-    args = ["cmd.exe", "/c", CONFIG_CMD, "--unattended", "--url", url, "--token", token]
+    args = [winproc.cmd_exe(), "/c", CONFIG_CMD, "--unattended", "--url", url, "--token", token]
     args += ["--name", name]
     if label_list:
         args += ["--labels", ",".join(label_list)]
@@ -153,7 +173,7 @@ def build_config_command(
 def build_remove_command(*, token: str) -> list[str]:
     register_secret(token)
     _check_token(token)
-    return ["cmd.exe", "/c", CONFIG_CMD, "remove", "--token", token]
+    return [winproc.cmd_exe(), "/c", CONFIG_CMD, "remove", "--token", token]
 
 
 def configure(
@@ -165,8 +185,13 @@ def configure(
     labels: Sequence[str],
     run: RunFn = run_command,
     timeout: float = CONFIG_TIMEOUT_S,
+    env: Mapping[str, str] | None = None,
 ) -> CommandResult:
-    """Register the runner in `runner_dir` with GitHub (blocking, up to `timeout` seconds)."""
+    """Register the runner in `runner_dir` with GitHub (blocking, up to `timeout` seconds).
+
+    `env` overrides variables in config.cmd's environment (e.g. https_proxy / http_proxy:
+    the runner reads them while configuring, not only while running).
+    """
     register_secret(token)
     args = build_config_command(url=url, token=token, name=name, labels=labels)
     return _run_config(
@@ -176,15 +201,21 @@ def configure(
         success_lines=CONFIGURE_SUCCESS_LINES,
         run=run,
         timeout=timeout,
+        env=env,
     )
 
 
 def unconfigure(
-    runner_dir: Path, *, token: str, run: RunFn = run_command, timeout: float = CONFIG_TIMEOUT_S
+    runner_dir: Path,
+    *,
+    token: str,
+    run: RunFn = run_command,
+    timeout: float = CONFIG_TIMEOUT_S,
+    env: Mapping[str, str] | None = None,
 ) -> CommandResult:
     """`config.cmd remove`: unregister on GitHub and delete .runner / .credentials (spike §3).
 
-    Read .runner (agentId) before calling this; it is gone afterwards.
+    Read .runner (agentId) before calling this; it is gone afterwards. `env` as in configure.
     """
     register_secret(token)
     args = build_remove_command(token=token)
@@ -195,6 +226,7 @@ def unconfigure(
         success_lines=UNCONFIGURE_SUCCESS_LINES,
         run=run,
         timeout=timeout,
+        env=env,
     )
 
 
@@ -206,10 +238,17 @@ def _run_config(
     success_lines: Sequence[str | tuple[str, ...]],
     run: RunFn,
     timeout: float,
+    env: Mapping[str, str] | None,
 ) -> CommandResult:
     if not (runner_dir / CONFIG_CMD).is_file():
         raise InstallError(f"{action}失败：{runner_dir} 下没有 {CONFIG_CMD}")
-    log.info("%s: %s (cwd=%s)", action, redact(subprocess.list2cmdline(args)), runner_dir)
+    log.info(
+        "%s: %s (cwd=%s, env overrides=%s)",
+        action,
+        redact(subprocess.list2cmdline(args)),
+        runner_dir,
+        sorted(env or {}),  # keys only: a proxy URL can carry credentials
+    )
     started = time.monotonic()
     try:
         proc = run(
@@ -220,6 +259,8 @@ def _run_config(
             stderr=subprocess.STDOUT,
             timeout=timeout,
             creationflags=_creationflags(),
+            # Always an explicit block: never inherit RUNNERDECK_PAT & co. (winproc).
+            env=winproc.child_environment(env),
         )
     except subprocess.TimeoutExpired as e:
         output = _decode_output(e.output)
@@ -283,7 +324,9 @@ def extract_runner(zip_path: Path, target: Path) -> None:
     """Unpack the runner zip into `target`, which must be missing or an empty directory.
 
     Every member is checked before anything is written (no absolute paths, drive letters or
-    `..`); on any failure whatever was extracted is removed again.
+    `..`). On Windows the target gets a protected DACL before the first file is written, so
+    every extracted file inherits it (harden_runner_dir). On any failure, Ctrl+C included,
+    whatever was extracted is removed again.
     """
     if target.exists():
         if not target.is_dir():
@@ -304,16 +347,101 @@ def extract_runner(zip_path: Path, target: Path) -> None:
         started = time.monotonic()
         try:
             target.mkdir(parents=True, exist_ok=True)
+            harden_runner_dir(target)  # never raises; a failure is only a warning
             zf.extractall(target)
             missing = [n for n in (CONFIG_CMD, RUN_CMD) if not (target / n).is_file()]
             if missing:
                 raise InstallError(f"压缩包内容不是 runner：解压后缺少 {'、'.join(missing)}")
-        except Exception as e:
+        except BaseException as e:
+            # BaseException: a Ctrl+C in the middle of extractall must not leave a half-filled
+            # directory behind (the next add would silently pick "<repo>-2").
             _discard_extracted(target, created=created)
-            if isinstance(e, InstallError):
+            if isinstance(e, InstallError) or not isinstance(e, Exception):
                 raise
             raise InstallError(f"解压 runner 失败：{e}") from e
     log.info("extracted %s to %s in %.1fs", zip_path.name, target, time.monotonic() - started)
+
+
+def harden_runner_dir(path: Path, *, run: RunFn = run_command) -> bool:
+    """Windows: give `path` a protected DACL granting full control (inherited by everything
+    below it) only to the current user, SYSTEM and Administrators. No-op off Windows.
+
+    A directory created under C:\\ or D:\\ otherwise inherits "Authenticated Users: Modify"
+    from the drive root, so any other local user could replace run.cmd or the runner binaries
+    and have them run as us. Never raises: a failure is logged as a warning and False is
+    returned (the runner still works, only without the tighter ACL).
+    """
+    if not winproc.IS_WINDOWS:
+        return False
+    sid = _current_user_sid(run)
+    if sid is None:
+        return False
+    icacls = _system32_exe("icacls.exe")
+    commands = [
+        # Drop explicit ACEs a pre-existing directory may carry, leaving only inherited ones...
+        [icacls, str(path), "/reset", "/q"],
+        # ...then remove those as well and grant exactly our three principals.
+        [
+            icacls,
+            str(path),
+            "/inheritance:r",
+            "/grant:r",
+            f"*{sid}:(OI)(CI)F",
+            f"*{_SYSTEM_SID}:(OI)(CI)F",
+            f"*{_ADMINISTRATORS_SID}:(OI)(CI)F",
+            "/q",
+        ],
+    ]
+    for args in commands:
+        if _run_acl_tool(args, run=run, what=f"icacls on {path}") is None:
+            return False
+    log.info("restricted ACL of %s to the current user, SYSTEM and Administrators", path)
+    return True
+
+
+def _current_user_sid(run: RunFn) -> str | None:
+    out = _run_acl_tool(
+        [_system32_exe("whoami.exe"), "/user", "/fo", "csv", "/nh"], run=run, what="whoami"
+    )
+    if out is None:
+        return None
+    for raw in reversed(out.splitlines()):
+        match = _WHOAMI_SID_RE.search(raw)
+        if match and _SID_RE.fullmatch(sid := match.group(1).decode("ascii")):
+            return sid
+    log.warning("not restricting runner dir ACL: no SID in whoami output %r", out[-200:])
+    return None
+
+
+def _run_acl_tool(args: list[str], *, run: RunFn, what: str) -> bytes | None:
+    """Run whoami / icacls; stdout on exit code 0, otherwise log a warning and return None."""
+    try:
+        proc = run(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=_ACL_TIMEOUT_S,
+            creationflags=_creationflags(),
+            env=winproc.child_environment(),
+        )
+    except Exception as e:  # OSError, TimeoutExpired, ...: hardening must never abort
+        log.warning("not restricting runner dir ACL: %s failed: %s", what, redact(str(e)))
+        return None
+    if proc.returncode != 0:
+        log.warning(
+            "not restricting runner dir ACL: %s exited with %s: %s",
+            what,
+            proc.returncode,
+            _decode_output(proc.stdout),
+        )
+        return None
+    return proc.stdout or b""
+
+
+def _system32_exe(name: str) -> str:
+    # The directory of winproc.cmd_exe(): %SystemRoot%\System32, never a search-path lookup.
+    return os.path.join(os.path.dirname(winproc.cmd_exe()), name)
 
 
 def _check_member(name: str, target: Path) -> None:

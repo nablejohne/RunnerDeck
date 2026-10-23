@@ -477,6 +477,72 @@ def test_setup_logging_is_idempotent(
         restore_runnerdeck_logger.removeHandler(foreign)
 
 
+def test_setup_logging_file_name(tmp_path: Path, restore_runnerdeck_logger: logging.Logger) -> None:
+    log_file = logs.setup_logging(tmp_path, file_name="runnerdeck-cli.log")
+    assert log_file == tmp_path / "runnerdeck-cli.log"
+    logging.getLogger("runnerdeck.core.cli").info("from the cli")
+    for handler in _tagged(restore_runnerdeck_logger):
+        handler.flush()
+    assert "from the cli" in log_file.read_text(encoding="utf-8")
+    assert not (tmp_path / paths.LOG_FILE_NAME).exists()
+
+
+def _small_log(tmp_path: Path, logger: logging.Logger) -> tuple[Path, logging.Handler]:
+    log_file = logs.setup_logging(tmp_path)
+    (handler,) = _tagged(logger)
+    handler.maxBytes = 300  # type: ignore[attr-defined]
+    return log_file, handler
+
+
+def test_failed_rollover_keeps_logging_without_tracebacks(
+    tmp_path: Path,
+    restore_runnerdeck_logger: logging.Logger,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    log_file, handler = _small_log(tmp_path, restore_runnerdeck_logger)
+    attempts: list[str] = []
+
+    def locked(source: str, dest: str) -> None:  # WinError 32: another process has it open
+        attempts.append(source)
+        raise PermissionError(32, "The process cannot access the file", source)
+
+    monkeypatch.setattr(handler, "rotate", locked)
+    log = logging.getLogger("runnerdeck.core.test")
+    for i in range(20):
+        log.info("record %02d %s", i, "x" * 40)
+    handler.flush()
+    text = log_file.read_text(encoding="utf-8")
+    assert all(f"record {i:02d}" in text for i in range(20))  # nothing dropped
+    assert len(attempts) == 1  # no retry on every record
+    assert "Logging error" not in capsys.readouterr().err
+
+    # The other process let go and ROLLOVER_RETRY_S has passed: rotation resumes.
+    monkeypatch.undo()
+    handler._retry_at = 0.0  # type: ignore[attr-defined]
+    log.info("after the other process let go")
+    handler.flush()
+    assert (tmp_path / f"{paths.LOG_FILE_NAME}.1").is_file()
+    assert "after the other process let go" in log_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
+def test_rollover_while_another_handle_has_the_log_open(
+    tmp_path: Path, restore_runnerdeck_logger: logging.Logger, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_file, handler = _small_log(tmp_path, restore_runnerdeck_logger)
+    log = logging.getLogger("runnerdeck.core.test")
+    log.info("first")
+    handler.flush()
+    with open(log_file, "a", encoding="utf-8"):  # like a second RunnerDeck process
+        for i in range(10):
+            log.info("record %02d %s", i, "x" * 40)
+        handler.flush()
+    text = log_file.read_text(encoding="utf-8")
+    assert all(f"record {i:02d}" in text for i in range(10))
+    assert "Logging error" not in capsys.readouterr().err
+
+
 def test_log_file_is_redacted(tmp_path: Path, restore_runnerdeck_logger: logging.Logger) -> None:
     secret = _unique_secret("logfile")
     redact.register_secret(secret)
@@ -611,10 +677,13 @@ def test_kill_tree_on_single_sleeping_child() -> None:
         [sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL
     )
     try:
-        assert winproc.kill_tree(child.pid, timeout=10) == [child.pid]
+        killed = winproc.kill_tree(child.pid, timeout=10)
+        # A uv venv's python.exe on Windows is a launcher that may already have started the
+        # base interpreter as its own child, so the list can hold more than child.pid.
+        assert child.pid in killed
         # psutil may already have reaped it on POSIX, so the exit code is not reliable here.
         child.wait(timeout=10)
-        assert _wait_gone(child.pid)
+        assert all(_wait_gone(pid) for pid in killed)
     finally:
         if child.poll() is None:
             child.kill()
@@ -636,6 +705,25 @@ def test_kill_processes_tolerates_already_dead() -> None:
     child.kill()
     child.wait(timeout=10)
     assert winproc.kill_processes([proc], timeout=1) == [child.pid]
+
+
+def test_kill_processes_reports_only_what_is_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL
+    )
+    try:
+        proc = psutil.Process(child.pid)
+
+        def denied() -> None:
+            raise psutil.AccessDenied(pid=child.pid)
+
+        monkeypatch.setattr(proc, "kill", denied)
+        assert winproc.kill_processes_report([proc], timeout=0.2) == ([], [child.pid])
+        assert winproc.kill_processes([proc], timeout=0.2) == []  # not "killed"
+        assert child.poll() is None
+    finally:
+        child.kill()
+        child.wait(timeout=10)
 
 
 def test_find_runner_processes_empty_dir(tmp_path: Path) -> None:

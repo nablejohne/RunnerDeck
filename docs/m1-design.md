@@ -208,10 +208,11 @@ class RunnerProcess:
     def output(self) -> list[str]            # 最近 max_lines 行的拷贝
     def start(self) -> None
         # 已在运行 -> ProcessError；目录下已有不属于本对象的 runner 进程（winproc.find_runner_processes）-> ProcessError
-        # Popen(["cmd.exe", "/c", "run.cmd"], cwd=runner_dir, stdin=DEVNULL, stdout=PIPE, stderr=STDOUT,
+        # Popen([winproc.cmd_exe(), "/c", "run.cmd"], cwd=runner_dir, stdin=DEVNULL, stdout=PIPE, stderr=STDOUT,
         #       creationflags=CREATE_NEW_PROCESS_GROUP（**不加** CREATE_NO_WINDOW，否则 Ctrl+Break 无效）, env=合并后的环境)
         # 状态 STARTING；起一个读取线程：逐行 decode_line -> 环形缓冲 -> on_line -> parse_line -> 状态机 -> on_state / on_job_finished
-        # 读到 EOF 后 wait()：我们主动 stop 的 -> STOPPED；否则退出码 0 -> STOPPED，非 0 -> ERROR 并记 last_error
+        # 读到 EOF 后 wait()：我们主动 stop 的 -> STOPPED；否则 cmd.exe 退出码非 0，或 run-helper 输出的
+        # Listener 退出码已知且非 0 -> ERROR（真实 run.cmd 在 Listener 崩溃后照样 exit /b 0，见 §13）
     def stop(self, timeout: float = 15.0) -> StopResult
         # 未运行 -> 直接返回 graceful=True, exit_code=None
         # 状态 STOPPING；若 winproc.has_console() 则 send_ctrl_break(pid) 并等待最多 timeout 秒
@@ -221,12 +222,12 @@ class RunnerProcess:
     def is_running(self) -> bool
 
 def running_processes(runner_dir: Path) -> list[psutil.Process]     # = winproc.find_runner_processes
-def stop_external(runner_dir: Path) -> list[int]
-    # 结束目录下所有 runner 进程及其父 cmd.exe（父进程命令行含 run.cmd / run-helper.cmd 时才杀），返回 pid；
-    # 用于 CLI 从另一个终端停止，必然是强杀
+def stop_external(runner_dir: Path) -> ExternalStop        # ExternalStop(killed, survivors, ok)
+    # 结束目录下所有 runner 进程及其父 cmd.exe（父进程命令行含 run.cmd / run-helper.cmd 时才杀）；
+    # 用于 CLI 从另一个终端停止，必然是强杀；survivors 非空时调用方必须报错
 ```
 
-Windows 专属测试：在 `tmp_path` 里放一个假的 `run.cmd`，用当前 Python 跑一个假 Listener 脚本（逐行打印 spike 样本里的输出，`signal.SIGBREAK` 处理器里打印 `Exiting...` 后退出码 0），验证 STARTING -> IDLE、Ctrl+Break 优雅停止（测试进程没有控制台时 skip 这一项，用 `winproc.has_console()` 判断）、强杀路径、意外退出 -> ERROR。
+Windows 专属测试：在 `tmp_path` 里放一个假的 `run.cmd`（照搬真实 run.cmd + run-helper 的退出码处理：Listener 崩溃后打印 run-helper 的那行并 `exit /b 0`），用当前 Python 跑一个假 Listener 脚本（逐行打印 spike 样本里的输出，`signal.SIGBREAK` 处理器里打印 `Exiting...` 后退出码 0），验证 STARTING -> IDLE、Ctrl+Break 优雅停止（测试进程没有控制台时 skip 这一项，用 `winproc.has_console()` 判断）、强杀路径、意外退出 -> ERROR。
 
 ## 9. `status.py`
 
@@ -283,9 +284,11 @@ class RunnerManager:
         # 回滚：解压后任何一步失败都删目录；configure 成功但之后失败，先尝试 unconfigure，失败再 API DELETE
     def remove_runner(self, key: str, *, keep_work: bool = False, progress: ProgressFn | None = None) -> RemoveResult
         # 运行中（目录下有 runner 进程）-> ProcessError，由调用方先停；先读 .runner 拿 agentId（remove 会删掉 .runner，spike §3）
-        # unconfigure 成功 -> 删目录；失败/目录不存在 -> API DELETE（404 视为已删除）；最后删记录
+        # unconfigure 成功 -> 删目录；失败/目录不存在 -> API DELETE；404 只有在 list_runners 成功（证明 PAT
+        # 能看到仓库）后才算“已删除”，否则 NotFoundError 且本地什么都不删；local_only=True 时完全不访问 GitHub
     def import_runner(self, path: Path) -> RunnerRecord
-        # read_runner_file -> parse_github_url -> API 确认 runner 仍存在（不存在 -> RunnerDeckError，建议重新注册）
+        # read_runner_file -> parse_github_url -> API 确认 runner 仍存在（同样先确认仓库可见，避免把“无权限”
+        # 当成“已删除”；确实不存在 -> RunnerDeckError，建议重新注册）
         # 已登记同一 path -> 返回已有记录
     def scan_unregistered(self) -> list[Path]        # runners_root 下已配置但没登记的目录
     def statuses(self, processes: Mapping[str, RunnerProcess] | None = None) -> list[RunnerStatusRow]
@@ -332,3 +335,36 @@ PAT 来源优先级：`RUNNERDECK_PAT` 环境变量 > keyring（按 `config.acco
 | H（第三阶段） | `core/cli.py`、`tests/core/test_cli.py` |
 
 `tests/core/conftest.py` 只由 A 创建，内容：`isolated_home`（设置 RUNNERDECK_HOME 到 tmp_path）、`memory_keyring`（内存 keyring 后端）两个夹具。其他人需要共用夹具时在自己的测试文件里定义，不要改 conftest。不要改 `pyproject.toml`、`uv.lock`、地基模块；需要改就在汇报里说明。
+
+## 13. 实现后的修订（以代码为准）
+
+M1 实现和对抗评审（16 条确认问题，见 PROGRESS.md）之后，接口相对上文的变化：
+
+**winproc.py**
+- `child_environment(overrides, *, base=None)`：给 config.cmd / run.cmd 的环境 = 本进程环境去掉 `SENSITIVE_ENV_VARS`（`RUNNERDECK_PAT`、`RUNNERDECK_TEST_PAT`、`GH_TOKEN`、`GITHUB_TOKEN` 等）再叠加 overrides。原因：workflow job 继承 run.cmd 的环境，fork PR 可读到 PAT。
+- `cmd_exe()`：`%SystemRoot%\System32\cmd.exe` 绝对路径，防止 cwd / PATH 里被放了假的 cmd.exe。
+- `kill_tree_report` / `kill_processes_report` 返回 `(gone, alive)`；`kill_tree` / `kill_processes` 只返回确认已结束的 pid。
+
+**github_client.py**：TLS 用 `truststore` 信任 Windows 系统证书库（国内常见的 TLS 代理/加速器把根证书装在系统库里），`SSL_CERT_FILE` 叠加生效，`SSL_CERT_DIR` 在 Windows/macOS 上不生效；不承载 https 流量的 SOCKS 环境代理不再阻止创建客户端。
+
+**installer.py**
+- `configure` / `unconfigure` 新增 `env=`（manager 传入代理），子进程环境总是经过 `child_environment`。
+- 默认 `run=run_command`：超时时结束整棵进程树（`subprocess.run` 只杀 cmd.exe，孙进程 Listener 占着管道会卡死）。
+- 成功判定接受 `REGISTERED_MARKERS`（`Runner successfully added` 或 `--replace` 时的 `Successfully replaced the runner`）；后者来自 runner 源码，待 spike 第 2 轮实测。
+- `harden_runner_dir()`：Windows 上用 icacls 关闭继承，只授权当前用户、SYSTEM、Administrators（`D:\` 根下默认继承 Authenticated Users: 修改）。失败只记警告。**runners_root 本身未加固**（其他用户可抢先建同名目录），留待 M3/M4。
+- 解压被 Ctrl+C 打断也会清理目录；`remove_runner_dir` 对不存在的目录是空操作，拒绝符号链接。
+
+**process.py**
+- ERROR 判定：见 §8 修订。run-helper 的固定输出映射为 Listener 退出码：`terminated error` -> 1、`retryable error` -> 2、`because of updating` -> 3、`re-launch ephemeral` -> 4、`Session Conflict error` -> 5（措辞来自 runner 源码，待实测）；2/3/4 是重启循环，不结束运行。新属性 `listener_exit_code`。
+- `stop()` 强杀后仍有存活进程 -> `ProcessError` 列出 pid；`note_forced_kill()` 供 CLI 第二次 Ctrl+C 自己杀进程树前调用，使这次停止记为强杀（`last_stop_forced`，M3 状态合并要用）。
+- `stop_external()` 返回 `ExternalStop`。
+
+**status.py**：STALLED 的文案是“连接异常”（与 ERROR 的“异常”区分）；阈值边界：`>= 60s` 为 STALLED，`>= 240s` 不再算会话残留。**已知缺口（推迟到 M3）**：强杀信息只在内存里，换进程（另一个终端 `stop`、重启应用）后无法判断会话残留，GitHub 仍显示 online 时会被标成 EXTERNAL。
+
+**manager.py**：`remove_runner(..., local_only=False)`，`local_only=True` 不访问 GitHub、只删目录和记录（`RemoteRemoval.SKIPPED`），用于仓库已删除或 PAT 已无权限；`RollbackError` 表示回滚未完成；`plan_add(..., root=, version=)`；`process_for` 只传代理覆盖项。
+
+**cli.py**
+- 新选项：`remove --local-only`、`add --version x.y.z`、`add` 接受仓库 URL、`-y`、全局 `--debug` / `-V`、`stop` 可接多个 key。
+- `start` 的 Ctrl+C：第一次并行地对所有 runner 优雅停止；第二次直接强杀仍在停止中的（Windows 上优雅等待本身不可打断）；第三次退出（130）。只要有我们启动的 runner 可能还活着，退出码就不是 0，并提示 `stop <name>`。
+- `stop`：有进程没杀掉 -> 退出码 1 并列出 pid。
+- 日志写 `runnerdeck-cli.log`（托盘应用用 `runnerdeck.log`），避免两个进程互相轮转失败。

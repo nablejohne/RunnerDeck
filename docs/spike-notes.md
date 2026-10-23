@@ -157,4 +157,11 @@ uv run python scripts/spike_runner.py run --dispatch-seconds 20          # 等�
 uv run python scripts/spike_runner.py remove --api-only --delete-dir
 ```
 
+M1 实现中引入、需要第 2 轮实测确认的（来自 runner 源码，未抓到过原始输出）：
+
+- `config.cmd --replace` 覆盖同名 runner 时是否输出 `Successfully replaced the runner`（installer 已兼容）
+- run-helper 对 Listener 退出码 1/2/3/4/5 打印的原句（`terminated error` / `retryable error` / `because of updating` / `re-launch ephemeral` / `Session Conflict error`），process.py 已按源码措辞识别
+- 真实的 `Runner.Listener.exe` / `Runner.Worker.exe` 进程能被 `find_runner_processes` 找到，`runnerdeck-cli stop` 能从另一个终端结束它们
+- `harden_runner_dir` 收紧 ACL 后 runner 能正常注册、运行、自更新、移除
+
 发回：`spike-out/`（可以删掉 `cache/` 里的两个 zip，约 200 MB）、`tests/fixtures/api/`、`.runner` 内容，以及 a、f 两步的控制台输出（这两步的部分结果只打印在控制台）。

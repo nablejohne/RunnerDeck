@@ -5,7 +5,9 @@
 Every business flow lives in manager.py; this module only parses arguments, asks for
 confirmation and prints. All output goes through redact(). Exit codes: 0 success, 1 a
 RunnerDeckError (printed as "错误：<message>") or a cancelled confirmation, 2 bad arguments,
-130 Ctrl+C (except in `start`, where Ctrl+C is the normal way to stop supervising).
+130 Ctrl+C. In `start`, Ctrl+C is the normal way to stop supervising and exits 0 once every
+runner has stopped; `start` never exits 0 while a runner it started may still be alive (it
+lists those with their PID and exits 1, or 130 when the user gave up waiting).
 
 Grounded in docs/spike-notes.md:
 - §2: users paste the token's name instead of its value, so `login` checks the format first.
@@ -20,17 +22,19 @@ import argparse
 import getpass
 import logging
 import os
+import signal
 import sys
 import threading
 import time
 import traceback
 import unicodedata
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import closing
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
+from types import FrameType
 from typing import Any, NoReturn, TextIO
 from urllib.parse import urlsplit
 
@@ -38,8 +42,13 @@ import psutil
 from pydantic import ValidationError
 
 from runnerdeck import __version__
-from runnerdeck.core import logs, paths, process, runner_file, secrets
-from runnerdeck.core.errors import InvalidInputError, ProcessError, RunnerDeckError
+from runnerdeck.core import logs, paths, process, runner_file, secrets, winproc
+from runnerdeck.core.errors import (
+    InvalidInputError,
+    NotFoundError,
+    ProcessError,
+    RunnerDeckError,
+)
 from runnerdeck.core.github_client import GitHubClient
 from runnerdeck.core.manager import (
     AddPlan,
@@ -59,7 +68,7 @@ from runnerdeck.core.models import (
     normalize_labels,
     parse_full_name,
 )
-from runnerdeck.core.process import RunnerProcess
+from runnerdeck.core.process import RunnerProcess, StopResult
 from runnerdeck.core.redact import redact, register_secret
 from runnerdeck.core.status import display_label
 from runnerdeck.core.store import ConfigStore, resolve_runner
@@ -75,6 +84,13 @@ EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 
 EXPIRY_WARN_DAYS = 7  # warn when the PAT expires sooner than this
+# Own log file: the tray app (and later the CLI next to it) must not rotate a file another
+# process holds open, which fails on Windows (WinError 32).
+LOG_FILE_NAME = "runnerdeck-cli.log"
+STOP_POLL_S = 0.1  # `start` stop phase: how often to look for finished stops / another Ctrl+C
+# `start` stop phase: how long to wait beyond stop_timeout_s (kill wait, pipe drain, psutil
+# scans in RunnerProcess.stop) before listing the runners that did not stop.
+STOP_GRACE_S = 30.0
 SETTINGS_KEYS = ("runners_root", "default_labels", "poll_interval_s", "proxy")
 _PROXY_OFF = frozenset({"", "none", "off", "-"})
 _SHOWN_AUTO_LABELS = ("self-hosted", "Windows", "X64")  # added by the runner (AUTO_LABELS)
@@ -87,6 +103,10 @@ LINGER_HINT = (
 RECONNECTING_HINT = (
     "GitHub 端的旧会话还没过期（上次是强制结束的），runner 大约每 30 秒重试一次，"
     "通常 3 分钟内会自动恢复"
+)
+EXTERNAL_EXIT_HINT = (
+    "这次退出不是在本终端按 Ctrl+C 停止的：可能是 runner 自己出错退出，"
+    "也可能是被外部结束（例如在另一个终端执行了 {prog} stop {key}）"
 )
 
 ReadFn = Callable[[str], str]
@@ -122,6 +142,8 @@ class CliDeps:
     getpass.getpass / input (prompt text is passed already redacted). client_factory builds a
     GitHubClient from (pat, settings.proxy); manager_factory gets the store and a zero-argument
     client factory that resolves the PAT lazily (RUNNERDECK_PAT > keyring by config.account).
+    kill_tree is what `start` uses on a second Ctrl+C: kill a run.cmd process tree by PID and
+    return (pids gone, pids still alive).
     """
 
     stdout: TextIO | None = None
@@ -132,12 +154,14 @@ class CliDeps:
     store_factory: Callable[[], ConfigStore] = ConfigStore
     client_factory: CliClientFactory = _default_client
     manager_factory: ManagerFactory = _default_manager
-    stop_external: Callable[[Path], list[int]] = process.stop_external
+    stop_external: Callable[[Path], process.ExternalStop] = process.stop_external
+    kill_tree: Callable[[int], tuple[list[int], list[int]]] = winproc.kill_tree_report
     setup_logging: Callable[..., Path] = logs.setup_logging
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], datetime] = _utcnow
     poll_interval_s: float = 0.5  # `start`: how often to check whether runners are still alive
     stop_timeout_s: float = process.DEFAULT_STOP_TIMEOUT_S
+    stop_grace_s: float = STOP_GRACE_S
 
 
 # --- output -------------------------------------------------------------------------------
@@ -265,6 +289,11 @@ def build_parser(console: Console) -> argparse.ArgumentParser:
     p = command("remove", "在 GitHub 上注销 runner 并删除目录和记录", _cmd_remove)
     p.add_argument("key", help="runner 的 id、id 前缀、名称或 owner/repo")
     p.add_argument("--keep-work", action="store_true", help="保留 _work 目录")
+    p.add_argument(
+        "--local-only",
+        action="store_true",
+        help="不访问 GitHub，只删除本地目录和记录（仓库已删除或 PAT 已无权限时使用）",
+    )
     p.add_argument("-y", "--yes", action="store_true", help="不询问，直接确认")
 
     p = command("import", "登记一个已经配置好的 runner 目录", _cmd_import)
@@ -652,7 +681,11 @@ def _cmd_remove(ctx: _Context, args: argparse.Namespace) -> int:
     key = _short_key(config, record)
     console.print(f"将移除 runner {record.name}（{record.full_name}，目录 {record.path}）")
     console.print(
-        "会在 GitHub 上注销它，删除本地目录"
+        (
+            "不会访问 GitHub（--local-only），只删除本地目录"
+            if args.local_only
+            else "会在 GitHub 上注销它，删除本地目录"
+        )
         + ("（保留 _work）" if args.keep_work else "")
         + "，并删除记录"
     )
@@ -661,16 +694,28 @@ def _cmd_remove(ctx: _Context, args: argparse.Namespace) -> int:
         return EXIT_ERROR
     try:
         result = ctx.manager.remove_runner(
-            record.id, keep_work=args.keep_work, progress=_progress(console)
+            record.id,
+            keep_work=args.keep_work,
+            local_only=args.local_only,
+            progress=_progress(console),
         )
     except ProcessError as e:
         console.error(f"错误：{e}")
         console.error(f"提示：runner 在另一个终端运行时，可以先执行 {PROG} stop {key}")
         return EXIT_ERROR
+    except NotFoundError as e:
+        console.error(f"错误：{e}")
+        console.error(
+            f"提示：如果仓库已被删除或不再需要这个 runner，可以用 {PROG} remove {key} --local-only"
+            " 只删除本地目录和记录"
+        )
+        return EXIT_ERROR
     for warning in result.warnings:
         console.print(f"注意：{warning}")
     if result.remote is RemoteRemoval.UNCONFIGURED:
         console.print("GitHub：已通过 config.cmd remove 注销")
+    elif result.remote is RemoteRemoval.SKIPPED:
+        console.print("GitHub：未处理（--local-only）")
     elif result.remote is RemoteRemoval.API_DELETED:
         console.print(f"GitHub：已通过 API 删除（runner id {result.runner_id}）")
     else:
@@ -719,17 +764,29 @@ def _cmd_stop(ctx: _Context, args: argparse.Namespace) -> int:
     code = EXIT_OK
     forced = False
     for record in records:
+        name = record.name
         try:
-            pids = ctx.deps.stop_external(Path(record.path))
-        except (psutil.Error, OSError) as e:
-            console.error(f"错误：无法结束 runner {record.name}：{e}")
+            outcome = ctx.deps.stop_external(Path(record.path))
+        except (psutil.Error, OSError, RunnerDeckError) as e:
+            console.error(f"错误：无法结束 runner {name}：{e}")
             code = EXIT_ERROR
             continue
-        if not pids:
-            console.print(f"runner {record.name} 没有在运行")
-            continue
-        forced = True
-        console.print(f"已强制结束 runner {record.name}（PID {', '.join(map(str, pids))}）")
+        killed = ", ".join(map(str, outcome.killed))
+        if outcome.ok and not outcome.killed:
+            console.print(f"runner {name} 没有在运行")
+        elif outcome.ok:
+            forced = True
+            console.print(f"已强制结束 runner {name}（PID {killed}）")
+        else:
+            if outcome.killed:
+                console.print(f"已结束 runner {name} 的部分进程（PID {killed}）")
+            survivors = ", ".join(map(str, outcome.survivors))
+            console.error(f"错误：无法结束 runner {name} 的进程（PID {survivors}），它仍在运行")
+            console.error(
+                "提示：它可能是用管理员权限或其他账号启动的，请在同样权限的终端里重新执行 "
+                f"{PROG} stop {_short_key(config, record)}"
+            )
+            code = EXIT_ERROR
     if forced:
         console.print(LINGER_HINT)
     return code
@@ -738,16 +795,95 @@ def _cmd_stop(ctx: _Context, args: argparse.Namespace) -> int:
 # --- start: foreground supervision ---------------------------------------------------------
 
 
-class _Supervisor:
-    """Runs several RunnerProcess objects in the foreground until they exit or Ctrl+C."""
+@contextmanager
+def _sigint_counted(handler: Callable[[int, FrameType | None], None]) -> Iterator[None]:
+    """While inside, Ctrl+C (SIGINT) calls `handler` instead of raising KeyboardInterrupt.
 
-    def __init__(self, ctx: _Context, records: Sequence[RunnerRecord]) -> None:
+    Only the main thread can install a handler; Ctrl+C never reaches other threads anyway.
+    CPython runs the handler on the main thread the next time that thread executes bytecode:
+    at once in time.sleep(), but on Windows only after a WaitForSingleObject (Popen.wait) or a
+    lock wait has returned.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    try:
+        previous = signal.signal(signal.SIGINT, handler)
+    except (ValueError, OSError):  # e.g. an embedding interpreter without signal support
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, signal.default_int_handler if previous is None else previous)
+
+
+@dataclass
+class _Run:
+    """One runner under `start` supervision. The stop phase's threads fill in the results."""
+
+    record: RunnerRecord
+    key: str  # what to type after `runnerdeck-cli stop`
+    proc: RunnerProcess
+    pid: int | None = None  # run.cmd's cmd.exe, remembered for the final report
+    stopper: threading.Thread | None = None  # runs proc.stop()
+    result: StopResult | None = None
+    stop_error: str | None = None
+    forcer: threading.Thread | None = None  # runs deps.kill_tree() after a 2nd Ctrl+C
+    force_killed: list[int] = field(default_factory=list)
+    force_survivors: list[int] = field(default_factory=list)
+    force_error: str | None = None
+
+    def busy(self) -> bool:
+        return any(t is not None and t.is_alive() for t in (self.stopper, self.forcer))
+
+    def wait(self, timeout: float) -> None:
+        for thread in (self.stopper, self.forcer):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout)
+                return
+
+
+class _Supervisor:
+    """Runs several RunnerProcess objects in the foreground until they exit or Ctrl+C.
+
+    run.cmd runs in its own process group, which ignores the console's Ctrl+C, so only this
+    object can stop the runners, and it must not lose one (docs/m1-design.md §11):
+    - While supervising, SIGINT only counts presses (_sigint_counted) instead of raising
+      KeyboardInterrupt at an arbitrary point, such as after Popen spawned run.cmd but before
+      the runner was registered here, which would leave it running unsupervised.
+    - 1st Ctrl+C: start no more runners; stop all running ones at the same time, each on its
+      own thread (Ctrl+Break, then up to stop_timeout_s each, in parallel).
+    - 2nd Ctrl+C: kill every runner still stopping (deps.kill_tree on run.cmd's PID). The
+      graceful wait itself cannot be cut short: on Windows RunnerProcess.stop() waits in
+      WaitForSingleObject, which Ctrl+C does not interrupt. So the main thread never blocks in
+      it, and killing the process is what ends that wait.
+    - 3rd Ctrl+C: stop waiting.
+    Without further presses the stop phase still ends after stop_timeout_s + stop_grace_s.
+    Every runner that may still be alive at the end is listed with its PID and a
+    `runnerdeck-cli stop <key>` hint; the exit code is then 1 (130 after a 3rd Ctrl+C), never 0.
+    """
+
+    def __init__(
+        self, ctx: _Context, records: Sequence[RunnerRecord], config: AppConfig | None = None
+    ) -> None:
         self.ctx = ctx
         self.console = ctx.console
         self.records = records
-        self.running: list[tuple[RunnerRecord, RunnerProcess]] = []
+        self.config = config
+        self.runs: list[_Run] = []
+        self.skipped: list[RunnerRecord] = []
         self.failed = False
         self._hinted: set[str] = set()
+        self._presses = 0
+
+    def _on_sigint(self, signum: int, frame: FrameType | None) -> None:
+        # Runs on the main thread between two bytecodes, possibly while that thread holds a
+        # lock (Console, RunnerProcess, threading.Event): only count, never print or wait here.
+        self._presses += 1
+
+    def _key(self, record: RunnerRecord) -> str:
+        return _short_key(self.config, record) if self.config is not None else record.name
 
     def _on_line(self, name: str) -> Callable[[str], None]:
         def on_line(line: str) -> None:
@@ -766,79 +902,202 @@ class _Supervisor:
         return on_state
 
     def run(self) -> int:
+        gave_up = False
+        with _sigint_counted(self._on_sigint):
+            try:
+                if self._supervise():
+                    self._announce_stop()
+                    ended = [run for run in self.runs if not run.proc.is_running()]
+                    self._report_exits(ended)
+                    targets = [run for run in self.runs if run not in ended]
+                    gave_up = self._stop_all(targets, base=1)
+                else:
+                    self._report_exits(self.runs)
+            except Exception:
+                # Never leave runners behind on an unexpected failure.
+                self._stop_all([run for run in self.runs if run.proc.is_running()], base=0)
+                self._report_alive()
+                raise
+            alive = self._report_alive()
+        if alive:
+            return EXIT_INTERRUPTED if gave_up else EXIT_ERROR
+        return EXIT_ERROR if self.failed else EXIT_OK
+
+    def _supervise(self) -> bool:
+        """Start the runners, then wait while any is running. True if Ctrl+C ended that."""
+        deps = self.ctx.deps
         try:
             self._start_all()
-            if not self.running:
-                return EXIT_ERROR
-            self.console.print("按 Ctrl+C 停止所有 runner")
-            while any(proc.is_running() for _, proc in self.running):
-                self.ctx.deps.sleep(self.ctx.deps.poll_interval_s)
-        except KeyboardInterrupt:
-            self.console.print()
-            self.console.print("收到 Ctrl+C，正在停止所有 runner …")
-            self._stop_all()
-        except Exception:
-            self._stop_all()  # never leave runners behind on an unexpected failure
-            raise
-        else:
-            self._report_exits()
-        return EXIT_ERROR if self.failed else EXIT_OK
+            if self.runs and not self._presses:
+                self.console.print("按 Ctrl+C 停止所有 runner")
+            while not self._presses and any(run.proc.is_running() for run in self.runs):
+                deps.sleep(deps.poll_interval_s)
+        except KeyboardInterrupt:  # only without our SIGINT handler (off the main thread)
+            self._presses += 1
+        return self._presses > 0
 
     def _start_all(self) -> None:
         manager = self.ctx.manager
-        for record in self.records:
+        for index, record in enumerate(self.records):
+            if self._presses:
+                self.skipped = list(self.records[index:])
+                return
             name = record.name
             try:
                 proc = manager.process_for(
                     record, on_line=self._on_line(name), on_state=self._on_state(name)
                 )
-                proc.start()
             except RunnerDeckError as e:
                 self.console.error(f"错误：[{name}] 无法启动：{e}")
                 self.failed = True
                 continue
-            self.running.append((record, proc))
+            run = _Run(record, self._key(record), proc)
+            # Registered before start(): if start() is cut short after run.cmd was spawned,
+            # the stop phase still finds the runner (is_running() is already True by then).
+            self.runs.append(run)
+            try:
+                proc.start()
+            except BaseException as e:
+                if not proc.is_running():
+                    self.runs.remove(run)
+                if not isinstance(e, RunnerDeckError):
+                    raise
+                self.console.error(f"错误：[{name}] 无法启动：{e}")
+                self.failed = True
+                continue
+            run.pid = proc.pid
             self.console.print(f"[{name}] 已启动（PID {proc.pid}），目录 {record.path}")
 
-    def _stop_all(self) -> None:
-        force = False
+    def _announce_stop(self) -> None:
+        self.console.print()
+        self.console.print(
+            f"收到 Ctrl+C，正在停止所有 runner（每个最多等 {self.ctx.deps.stop_timeout_s:g} 秒；"
+            "再按一次 Ctrl+C 立即强制结束）…"
+        )
+        if self.skipped:
+            self.console.print(f"没有启动：{'、'.join(r.name for r in self.skipped)}")
+
+    def _stop_all(self, targets: Sequence[_Run], *, base: int) -> bool:
+        """Stop `targets` at the same time. True if the user gave up waiting (3rd Ctrl+C).
+
+        base: Ctrl+C presses already used up (1 after the press that started stopping).
+        """
+        deps = self.ctx.deps
+        for run in targets:
+            run.stopper = threading.Thread(
+                target=self._stop_one,
+                args=(run, deps.stop_timeout_s),
+                name=f"stop-{run.record.name}",
+                daemon=True,  # a runner we gave up on must not keep the CLI from exiting
+            )
+            run.stopper.start()
+        limit = deps.stop_timeout_s + deps.stop_grace_s
+        deadline = time.monotonic() + limit
+        forced = gave_up = False
+        while busy := [run for run in targets if run.busy()]:
+            if not forced and self._presses > base:
+                forced = True
+                self.console.print(
+                    "再次收到 Ctrl+C：不再等待 Ctrl+Break，立即强制结束还没停下的 runner"
+                    "（再按一次 Ctrl+C 就不再等待）"
+                )
+                for run in busy:
+                    self._force(run)
+            elif forced and self._presses > base + 1:
+                gave_up = True
+                self.console.error("又收到 Ctrl+C：不再等待 runner 停止")
+                break
+            elif time.monotonic() > deadline:
+                self.console.error(f"错误：等了 {limit:g} 秒，仍有 runner 没有停下")
+                break
+            try:
+                busy[0].wait(STOP_POLL_S)
+            except KeyboardInterrupt:  # only without our SIGINT handler (off the main thread)
+                self._presses += 1
+        self._report_stops(targets)
+        return gave_up
+
+    def _stop_one(self, run: _Run, timeout: float) -> None:
+        try:
+            run.result = run.proc.stop(timeout)
+        except RunnerDeckError as e:
+            run.stop_error = str(e)
+        except Exception as e:  # a bug, on a daemon thread: report it rather than lose it
+            log.exception("stopping %s failed", run.record.name)
+            run.stop_error = f"内部错误：{type(e).__name__}: {e}"
+
+    def _force(self, run: _Run) -> None:
+        pid = run.proc.pid
+        if pid is None or run.stopper is None or not run.stopper.is_alive():
+            return
+        run.forcer = threading.Thread(
+            target=self._force_one, args=(run, pid), name=f"kill-{run.record.name}", daemon=True
+        )
+        run.forcer.start()
+
+    def _force_one(self, run: _Run, pid: int) -> None:
+        try:
+            run.proc.note_forced_kill()  # so its stop() reports a hard kill, not a graceful one
+            run.force_killed, run.force_survivors = self.ctx.deps.kill_tree(pid)
+        except Exception as e:  # psutil.Error / OSError, or a bug: report it rather than lose it
+            log.warning("killing %s (pid %s) failed: %s", run.record.name, pid, e)
+            run.force_error = str(e) or type(e).__name__
+
+    def _report_stops(self, targets: Sequence[_Run]) -> None:
         forced_any = False
-        for record, proc in self.running:
-            if not proc.is_running():
+        for run in targets:
+            name = run.record.name
+            if run.force_error is not None:
+                self.console.error(f"错误：[{name}] 无法强制结束：{run.force_error}")
+                self.failed = True
+            elif run.force_survivors:
+                pids = ", ".join(map(str, run.force_survivors))
+                self.console.error(f"错误：[{name}] 强制结束失败，这些进程还在：PID {pids}")
+                self.failed = True
+            if run.stop_error is not None:
+                self.console.error(f"错误：[{name}] {run.stop_error}")
+                if not run.proc.is_running():  # the run ended, but some processes survived
+                    self.console.error(f"提示：请执行 {PROG} stop {run.key} 结束剩下的进程")
+                self.failed = True
                 continue
-            name = record.name
-            while True:
-                try:
-                    result = proc.stop(0.0 if force else self.ctx.deps.stop_timeout_s)
-                    break
-                except KeyboardInterrupt:
-                    if force:
-                        raise
-                    force = True
-                    self.console.print("再次收到 Ctrl+C：不再等待，强制结束剩余的 runner")
-                except RunnerDeckError as e:
-                    self.console.error(f"错误：[{name}] {e}")
-                    self.failed = True
-                    result = None
-                    break
-            if result is None:
-                continue
-            if result.graceful:
-                self.console.print(f"[{name}] 已停止")
-            else:
+            if run.result is None:
+                continue  # still stopping: listed by _report_alive
+            killed = list(dict.fromkeys([*run.force_killed, *run.result.killed_pids]))
+            pids = ", ".join(map(str, killed)) or "-"
+            if run.force_killed:
                 forced_any = True
-                pids = ", ".join(map(str, result.killed_pids)) or "-"
+                self.console.print(f"[{name}] 已强制结束（PID {pids}）")
+            elif not run.result.graceful:
+                forced_any = True
                 self.console.print(f"[{name}] 没能正常停止，已强制结束（PID {pids}）")
+            else:
+                self.console.print(f"[{name}] 已停止")
         if forced_any:
             self.console.print(LINGER_HINT)
 
-    def _report_exits(self) -> None:
-        for record, proc in self.running:
-            if proc.last_error:
-                self.console.error(f"错误：[{record.name}] {proc.last_error}")
+    def _report_exits(self, runs: Sequence[_Run]) -> None:
+        """Runners that ended on their own, not stopped by this supervisor."""
+        for run in runs:
+            name = run.record.name
+            error = run.proc.last_error
+            if error:
+                self.console.error(f"错误：[{name}] {error}")
+                hint = EXTERNAL_EXIT_HINT.format(prog=PROG, key=run.key)
+                self.console.error(f"[{name}] {hint}")
                 self.failed = True
             else:
-                self.console.print(f"[{record.name}] 已退出（退出码 {proc.exit_code}）")
+                self.console.print(f"[{name}] 已退出（退出码 {run.proc.exit_code}）")
+
+    def _report_alive(self) -> bool:
+        """List every runner that may still be running. True if there is one."""
+        alive = [run for run in self.runs if run.proc.is_running()]
+        for run in alive:
+            pid = run.proc.pid or run.pid
+            self.console.error(
+                f"错误：[{run.record.name}] 没能确认已停止，可能仍在运行（PID {pid or '未知'}）；"
+                f"请执行 {PROG} stop {run.key} 结束它"
+            )
+        return bool(alive)
 
 
 def _cmd_start(ctx: _Context, args: argparse.Namespace) -> int:
@@ -853,7 +1112,7 @@ def _cmd_start(ctx: _Context, args: argparse.Namespace) -> int:
         records = _unique([resolve_runner(config, key) for key in args.keys])
     else:
         raise UsageError("请指定要启动的 runner，或使用 --all")
-    return _Supervisor(ctx, records).run()
+    return _Supervisor(ctx, records, config).run()
 
 
 # --- settings -----------------------------------------------------------------------------
@@ -930,7 +1189,9 @@ def _cmd_settings_set(ctx: _Context, args: argparse.Namespace) -> int:
 
 def _init_logging(deps: CliDeps, console: Console, debug: bool) -> Path | None:
     try:
-        return deps.setup_logging(level=logging.DEBUG if debug else logging.INFO, stream=debug)
+        return deps.setup_logging(
+            level=logging.DEBUG if debug else logging.INFO, stream=debug, file_name=LOG_FILE_NAME
+        )
     except OSError as e:
         console.error(f"警告：无法写入日志文件（{e}），继续运行")
         return None

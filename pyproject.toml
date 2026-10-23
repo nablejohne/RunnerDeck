@@ -10,6 +10,7 @@ dependencies = [
     "keyring>=25",
     "psutil>=7.0",
     "pydantic>=2.9",
+    "truststore>=0.10",
 ]
 
 [project.scripts]

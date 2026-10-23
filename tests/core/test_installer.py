@@ -6,7 +6,9 @@ are obviously fake values generated per test.
 
 from __future__ import annotations
 
+import functools
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -40,6 +42,7 @@ FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "config"
 CONFIG_OK = (FIXTURES / "config_ok.txt").read_bytes()
 REMOVE_OK = (FIXTURES / "remove_ok.txt").read_bytes()
 URL = "https://github.com/octo/sandbox"
+PROXY = "http://127.0.0.1:7890"
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
 
 
@@ -98,7 +101,7 @@ def test_build_config_command_exact_list() -> None:
     token = fake_token()
     args = build_config_command(url=URL, token=token, name="box-sandbox", labels=["gpu", "big"])
     assert args == [
-        "cmd.exe", "/c", "config.cmd", "--unattended",
+        winproc.cmd_exe(), "/c", "config.cmd", "--unattended",
         "--url", URL,
         "--token", token,
         "--name", "box-sandbox",
@@ -202,8 +205,19 @@ def test_build_config_command_registers_token_for_redaction() -> None:
 def test_build_remove_command() -> None:
     token = fake_token()
     assert build_remove_command(token=token) == [
-        "cmd.exe", "/c", "config.cmd", "remove", "--token", token,
+        winproc.cmd_exe(), "/c", "config.cmd", "remove", "--token", token,
     ]  # fmt: skip
+
+
+def test_config_commands_use_winproc_cmd_exe(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A bare "cmd.exe" is looked up in our current directory before System32.
+    absolute = "X:\\Windows\\System32\\cmd.exe"
+    monkeypatch.setattr(winproc, "cmd_exe", lambda: absolute)
+    token = fake_token()
+    assert build_config_command(url=URL, token=token, name="box", labels=[])[:3] == [
+        absolute, "/c", "config.cmd",
+    ]  # fmt: skip
+    assert build_remove_command(token=token)[:3] == [absolute, "/c", "config.cmd"]
 
 
 # --- configure / unconfigure -----------------------------------------------------------------
@@ -231,7 +245,80 @@ def test_configure_success_with_real_output(runner_dir: Path) -> None:
         "stderr": subprocess.STDOUT,
         "timeout": CONFIG_TIMEOUT_S,
         "creationflags": winproc.CREATE_NO_WINDOW if winproc.IS_WINDOWS else 0,
+        "env": winproc.child_environment(),
     }
+
+
+def test_configure_child_env_drops_pat_and_keeps_the_rest(
+    runner_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("RUNNERDECK_PAT", "RUNNERDECK_TEST_PAT", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.setenv(name, "ghp_" + "x" * 36)
+    monkeypatch.setenv("RD_INHERITED", "kept")
+    run = FakeRun(CONFIG_OK)
+    configure(runner_dir, url=URL, token=fake_token(), name="box", labels=[], run=run)
+    child_env = run.calls[0][1]["env"]
+    assert child_env["RD_INHERITED"] == "kept"
+    for name in ("RUNNERDECK_PAT", "RUNNERDECK_TEST_PAT", "GH_TOKEN", "GITHUB_TOKEN"):
+        assert name not in child_env
+
+
+def test_configure_and_unconfigure_pass_env_overrides(
+    runner_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNNERDECK_PAT", "ghp_" + "x" * 36)
+    monkeypatch.setenv("RD_INHERITED", "kept")
+    overrides = {"https_proxy": PROXY, "http_proxy": PROXY}
+    configure_run, remove_run = FakeRun(CONFIG_OK), FakeRun(REMOVE_OK)
+    configure(
+        runner_dir, url=URL, token=fake_token(), name="box", labels=[], run=configure_run,
+        env=overrides,
+    )  # fmt: skip
+    unconfigure(runner_dir, token=fake_token(), run=remove_run, env=overrides)
+    for run in (configure_run, remove_run):
+        child_env = run.calls[0][1]["env"]
+        assert child_env["https_proxy"] == PROXY
+        assert child_env["http_proxy"] == PROXY
+        assert child_env["RD_INHERITED"] == "kept"
+        assert "RUNNERDECK_PAT" not in child_env
+
+
+def test_configure_env_override_replaces_other_spelling_on_windows(
+    runner_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(winproc, "IS_WINDOWS", True)
+    monkeypatch.setenv("HTTPS_PROXY", "http://stale:1")
+    run = FakeRun(CONFIG_OK)
+    configure(
+        runner_dir, url=URL, token=fake_token(), name="box", labels=[], run=run,
+        env={"https_proxy": PROXY},
+    )  # fmt: skip
+    child_env = run.calls[0][1]["env"]
+    assert [(k, v) for k, v in child_env.items() if k.upper() == "HTTPS_PROXY"] == [
+        ("https_proxy", PROXY)
+    ]
+
+
+def test_configure_env_reaches_a_real_child(
+    runner_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNNERDECK_PAT", "ghp_" + "y" * 36)
+    code = (
+        "import os; "
+        "print('proxy=' + os.environ.get('https_proxy', '-')); "
+        "print('pat=' + str('RUNNERDECK_PAT' in os.environ)); "
+        "print('Runner successfully added'); print('Settings Saved.')"
+    )
+
+    def via_python(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        return run_command([sys.executable, "-c", code], **kwargs)
+
+    result = configure(
+        runner_dir, url=URL, token=fake_token(), name="box", labels=[], run=via_python,
+        timeout=60, env={"https_proxy": PROXY},
+    )  # fmt: skip
+    assert f"proxy={PROXY}" in result.output
+    assert "pat=False" in result.output
 
 
 def test_configure_uses_create_no_window_on_windows(
@@ -387,7 +474,7 @@ def test_unconfigure_success_with_real_output(runner_dir: Path) -> None:
     assert result.returncode == 0
     assert "Runner removed successfully" in result.output
     [(args, kwargs)] = run.calls
-    assert args == ["cmd.exe", "/c", "config.cmd", "remove", "--token", token]
+    assert args == [winproc.cmd_exe(), "/c", "config.cmd", "remove", "--token", token]
     assert kwargs["cwd"] == runner_dir
     assert kwargs["stdin"] == subprocess.DEVNULL
     assert kwargs["stdout"] == subprocess.PIPE
@@ -680,6 +767,165 @@ def test_extract_runner_bad_zip(tmp_path: Path) -> None:
 def test_extract_runner_missing_zip(tmp_path: Path) -> None:
     with pytest.raises(InstallError, match="无法打开"):
         extract_runner(tmp_path / "missing.zip", tmp_path / "t")
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["new-dir", "empty-dir"])
+def test_extract_runner_cleans_up_after_ctrl_c(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    zip_path = make_zip(tmp_path / "runner.zip", RUNNER_MEMBERS)
+    target = tmp_path / "t"
+    if existing:
+        target.mkdir()
+    written: list[str] = []
+
+    def interrupted(self: zipfile.ZipFile, path: Any = None, *args: Any, **kwargs: Any) -> None:
+        for info in self.infolist()[:2]:
+            written.append(self.extract(info, path))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(zipfile.ZipFile, "extractall", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        extract_runner(zip_path, target)
+    assert len(written) == 2  # files were on disk when Ctrl+C arrived
+    if existing:
+        assert target.is_dir() and list(target.iterdir()) == []
+    else:
+        assert not target.exists()
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["new-dir", "empty-dir"])
+def test_extract_runner_hardens_target_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    zip_path = make_zip(tmp_path / "runner.zip", RUNNER_MEMBERS)
+    target = tmp_path / "runners" / "t"
+    if existing:
+        target.mkdir(parents=True)
+    seen: list[tuple[Path, bool, list[Path]]] = []
+
+    def spy(path: Path, **kwargs: Any) -> bool:
+        seen.append((path, path.is_dir(), list(path.iterdir())))
+        return True
+
+    monkeypatch.setattr(installer, "harden_runner_dir", spy)
+    extract_runner(zip_path, target)
+    assert seen == [(target, True, [])]
+    assert (target / "run.cmd").is_file()
+
+
+def test_extract_runner_continues_when_hardening_fails(
+    tmp_path: Path, fake_windows: None, logged_warnings: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    zip_path = make_zip(tmp_path / "runner.zip", RUNNER_MEMBERS)
+    target = tmp_path / "t"
+    run = ScriptedRun((0, WHOAMI_OUT), (5, b"Access is denied.\r\n"))
+    monkeypatch.setattr(
+        installer, "harden_runner_dir", functools.partial(installer.harden_runner_dir, run=run)
+    )
+    extract_runner(zip_path, target)
+    for name, data in RUNNER_MEMBERS.items():
+        assert (target / name).read_bytes() == data
+    assert len(run.calls) == 2
+    assert any("Access is denied." in w for w in logged_warnings)
+
+
+# --- harden_runner_dir (fake whoami / icacls; real ones in the Windows section) ----------------
+
+WHOAMI_OUT = b'"desktop-box\\alice","S-1-5-21-1111-2222-3333-1001"\r\n'
+USER_SID = "S-1-5-21-1111-2222-3333-1001"
+FAKE_SYSTEM_ROOT = "C:\\Windows"
+
+
+class ScriptedRun:
+    """Stands in for run_command: one scripted (returncode, stdout) or exception per call."""
+
+    def __init__(self, *results: tuple[int, bytes] | BaseException) -> None:
+        self.results = list(results)
+        self.calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def __call__(self, args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        self.calls.append((args, kwargs))
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        returncode, stdout = result
+        return subprocess.CompletedProcess(args, returncode, stdout, None)
+
+
+@pytest.fixture
+def fake_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(winproc, "IS_WINDOWS", True)
+    monkeypatch.setenv("SYSTEMROOT", FAKE_SYSTEM_ROOT)
+
+
+@pytest.fixture
+def logged_warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    seen: list[str] = []
+    monkeypatch.setattr(
+        installer.log, "warning", lambda msg, *args, **kwargs: seen.append(msg % args)
+    )
+    return seen
+
+
+def _system32(name: str) -> str:
+    return os.path.join(FAKE_SYSTEM_ROOT, "System32", name)
+
+
+def test_harden_runner_dir_grants_only_user_system_and_admins(
+    tmp_path: Path, fake_windows: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNNERDECK_PAT", "ghp_" + "x" * 36)
+    run = ScriptedRun((0, WHOAMI_OUT), (0, b""), (0, b""))
+    assert installer.harden_runner_dir(tmp_path, run=run) is True
+    assert [args for args, _ in run.calls] == [
+        [_system32("whoami.exe"), "/user", "/fo", "csv", "/nh"],
+        [_system32("icacls.exe"), str(tmp_path), "/reset", "/q"],
+        [
+            _system32("icacls.exe"), str(tmp_path), "/inheritance:r", "/grant:r",
+            f"*{USER_SID}:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/q",
+        ],
+    ]  # fmt: skip
+    for _, kwargs in run.calls:
+        assert kwargs["stdin"] == subprocess.DEVNULL
+        assert kwargs["stdout"] == subprocess.PIPE
+        assert kwargs["creationflags"] == winproc.CREATE_NO_WINDOW
+        assert 0 < kwargs["timeout"] <= 60
+        assert "RUNNERDECK_PAT" not in kwargs["env"]
+
+
+def test_harden_runner_dir_is_a_noop_off_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(winproc, "IS_WINDOWS", False)
+    run = ScriptedRun()
+    assert installer.harden_runner_dir(tmp_path, run=run) is False
+    assert run.calls == []
+
+
+@pytest.mark.parametrize(
+    ("script", "calls", "logged"),
+    [
+        ((FileNotFoundError(2, "No such file", "whoami.exe"),), 1, "No such file"),
+        (((1, b"ERROR: access denied\r\n"),), 1, "ERROR: access denied"),
+        (((0, b"INFO: no output\r\n"),), 1, "no SID"),
+        (((0, WHOAMI_OUT), (5, b"Access is denied.\r\n")), 2, "Access is denied."),
+        (((0, WHOAMI_OUT), (0, b""), (1332, b"No mapping\r\n")), 3, "No mapping"),
+        (((0, WHOAMI_OUT), (0, b""), subprocess.TimeoutExpired(["icacls"], 30)), 3, "timed out"),
+    ],
+    ids=["whoami-missing", "whoami-fails", "whoami-no-sid", "reset-fails", "grant-fails", "hang"],
+)
+def test_harden_runner_dir_failure_only_warns(
+    tmp_path: Path, fake_windows: None, logged_warnings: list[str],
+    script: tuple[Any, ...], calls: int, logged: str,
+) -> None:  # fmt: skip
+    run = ScriptedRun(*script)
+    assert installer.harden_runner_dir(tmp_path, run=run) is False
+    assert len(run.calls) == calls
+    assert len(logged_warnings) == 1
+    assert "not restricting runner dir ACL" in logged_warnings[0]
+    assert logged in logged_warnings[0]
 
 
 # --- write_env_file ----------------------------------------------------------------------------
@@ -1007,6 +1253,127 @@ def test_configure_real_cmd_exe_timeout_kills_grandchild(tmp_path: Path) -> None
     with pytest.raises(InstallError, match="超时"):
         configure(d, url=URL, token=fake_token(), name="box", labels=[], timeout=3)
     assert time.monotonic() - started < 30
+
+
+def _write_fake_runner(d: Path, config_cmd: str) -> None:
+    d.mkdir()
+    _write_batch(d / "config.cmd", config_cmd)
+    _write_batch(d / "run.cmd", "@echo off\n")
+    (d / "marker.txt").write_text("x")
+
+
+def _real_system32(name: str) -> str:
+    return os.path.join(os.environ["SYSTEMROOT"], "System32", name)
+
+
+@windows_only
+def test_config_commands_use_absolute_system32_cmd_exe() -> None:
+    token = fake_token()
+    expected = os.path.normcase(_real_system32("cmd.exe"))
+    for args in (
+        build_config_command(url=URL, token=token, name="box", labels=[]),
+        build_remove_command(token=token),
+    ):
+        assert os.path.isabs(args[0]) and os.path.isfile(args[0])
+        assert os.path.normcase(args[0]) == expected
+
+
+@windows_only
+def test_configure_ignores_cmd_exe_planted_in_current_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # CreateProcess searches our current directory before System32 for a bare "cmd.exe".
+    planted = tmp_path / "downloads"
+    planted.mkdir()
+    shutil.copyfile(_real_system32("whoami.exe"), planted / "cmd.exe")
+    monkeypatch.chdir(planted)
+    d = tmp_path / "runner"
+    _write_fake_runner(d, FAKE_CONFIG_CMD)
+    result = configure(d, url=URL, token=fake_token(), name="box", labels=[], timeout=60)
+    assert "Runner successfully added" in result.output
+
+
+@windows_only
+def test_configure_real_cmd_exe_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNNERDECK_PAT", "ghp_" + "z" * 36)
+    monkeypatch.setenv("HTTPS_PROXY", "http://stale:1")
+    d = tmp_path / "runner"
+    script = (
+        "@echo off\n"
+        "echo proxy=[%https_proxy%]\n"
+        "if defined RUNNERDECK_PAT echo PAT LEAKED\n"
+        "echo Runner successfully added\n"
+        "echo Settings Saved.\n"
+    )
+    _write_fake_runner(d, script)
+    result = configure(
+        d, url=URL, token=fake_token(), name="box", labels=[], timeout=60,
+        env={"https_proxy": PROXY},
+    )  # fmt: skip
+    assert f"proxy=[{PROXY}]" in result.output
+    assert "PAT LEAKED" not in result.output
+
+
+def _icacls_aces(path: Path) -> list[str]:
+    """ACE strings `icacls <path>` prints, e.g. "NT AUTHORITY\\SYSTEM:(I)(OI)(CI)(F)"."""
+    out = subprocess.run(
+        [_real_system32("icacls.exe"), str(path)], capture_output=True, check=True
+    ).stdout.decode(winproc.console_codepage_codec(), errors="replace")
+    aces: list[str] = []
+    for i, line in enumerate(out.splitlines()):
+        if not line.strip():
+            break  # blank line before "Successfully processed 1 files; ..."
+        if i == 0:
+            assert line.startswith(str(path)), out
+            line = line[len(str(path)) :]
+        aces.append(line.strip())
+    assert aces, out
+    return aces
+
+
+def _is_users_ace(ace: str) -> bool:
+    return "Authenticated Users" in ace or ace.startswith(("BUILTIN\\Users:", "Everyone:"))
+
+
+@windows_only
+def test_extract_runner_restricts_acl_windows(tmp_path: Path) -> None:
+    # Like the C:\\ root: Authenticated Users get Modify on everything created below.
+    drive_root = tmp_path / "drive_root"
+    drive_root.mkdir()
+    subprocess.run(
+        [_real_system32("icacls.exe"), str(drive_root), "/grant", "*S-1-5-11:(OI)(CI)M"],
+        capture_output=True,
+        check=True,
+    )
+    assert any(_is_users_ace(a) for a in _icacls_aces(drive_root))
+    zip_path = make_zip(tmp_path / "runner.zip", RUNNER_MEMBERS)
+    target = drive_root / "runners" / "sandbox"
+    extract_runner(zip_path, target)
+
+    aces = _icacls_aces(target)
+    assert not [a for a in aces if "(I)" in a], aces  # inheritance from above is cut
+    assert not [a for a in aces if _is_users_ace(a)], aces
+    assert 1 <= len(aces) <= 3 and all(a.endswith(":(OI)(CI)(F)") for a in aces), aces
+    assert any(os.environ["USERNAME"].casefold() in a.casefold() for a in aces), aces
+    for name in ("run.cmd", "bin/Runner.Listener.exe"):
+        file_aces = _icacls_aces(target / name)
+        assert not [a for a in file_aces if _is_users_ace(a)], file_aces
+        assert all(a.endswith("(I)(F)") for a in file_aces), file_aces
+
+    for name, data in RUNNER_MEMBERS.items():
+        assert (target / name).read_bytes() == data
+    remove_runner_dir(target)
+    assert not target.exists()
+
+
+@windows_only
+def test_harden_runner_dir_real_failure_is_a_warning_windows(
+    tmp_path: Path, logged_warnings: list[str]
+) -> None:
+    assert installer.harden_runner_dir(tmp_path / "missing") is False
+    assert len(logged_warnings) == 1 and "icacls" in logged_warnings[0]
 
 
 @windows_only

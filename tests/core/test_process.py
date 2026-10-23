@@ -25,6 +25,7 @@ from runnerdeck.core.errors import ProcessError
 from runnerdeck.core.models import LocalState
 from runnerdeck.core.process import (
     EventKind,
+    ExternalStop,
     OutputStateMachine,
     RunnerEvent,
     RunnerProcess,
@@ -58,6 +59,10 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> None:
 
 # --- parse_line ------------------------------------------------------------------------------
 
+SESSION_CONFLICT_LINE = (
+    '"Runner listener exit with Session Conflict error, stop the service, no retry needed."'
+)
+
 
 @pytest.mark.parametrize(
     ("line", "expected"),
@@ -86,6 +91,27 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> None:
         ),
         ('"Exiting after unknown error code: 15"', RunnerEvent(EventKind.EXITED, "15")),
         ("Exiting after unknown error code: -1", RunnerEvent(EventKind.EXITED, "-1")),
+        # run-helper.cmd.template lines without a number: mapped to the code they stand for
+        (
+            '"Runner listener exit with terminated error, stop the service, no retry needed."',
+            RunnerEvent(EventKind.EXITED, "1"),
+        ),
+        (
+            '"Runner listener exit with retryable error, re-launch runner in 5 seconds."',
+            RunnerEvent(EventKind.EXITED, "2"),
+        ),
+        (
+            '"Runner listener exit because of updating, re-launch runner in 5 seconds"',
+            RunnerEvent(EventKind.EXITED, "3"),
+        ),
+        (
+            '"Runner listener exit because of updating, re-launch ephemeral runner in 5 seconds"',
+            RunnerEvent(EventKind.EXITED, "4"),
+        ),
+        (
+            SESSION_CONFLICT_LINE,
+            RunnerEvent(EventKind.EXITED, "5"),
+        ),
     ],
 )
 def test_parse_line_recognises_spike_patterns(line: str, expected: RunnerEvent) -> None:
@@ -100,6 +126,7 @@ def test_parse_line_recognises_spike_patterns(line: str, expected: RunnerEvent) 
         "终止批处理操作吗(Y/N)? ",
         "2026-10-22 08:16:53Z: Runner connect error: Error: Conflict. Retrying until reconnected.",
         '"Exiting runner..."',
+        '"Restarting runner..."',
         "Exiting after a while",
         "  Exiting...",  # anchored: only the listener's own line counts
         "Connected to GitHub, now doing something else",
@@ -308,6 +335,7 @@ class FakeWin:
         )  # None: Ctrl+Break is ignored
         self.ctrl_break_error: ProcessError | None = None
         self.kill_works = True
+        self.unkillable: set[int] = set()  # runner_procs pids that kill_processes cannot end
         self.runner_procs: list[Any] = []
         self.calls: list[tuple[str, Any]] = []
 
@@ -322,20 +350,25 @@ class FakeWin:
             proc = self._proc(pid)
             threading.Timer(0.02, proc.finish, args=(0, self.ctrl_break_tail)).start()
 
-    def kill_tree(self, pid: int, *, timeout: float = 5.0) -> list[int]:
+    def kill_tree_report(self, pid: int, *, timeout: float = 5.0) -> tuple[list[int], list[int]]:
         self.calls.append(("kill_tree", pid))
         proc = next((p for p in self.popen.procs if p.pid == pid), None)
         if proc is None:  # not one of ours (stop_external tests)
-            return [pid]
+            return [pid], []
         if not self.kill_works:
-            return [pid]
+            return [], [pid]
         proc.finish(1)
-        return [pid + 1, pid]
+        return [pid + 1, pid], []
 
-    def kill_processes(self, procs: list[Any], *, timeout: float = 5.0) -> list[int]:
+    def kill_processes_report(
+        self, procs: list[Any], *, timeout: float = 5.0
+    ) -> tuple[list[int], list[int]]:
         self.calls.append(("kill_processes", [p.pid for p in procs]))
-        self.runner_procs = [p for p in self.runner_procs if p not in procs]
-        return [p.pid for p in procs]
+        gone = [p for p in procs if p.pid not in self.unkillable]
+        for p in gone:
+            p.alive = False
+        self.runner_procs = [p for p in self.runner_procs if p not in gone]
+        return [p.pid for p in gone], [p.pid for p in procs if p not in gone]
 
     def find_runner_processes(self, runner_dir: Path) -> list[Any]:
         self.calls.append(("find", runner_dir))
@@ -407,8 +440,8 @@ def win(monkeypatch: pytest.MonkeyPatch, popen: FakePopen) -> FakeWin:
     for name in (
         "has_console",
         "send_ctrl_break",
-        "kill_tree",
-        "kill_processes",
+        "kill_tree_report",
+        "kill_processes_report",
         "find_runner_processes",
     ):
         monkeypatch.setattr(winproc, name, getattr(fake, name))
@@ -423,6 +456,12 @@ def rec() -> Recorder:
 
 def make(runner_dir: Path, popen: FakePopen, rec: Recorder, **kw: Any) -> RunnerProcess:
     return RunnerProcess(runner_dir, popen=popen, **rec.callbacks(), **kw)
+
+
+IDLE_OUTPUT = (
+    b"\r\n\xe2\x88\x9a Connected to GitHub\r\n\r\nCurrent runner version: '2.338.0'\r\n"
+    b"2026-10-22 08:09:45Z: Listening for Jobs\r\n"
+)
 
 
 class FakePsProc:
@@ -442,6 +481,7 @@ class FakePsProc:
         self._cmdline = cmdline or [name]
         self._parent = parent
         self._deny = deny
+        self.alive = True
 
     def name(self) -> str:
         return self._name
@@ -457,6 +497,9 @@ class FakePsProc:
     def ppid(self) -> int:
         return self._parent.pid if self._parent else 0
 
+    def is_running(self) -> bool:
+        return self.alive
+
 
 # --- RunnerProcess: replaying captured output -------------------------------------------------
 
@@ -468,7 +511,7 @@ def test_start_launches_run_cmd_with_required_flags(
     proc.start()
     try:
         fake = popen.last
-        assert fake.args == ["cmd.exe", "/c", "run.cmd"]
+        assert fake.args == [winproc.cmd_exe(), "/c", "run.cmd"]
         kw = fake.kwargs
         assert kw["cwd"] == str(runner_dir)
         assert kw["stdin"] is subprocess.DEVNULL
@@ -487,23 +530,77 @@ def test_start_launches_run_cmd_with_required_flags(
         proc.stop()
 
 
-def test_env_none_inherits_environment(
-    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
+def test_start_uses_absolute_cmd_exe_on_windows(
+    runner_dir: Path,
+    popen: FakePopen,
+    win: FakeWin,
+    rec: Recorder,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A bare "cmd.exe" is looked up in the cwd (the runner dir) and PATH first.
+    monkeypatch.setattr(winproc, "IS_WINDOWS", True)
+    monkeypatch.setenv("SYSTEMROOT", "C:\\Windows")
     popen.exit_code = 0
     proc = make(runner_dir, popen, rec)
     proc.start()
     proc.wait(5)
-    assert popen.last.kwargs["env"] is None
+    assert popen.last.args == [os.path.join("C:\\Windows", "System32", "cmd.exe"), "/c", "run.cmd"]
 
 
-def test_env_merge_is_case_insensitive_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+SECRETS = {
+    "RUNNERDECK_PAT": "github_pat_" + "A" * 30,
+    "RUNNERDECK_TEST_PAT": "github_pat_" + "B" * 30,
+    "GH_TOKEN": "ghp_" + "C" * 36,
+    "GITHUB_TOKEN": "ghp_" + "D" * 36,
+}
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [None, {"https_proxy": "http://127.0.0.1:7890", "http_proxy": "http://127.0.0.1:7890"}],
+)
+def test_child_environment_never_carries_the_pat(
+    runner_dir: Path,
+    popen: FakePopen,
+    win: FakeWin,
+    rec: Recorder,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, str] | None,
+) -> None:
+    # Workflow jobs inherit run.cmd's environment: a PAT there ends up in job logs.
+    for key, value in SECRETS.items():
+        monkeypatch.setenv(key, value)
+    popen.exit_code = 0
+    proc = make(runner_dir, popen, rec, env=overrides)
+    proc.start()
+    proc.wait(5)
+    env = popen.last.kwargs["env"]
+    assert isinstance(env, dict)  # never None: that would inherit everything
+    assert env["PATH"] == os.environ["PATH"]
+    assert not set(SECRETS) & set(env)
+    assert not set(SECRETS.values()) & set(env.values())
+    for key, value in (overrides or {}).items():
+        assert env[key] == value
+
+
+def test_child_environment_is_case_insensitive_on_windows(
+    runner_dir: Path,
+    popen: FakePopen,
+    win: FakeWin,
+    rec: Recorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(winproc, "IS_WINDOWS", True)
-    monkeypatch.setenv("RUNNERDECK_CASE_TEST", "old")
-    merged = process_mod._merge_env({"runnerdeck_case_test": "new"})
-    assert merged is not None
-    assert merged["runnerdeck_case_test"] == "new"
-    assert "RUNNERDECK_CASE_TEST" not in merged
+    monkeypatch.setenv("runnerdeck_pat", SECRETS["RUNNERDECK_PAT"])
+    monkeypatch.setenv("HTTPS_PROXY", "http://old:1")
+    popen.exit_code = 0
+    proc = make(runner_dir, popen, rec, env={"https_proxy": "http://127.0.0.1:7890"})
+    proc.start()
+    proc.wait(5)
+    env = popen.last.kwargs["env"]
+    assert "runnerdeck_pat" not in env
+    assert env["https_proxy"] == "http://127.0.0.1:7890"
+    assert "HTTPS_PROXY" not in env  # two spellings in one Windows env block is undefined
 
 
 @pytest.mark.parametrize(
@@ -681,20 +778,142 @@ def test_output_lines_are_redacted(
     assert "--token ***" in proc.output()[0]
 
 
-def test_nonzero_exit_is_error_with_last_line(
+def test_listener_crash_is_error_although_run_cmd_exits_0(
     runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
 ) -> None:
+    # Spike §5 kill_listener: the Listener died with 15, run.cmd still returned rc=0.
     popen.data = fixture_bytes("conflict_then_kill_listener.txt")
-    popen.exit_code = 15
+    popen.exit_code = 0
     proc = make(runner_dir, popen, rec)
     proc.start()
-    assert proc.wait(5) == 15
+    assert proc.wait(5) == 0
     assert proc.state == S.ERROR
-    assert proc.exit_code == 15
-    assert proc.last_error is not None
-    assert "15" in proc.last_error
-    assert '"Exiting runner..."' in proc.last_error
+    assert proc.exit_code == 0
+    assert proc.listener_exit_code == 15
+    assert proc.last_error == ('runner 意外退出（Listener 退出码 15）："Exiting runner..."')
     assert rec.states[-1] == (S.ERROR, None)
+
+
+@pytest.mark.parametrize(
+    ("line", "code"),
+    [
+        ('"Runner listener exit with terminated error, stop the service, no retry needed."', 1),
+        (
+            SESSION_CONFLICT_LINE,
+            5,
+        ),
+    ],
+)
+def test_listener_error_exit_lines_are_errors_with_rc_0(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, line: str, code: int
+) -> None:
+    # e.g. the registration was deleted on GitHub: run-helper ends with exit /b 0.
+    popen.data = IDLE_OUTPUT + line.encode() + b'\r\n"Exiting runner..."\r\n'
+    popen.exit_code = 0
+    proc = make(runner_dir, popen, rec)
+    proc.start()
+    assert proc.wait(5) == 0
+    assert proc.state == S.ERROR
+    assert proc.listener_exit_code == code
+    assert proc.last_error is not None
+    assert f"Listener 退出码 {code}" in proc.last_error
+
+
+def test_clean_listener_exit_with_rc_0_is_stopped(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
+) -> None:
+    # Nobody called stop(), e.g. Ctrl+Break from the console the runner shares.
+    popen.data = fixture_bytes("job_then_ctrl_break.txt")
+    popen.exit_code = 0
+    proc = make(runner_dir, popen, rec)
+    proc.start()
+    proc.wait(5)
+    assert proc.listener_exit_code == 0
+    assert proc.state == S.STOPPED
+    assert proc.last_error is None
+
+
+RETRY = b'"Runner listener exit with retryable error, re-launch runner in 5 seconds."\r\n'
+RESTART = b'"Restarting runner..."\r\n'
+CLEAN_EXIT = (
+    b'"Runner listener exit with 0 return code, stop the service, no retry needed."\r\n'
+    b'"Exiting runner..."\r\n'
+)
+
+
+@pytest.mark.parametrize(
+    ("data", "state", "listener"),
+    [
+        # relaunched Listener later exits cleanly: its line replaces the restart code
+        (IDLE_OUTPUT + RETRY + RESTART + IDLE_OUTPUT + CLEAN_EXIT, S.STOPPED, 0),
+        # relaunched Listener later crashes
+        (
+            IDLE_OUTPUT
+            + RETRY
+            + RESTART
+            + IDLE_OUTPUT
+            + b'"Exiting after unknown error code: 15"\r\n"Exiting runner..."\r\n',
+            S.ERROR,
+            15,
+        ),
+        # run.cmd ended right after a restart code, no Listener running any more
+        (IDLE_OUTPUT + RETRY + b'"Exiting runner..."\r\n', S.ERROR, 2),
+    ],
+)
+def test_restart_codes_do_not_end_the_run(
+    runner_dir: Path,
+    popen: FakePopen,
+    win: FakeWin,
+    rec: Recorder,
+    data: bytes,
+    state: LocalState,
+    listener: int,
+) -> None:
+    popen.data = data
+    popen.exit_code = 0
+    proc = make(runner_dir, popen, rec)
+    proc.start()
+    assert proc.wait(5) == 0
+    assert proc.state == state
+    assert proc.listener_exit_code == listener
+    assert (proc.last_error is None) == (state == S.STOPPED)
+
+
+def test_listener_restart_keeps_running(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
+) -> None:
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT + RETRY + RESTART + IDLE_OUTPUT)
+    wait_until(lambda: proc.output()[-1].endswith("Listening for Jobs"))
+    assert proc.is_running()
+    assert proc.state == S.IDLE
+    proc.stop()
+    assert proc.state == S.STOPPED
+
+
+def test_stop_requested_hides_listener_error_code(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
+) -> None:
+    win.console = True
+    win.ctrl_break_tail = b'"Exiting after unknown error code: 15"\r\n"Exiting runner..."\r\n'
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT)
+    result = proc.stop(timeout=5)
+    assert result.graceful
+    assert proc.listener_exit_code == 15
+    assert proc.state == S.STOPPED
+    assert proc.last_error is None
+
+
+def test_cmd_exe_failure_and_listener_code_both_reported(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
+) -> None:
+    popen.data = b'"Exiting after unknown error code: 15"\r\n'
+    popen.exit_code = 1
+    proc = make(runner_dir, popen, rec)
+    proc.start()
+    proc.wait(5)
+    assert proc.last_error == (
+        'runner 意外退出（退出码 1，Listener 退出码 15）："Exiting after unknown error code: 15"'
+    )
 
 
 def test_error_message_for_ntstatus_exit_code_and_no_output(
@@ -710,17 +929,21 @@ def test_error_message_for_ntstatus_exit_code_and_no_output(
 def test_restart_resets_run_state(
     runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
 ) -> None:
+    # cmd.exe itself failing (e.g. killed from Task Manager) is an error too.
+    popen.data = b'"Exiting after unknown error code: 15"\r\n'
     popen.exit_code = 2
     proc = make(runner_dir, popen, rec)
     proc.start()
     proc.wait(5)
     assert proc.state == S.ERROR
+    assert proc.listener_exit_code == 15
     popen.exit_code = None
     popen.data = b"2026-10-22 08:09:45Z: Listening for Jobs\r\n"
     proc.start()
     wait_until(lambda: proc.state == S.IDLE)
     assert proc.last_error is None
     assert proc.exit_code is None
+    assert proc.listener_exit_code is None
     assert proc.stopped_at is None
     proc.stop()
 
@@ -868,12 +1091,6 @@ def started(
     return proc
 
 
-IDLE_OUTPUT = (
-    b"\r\n\xe2\x88\x9a Connected to GitHub\r\n\r\nCurrent runner version: '2.338.0'\r\n"
-    b"2026-10-22 08:09:45Z: Listening for Jobs\r\n"
-)
-
-
 def test_stop_graceful_ctrl_break(
     runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
 ) -> None:
@@ -900,6 +1117,38 @@ def test_stop_graceful_cleans_leftover_runner_processes(
     result = proc.stop(timeout=5)
     assert result.graceful is True
     assert result.killed_pids == [888]
+
+
+def test_kill_noted_during_graceful_wait_is_reported_as_forced(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
+) -> None:
+    # The CLI's 2nd Ctrl+C: stop() is blocked waiting for Ctrl+Break while another thread
+    # calls note_forced_kill() and kills the tree. The exit must not count as graceful.
+    win.console = True
+    win.ctrl_break_tail = None  # Ctrl+Break is ignored, so only the kill ends the wait
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT)
+    wait_until(lambda: proc.state == S.IDLE)
+    pid = popen.last.pid
+
+    def force() -> None:
+        proc.note_forced_kill()
+        win.kill_tree_report(pid)
+
+    threading.Timer(0.1, force).start()
+    result = proc.stop(timeout=10)
+    assert result.graceful is False
+    assert result.method == StopMethod.KILL
+    assert proc.last_stop_forced
+    assert proc.state == S.STOPPED
+    assert proc.stop() == result  # the recorded stop is the forced one
+
+
+def test_note_forced_kill_when_not_running_is_a_noop(
+    runner_dir: Path, popen: FakePopen, rec: Recorder
+) -> None:
+    proc = make(runner_dir, popen, rec)
+    proc.note_forced_kill()
+    assert not proc.last_stop_forced
 
 
 def test_stop_graceful_timeout_falls_back_to_kill(
@@ -960,14 +1209,14 @@ def test_stop_survives_kill_helper_errors(
     proc = started(runner_dir, popen, rec)
     fake = popen.last
 
-    def kill_tree_fails(pid: int, *, timeout: float = 5.0) -> list[int]:
+    def kill_tree_fails(pid: int, *, timeout: float = 5.0) -> tuple[list[int], list[int]]:
         fake.finish(1)  # the process still dies (e.g. killed by someone else)
         raise psutil.AccessDenied(pid)
 
     def scan_fails(runner_dir: Path) -> list[Any]:
         raise psutil.AccessDenied(0)
 
-    monkeypatch.setattr(winproc, "kill_tree", kill_tree_fails)
+    monkeypatch.setattr(winproc, "kill_tree_report", kill_tree_fails)
     monkeypatch.setattr(winproc, "find_runner_processes", scan_fails)
     result = proc.stop()
     assert result.graceful is False
@@ -985,7 +1234,7 @@ def test_stop_raises_if_process_survives_kill(
     monkeypatch.setattr(process_mod, "KILL_WAIT_S", 0.05)
     win.kill_works = False
     proc = started(runner_dir, popen, rec)
-    with pytest.raises(ProcessError, match="无法结束"):
+    with pytest.raises(ProcessError, match=f"无法结束 runner 进程（PID {popen.last.pid}）"):
         proc.stop()
     assert proc.is_running()
     assert proc.state == S.STOPPING
@@ -994,6 +1243,67 @@ def test_stop_raises_if_process_survives_kill(
     win.kill_works = True
     result = proc.stop()
     assert result.graceful is False
+    assert proc.state == S.STOPPED
+
+
+@pytest.mark.parametrize("console", [False, True])
+def test_stop_raises_if_runner_processes_survive(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, console: bool
+) -> None:
+    # run.cmd is gone (killed, or ended by Ctrl+Break) but a Runner.* process cannot be killed.
+    win.console = console
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT)
+    worker = FakePsProc(999, "Runner.Worker.exe")
+    win.runner_procs = [worker]
+    win.unkillable = {999}
+    with pytest.raises(ProcessError, match=r"无法结束 runner 进程（PID 999）"):
+        proc.stop(timeout=5)
+    assert win.called("kill_processes") == [[999]]
+    assert not proc.is_running()  # the run itself is over
+    assert proc.state == S.ERROR
+    assert proc.last_error == "无法结束 runner 进程（PID 999）"
+    assert rec.states[-1] == (S.ERROR, None)
+
+
+def test_stop_reports_survivor_when_kill_wait_is_denied(
+    runner_dir: Path,
+    popen: FakePopen,
+    win: FakeWin,
+    rec: Recorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # psutil's wait raises AccessDenied on Windows for a process we may not open.
+    proc = started(runner_dir, popen, rec)
+    win.runner_procs = [FakePsProc(998, "Runner.Listener.exe")]
+
+    def denied(procs: list[Any], *, timeout: float = 5.0) -> tuple[list[int], list[int]]:
+        raise psutil.AccessDenied(998)
+
+    monkeypatch.setattr(winproc, "kill_processes_report", denied)
+    with pytest.raises(ProcessError, match="998"):
+        proc.stop()
+    assert proc.state == S.ERROR
+
+
+def test_stop_kills_leftovers_that_survived_the_tree_kill(
+    runner_dir: Path,
+    popen: FakePopen,
+    win: FakeWin,
+    rec: Recorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = started(runner_dir, popen, rec)
+    fake = popen.last
+    listener = FakePsProc(997, "Runner.Listener.exe")
+    win.runner_procs = [listener]
+
+    def tree_leaves_listener(pid: int, *, timeout: float = 5.0) -> tuple[list[int], list[int]]:
+        fake.finish(1)
+        return [pid], [997]
+
+    monkeypatch.setattr(winproc, "kill_tree_report", tree_leaves_listener)
+    result = proc.stop()
+    assert result.killed_pids == [fake.pid, 997]
     assert proc.state == S.STOPPED
 
 
@@ -1007,7 +1317,8 @@ def test_stop_when_not_running(runner_dir: Path, popen: FakePopen, win: FakeWin)
 def test_stop_after_unexpected_exit_is_noop(
     runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
 ) -> None:
-    popen.exit_code = 3
+    popen.data = fixture_bytes("conflict_then_kill_listener.txt")
+    popen.exit_code = 0
     proc = make(runner_dir, popen, rec)
     proc.start()
     proc.wait(5)
@@ -1113,11 +1424,11 @@ def test_stop_finalizes_when_pipe_stays_open(
     proc = started(runner_dir, popen, rec, IDLE_OUTPUT)
     fake = popen.last
 
-    def kill_tree_pipe_stays_open(pid: int, *, timeout: float = 5.0) -> list[int]:
+    def kill_tree_pipe_stays_open(pid: int, *, timeout: float = 5.0) -> tuple[list[int], list[int]]:
         fake.finish(1, close_pipe=False)
-        return [pid]
+        return [pid], []
 
-    monkeypatch.setattr(winproc, "kill_tree", kill_tree_pipe_stays_open)
+    monkeypatch.setattr(winproc, "kill_tree_report", kill_tree_pipe_stays_open)
     result = proc.stop()
     assert result.graceful is False
     assert proc.state == S.STOPPED
@@ -1141,12 +1452,14 @@ def test_late_output_from_previous_run_is_dropped(
     proc = started(runner_dir, popen, rec)
     old = popen.last
     monkeypatch.setattr(
-        winproc, "kill_tree", lambda pid, timeout=5.0: (old.finish(1, close_pipe=False), [pid])[1]
+        winproc,
+        "kill_tree_report",
+        lambda pid, timeout=5.0: (old.finish(1, close_pipe=False), ([pid], []))[1],
     )
     proc.stop()
     old_reader = proc._reader
     assert old_reader is not None and old_reader.is_alive()  # still blocked on the open pipe
-    monkeypatch.setattr(winproc, "kill_tree", win.kill_tree)
+    monkeypatch.setattr(winproc, "kill_tree_report", win.kill_tree_report)
     proc.start()
     old.stdout.write(b"stale line from old run\r\n")
     old.stdout.close_writer()
@@ -1221,8 +1534,21 @@ def test_running_processes_delegates(win: FakeWin, runner_dir: Path) -> None:
 
 
 def test_stop_external_nothing_running(win: FakeWin, runner_dir: Path) -> None:
-    assert stop_external(runner_dir) == []
+    result = stop_external(runner_dir)
+    assert result == ExternalStop([], [])
+    assert result.ok
     assert win.called("kill_tree") == []
+
+
+def test_stop_external_scan_failure_is_an_error(
+    win: FakeWin, runner_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def denied(runner_dir: Path) -> list[Any]:
+        raise psutil.AccessDenied(0)
+
+    monkeypatch.setattr(winproc, "find_runner_processes", denied)
+    with pytest.raises(ProcessError, match="无法检查"):
+        stop_external(runner_dir)
 
 
 def _external_tree(
@@ -1251,14 +1577,34 @@ def test_stop_external_kills_launching_cmd_chain(
     win.runner_procs = [listener, worker]
     trees = {101: [102, 103, 104, 101]}
 
-    def kill_tree(pid: int, *, timeout: float = 5.0) -> list[int]:
+    def kill_tree(pid: int, *, timeout: float = 5.0) -> tuple[list[int], list[int]]:
         win.calls.append(("kill_tree", pid))
         win.runner_procs = []
-        return trees[pid]
+        return trees[pid], []
 
-    monkeypatch.setattr(winproc, "kill_tree", kill_tree)
-    assert stop_external(runner_dir) == [102, 103, 104, 101]
+    monkeypatch.setattr(winproc, "kill_tree_report", kill_tree)
+    assert stop_external(runner_dir) == ExternalStop([102, 103, 104, 101], [])
     assert win.called("kill_tree") == [101]  # the worker is covered by the listener's tree
+    assert win.called("kill_processes") == []  # nothing left over
+
+
+def test_stop_external_reports_surviving_cmd_shell(
+    win: FakeWin, runner_dir: Path, no_lineage: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, run, helper, listener, worker = _external_tree(
+        ["cmd.exe", "/c", "run.cmd"], ["cmd.exe", "/c", "run-helper.cmd"]
+    )
+    win.runner_procs = [listener, worker]
+
+    def kill_tree(pid: int, *, timeout: float = 5.0) -> tuple[list[int], list[int]]:
+        win.calls.append(("kill_tree", pid))
+        win.runner_procs = []
+        return [102, 103, 104], [101, 555]  # 555: some job process, not ours to report
+
+    monkeypatch.setattr(winproc, "kill_tree_report", kill_tree)
+    result = stop_external(runner_dir)
+    assert result == ExternalStop([102, 103, 104], [101])
+    assert not result.ok
 
 
 def test_stop_external_does_not_kill_unrelated_shell(
@@ -1320,35 +1666,112 @@ def test_stop_external_never_kills_own_lineage(
     listener = FakePsProc(501, "Runner.Listener.exe", parent=shell)
     win.runner_procs = [listener]
     monkeypatch.setattr(process_mod, "_own_lineage", lambda: {500})
-    stop_external(runner_dir)
+    assert stop_external(runner_dir) == ExternalStop([501], [])
     assert win.called("kill_tree") == []
     assert win.called("kill_processes") == [[501]]
 
 
-def test_stop_external_cleans_leftovers_and_tolerates_errors(
+def test_stop_external_protected_runner_process_is_a_survivor(
+    win: FakeWin, runner_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # e.g. `runnerdeck-cli stop` run by a job on that very runner: never kill our own ancestors,
+    # but do not claim the runner was stopped either.
+    listener = FakePsProc(510, "Runner.Listener.exe")
+    worker = FakePsProc(511, "Runner.Worker.exe", parent=listener)
+    win.runner_procs = [listener, worker]
+    monkeypatch.setattr(process_mod, "_own_lineage", lambda: {510, 511})
+    result = stop_external(runner_dir)
+    assert result == ExternalStop([], [510, 511])
+    assert win.called("kill_tree") == []
+    assert win.called("kill_processes") == []
+
+
+def _deny_kill_tree(win: FakeWin, monkeypatch: pytest.MonkeyPatch) -> None:
+    def kill_tree_denied(pid: int, *, timeout: float = 5.0) -> tuple[list[int], list[int]]:
+        win.calls.append(("kill_tree", pid))
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(winproc, "kill_tree_report", kill_tree_denied)
+
+
+def test_stop_external_cleans_leftovers_after_tree_kill_error(
     win: FakeWin, runner_dir: Path, no_lineage: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     listener = FakePsProc(601, "Runner.Listener.exe")
     win.runner_procs = [listener]
-
-    def kill_tree_denied(pid: int, *, timeout: float = 5.0) -> list[int]:
-        win.calls.append(("kill_tree", pid))
-        raise psutil.AccessDenied(pid)
-
-    monkeypatch.setattr(winproc, "kill_tree", kill_tree_denied)
-    assert stop_external(runner_dir) == [601]
+    _deny_kill_tree(win, monkeypatch)
+    assert stop_external(runner_dir) == ExternalStop([601], [])
     assert win.called("kill_processes") == [[601]]
 
+
+def test_stop_external_reports_survivors_when_every_kill_is_denied(
+    win: FakeWin, runner_dir: Path, no_lineage: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # e.g. the runner was started from an elevated terminal: it is still online.
+    listener = FakePsProc(601, "Runner.Listener.exe")
+    win.runner_procs = [listener]
+    win.unkillable = {601}
+    _deny_kill_tree(win, monkeypatch)
+    result = stop_external(runner_dir)
+    assert result == ExternalStop([], [601])
+    assert not result.ok
+
+
+def test_stop_external_partial_kill_reports_the_rest(
+    win: FakeWin, runner_dir: Path, no_lineage: None
+) -> None:
+    a = FakePsProc(611, "Runner.Listener.exe")
+    b = FakePsProc(612, "Runner.Listener.exe")
+    win.runner_procs = [a, b]
+    win.unkillable = {612}
+    # kill_tree of a pid that is not one of FakePopen's "works" but the rescan still sees both
+    result = stop_external(runner_dir)
+    assert result.survivors == [612]
+    assert 611 in result.killed
+    assert 612 not in result.killed
+
+
+def test_stop_external_wait_denied_is_a_survivor(
+    win: FakeWin, runner_dir: Path, no_lineage: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # On Windows psutil's wait raises AccessDenied for a process we may not open.
+    listener = FakePsProc(621, "Runner.Listener.exe")
+    win.runner_procs = [listener]
+    _deny_kill_tree(win, monkeypatch)
+
+    def wait_denied(procs: list[Any], *, timeout: float = 5.0) -> tuple[list[int], list[int]]:
+        raise psutil.AccessDenied(621)
+
+    monkeypatch.setattr(winproc, "kill_processes_report", wait_denied)
+    assert stop_external(runner_dir) == ExternalStop([], [621])
+
+
+def test_stop_external_rescan_failure_checks_the_first_scan(
+    win: FakeWin, runner_dir: Path, no_lineage: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listener = FakePsProc(631, "Runner.Listener.exe")
+    gone = FakePsProc(632, "Runner.Listener.exe")
     calls = {"n": 0}
 
     def scan_then_fail(runner_dir: Path) -> list[Any]:
         calls["n"] += 1
         if calls["n"] > 1:
             raise psutil.AccessDenied(0)
-        return [listener]
+        return [listener, gone]
+
+    def kill_tree(pid: int, *, timeout: float = 5.0) -> tuple[list[int], list[int]]:
+        win.calls.append(("kill_tree", pid))
+        if pid == 632:
+            gone.alive = False
+            return [632], []
+        return [], [631]
 
     monkeypatch.setattr(winproc, "find_runner_processes", scan_then_fail)
-    assert stop_external(runner_dir) == []
+    monkeypatch.setattr(winproc, "kill_tree_report", kill_tree)
+    win.unkillable = {631}
+    # cannot rescan: what survives is judged from the processes found the first time
+    assert stop_external(runner_dir) == ExternalStop([632], [631])
+    assert win.called("kill_processes") == [[631]]
 
 
 def test_own_lineage_contains_this_process() -> None:
@@ -1440,22 +1863,62 @@ def test_windows_graceful_ctrl_break(tmp_path: Path, real_processes: Any) -> Non
     result = proc.stop(timeout=15)
     assert result.graceful is True
     assert result.method == StopMethod.CTRL_BREAK
+    assert result.exit_code == 0
     assert proc.state == S.STOPPED
-    assert "Exiting..." in proc.output()
+    out = proc.output()
+    assert "Exiting..." in out
+    assert '"Runner listener exit with 0 return code, stop the service, no retry needed."' in out
+    assert out[-1] == '"Exiting runner..."'
+    assert proc.listener_exit_code == 0
     wait_until(lambda: not psutil.pid_exists(child), 10)
 
 
 @windows_only
 def test_windows_unexpected_exit_is_error(tmp_path: Path, real_processes: Any) -> None:
+    # Like the real run.cmd, the fake one returns 0 after the Listener died with 15 (spike §5).
     runner_dir, _ = make_fake_runner_dir(tmp_path, "crash")
     proc = RunnerProcess(runner_dir)
     real_processes.append(proc)
     proc.start()
-    assert proc.wait(30) == 3
+    assert proc.wait(30) == 0
     assert proc.state == S.ERROR
-    assert proc.last_error is not None
-    assert "3" in proc.last_error
+    assert proc.listener_exit_code == 15
+    assert proc.last_error == 'runner 意外退出（Listener 退出码 15）："Exiting runner..."'
+    assert proc.output()[-2:] == ['"Exiting after unknown error code: 15"', '"Exiting runner..."']
     assert proc.stop().exit_code is None  # nothing left to stop
+
+
+@windows_only
+def test_windows_terminated_error_is_error(tmp_path: Path, real_processes: Any) -> None:
+    # Listener code 1, e.g. its registration was deleted on GitHub.
+    runner_dir, _ = make_fake_runner_dir(tmp_path, "terminated")
+    proc = RunnerProcess(runner_dir)
+    real_processes.append(proc)
+    proc.start()
+    assert proc.wait(30) == 0
+    assert proc.state == S.ERROR
+    assert proc.listener_exit_code == 1
+    assert proc.last_error is not None
+    assert "Listener 退出码 1" in proc.last_error
+
+
+@windows_only
+def test_windows_retryable_exit_relaunches_listener(tmp_path: Path, real_processes: Any) -> None:
+    runner_dir, pid_file = make_fake_runner_dir(tmp_path, "retry")
+    proc = RunnerProcess(runner_dir)
+    real_processes.append(proc)
+    proc.start()
+    wait_until(lambda: '"Restarting runner..."' in proc.output(), 30)
+    wait_until(lambda: proc.output()[-1].endswith("Listening for Jobs"), 30)
+    assert proc.is_running()
+    assert proc.state == S.IDLE
+    child = listener_pid(pid_file)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(winproc, "has_console", lambda: False)
+        proc.stop()
+    assert proc.state == S.STOPPED
+    assert proc.last_error is None
+    wait_until(lambda: not psutil.pid_exists(child), 10)
 
 
 @windows_only

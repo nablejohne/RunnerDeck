@@ -1,5 +1,50 @@
 @echo off
-rem Fake run.cmd for tests/core/test_process.py. The test fills in the @...@ placeholders
-rem and writes the result as run.cmd into a temporary runner directory.
+rem Fake run.cmd for tests/core/test_process.py and test_cli.py. The tests fill in the @...@
+rem placeholders and write the result as run.cmd into a temporary runner directory.
+rem
+rem Mirrors the real run.cmd + run-helper.cmd.template pair (actions/runner
+rem src/Misc/layoutroot) without their 5 s pauses; the helper is a subroutine here so the
+rem file stays self-contained. The helper turns the Listener's exit code into one echoed
+rem line and returns 1 ("relaunch") for codes 2/3/4, else 0. run.cmd relaunches on 1 and
+rem otherwise always ends with exit /b 0: cmd.exe's exit code never carries the Listener's
+rem (spike-notes section 5, kill_listener: Listener code 15, rc=0).
+
+:launch_helper
+call :run_helper
+if errorlevel 1 goto restart
+echo "Exiting runner..."
+exit /b 0
+
+:restart
+echo "Restarting runner..."
+goto launch_helper
+
+:run_helper
 "@PYTHON@" "@LISTENER@" @MODE@ "@PIDFILE@"
-exit /b %ERRORLEVEL%
+set LISTENER_RC=%ERRORLEVEL%
+if "%LISTENER_RC%"=="0" (
+  echo "Runner listener exit with 0 return code, stop the service, no retry needed."
+  exit /b 0
+)
+if "%LISTENER_RC%"=="1" (
+  echo "Runner listener exit with terminated error, stop the service, no retry needed."
+  exit /b 0
+)
+if "%LISTENER_RC%"=="2" (
+  echo "Runner listener exit with retryable error, re-launch runner in 5 seconds."
+  exit /b 1
+)
+if "%LISTENER_RC%"=="3" (
+  echo "Runner listener exit because of updating, re-launch runner in 5 seconds"
+  exit /b 1
+)
+if "%LISTENER_RC%"=="4" (
+  echo "Runner listener exit because of updating, re-launch ephemeral runner in 5 seconds"
+  exit /b 1
+)
+if "%LISTENER_RC%"=="5" (
+  echo "Runner listener exit with Session Conflict error, stop the service, no retry needed."
+  exit /b 0
+)
+echo "Exiting after unknown error code: %LISTENER_RC%"
+exit /b 0

@@ -10,6 +10,11 @@ Grounded in docs/spike-notes.md:
 - §5: a hard kill leaves the GitHub session alive for minutes; status merging lives in status.py.
 Registration and remove tokens live about an hour: they are fetched right before config.cmd
 runs and never cached.
+
+GitHub answers 404 both for "this runner is gone" and for "this PAT cannot see the repo". A 404
+from get_runner / delete_runner / the remove token is only read as "gone" after list_runners on
+the same repo succeeded (_confirm_repo_access); otherwise the flow stops with NotFoundError and
+deletes nothing, because the directory may hold a still-valid registration.
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from runnerdeck.core import installer, process, release, runner_file
 from runnerdeck.core.errors import (
     InstallError,
     InvalidInputError,
+    NotFoundError,
     ProcessError,
     RunnerDeckError,
     RunnerFileError,
@@ -102,7 +108,9 @@ class RemoteRemoval(StrEnum):
 
     UNCONFIGURED = "unconfigured"  # `config.cmd remove` succeeded
     API_DELETED = "api_deleted"  # DELETE /actions/runners/{id} -> 204
-    ALREADY_GONE = "already_gone"  # 404, or no runner with that name in the repo's list
+    # 404, or no runner with that name; only after list_runners proved the repo is visible
+    ALREADY_GONE = "already_gone"
+    SKIPPED = "skipped"  # remove_runner(local_only=True): GitHub was not touched
 
 
 class RollbackError(RunnerDeckError):
@@ -260,13 +268,34 @@ def _normalize_version(version: str | None) -> str | None:
 
 
 def _proxy_env(proxy: str | None) -> dict[str, str] | None:
-    """Environment for run.cmd so the runner itself reaches GitHub through the proxy."""
+    """Environment overrides for config.cmd and run.cmd, so the runner itself (registration,
+    removal and the listener) reaches GitHub through the proxy. Only the overrides: installer /
+    process build the full child environment from them (winproc.child_environment)."""
     value = (proxy or "").strip()
     if not value:
         return None
     if "://" not in value:
         value = f"http://{value}"
     return {"https_proxy": value, "http_proxy": value}
+
+
+# What the user is told was left alone when repo access could not be confirmed.
+_REMOVE_KEPT = "没有删除任何东西：runner 目录和记录都保留着，换用有权限的 PAT 重新登录后再移除"
+_IMPORT_KEPT = (
+    "无法确认 runner 是否还在 GitHub 上；请不要删除该目录，换用有权限的 PAT 重新登录后再导入"
+)
+
+
+def _no_repo_access(owner: str, repo: str, cause: NotFoundError, kept: str) -> NotFoundError:
+    where = f"{cause.method} {cause.path} -> 404" if cause.method and cause.path else "404"
+    return NotFoundError(
+        f"PAT 无法访问仓库 {owner}/{repo}（{where}）：仓库不存在，或这个 PAT 看不到它。"
+        "fine-grained PAT 需要选中该仓库并授予 Administration: Read and write 权限，"
+        f"classic PAT 需要 repo 权限。{kept}",
+        status=cause.status,
+        method=cause.method,
+        path=cause.path,
+    )
 
 
 def _custom_labels(labels: Sequence[str]) -> list[str]:
@@ -447,12 +476,13 @@ class RunnerManager:
         """
         report = progress or _no_progress
         with self._install_lock:
-            self._check_plan_still_valid(plan)
+            config = self._check_plan_still_valid(plan)
+            child_env = _proxy_env(config.settings.proxy)
             with closing(self._client_factory()) as client:
                 zip_path = self._prepare_package(client, plan, report)
                 report(Step.EXTRACT, f"解压到 {plan.target_dir}")
                 installer.extract_runner(zip_path, plan.target_dir)
-                record = self._register_extracted(client, plan, report)
+                record = self._register_extracted(client, plan, report, child_env)
             try:
                 for pruned in self._cache.prune():
                     log.info("pruned old runner package %s", pruned.name)
@@ -475,9 +505,16 @@ class RunnerManager:
         return zip_path
 
     def _register_extracted(
-        self, client: GitHubClient, plan: AddPlan, report: ProgressFn
+        self,
+        client: GitHubClient,
+        plan: AddPlan,
+        report: ProgressFn,
+        child_env: Mapping[str, str] | None,
     ) -> RunnerRecord:
-        """Everything after a successful extraction; rolls back on any failure."""
+        """Everything after a successful extraction; rolls back on any failure.
+
+        child_env: environment overrides (proxy) for config.cmd, also used by the rollback.
+        """
         runner_dir = plan.target_dir
         registered = False
         agent_id: int | None = None
@@ -496,6 +533,7 @@ class RunnerManager:
                     name=plan.name,
                     labels=plan.labels,
                     run=self._installer_run,
+                    env=child_env,
                 )
             except BaseException as e:
                 registered = _registration_happened(runner_dir, e)
@@ -535,6 +573,7 @@ class RunnerManager:
                 agent_id=agent_id,
                 record_id=record_id,
                 report=report,
+                child_env=child_env,
             )
             if problems and isinstance(e, RunnerDeckError):
                 raise RollbackError(e, problems) from e
@@ -552,6 +591,7 @@ class RunnerManager:
         agent_id: int | None,
         record_id: str | None,
         report: ProgressFn,
+        child_env: Mapping[str, str] | None,
     ) -> list[str]:
         """Undo add_runner after extraction. Returns what could not be undone (Chinese)."""
         log.warning("adding runner for %s failed (%s); rolling back", plan.full_name, error)
@@ -566,7 +606,9 @@ class RunnerManager:
             except Exception as e:
                 problems.append(f"无法确认 runner 记录已删除：{e}")
         if registered:
-            problems.extend(self._unregister_after_failure(client, plan, agent_id, report))
+            problems.extend(
+                self._unregister_after_failure(client, plan, agent_id, report, child_env)
+            )
         _report_safely(report, Step.ROLLBACK, f"回滚：删除目录 {plan.target_dir}")
         try:
             installer.remove_runner_dir(plan.target_dir)
@@ -575,7 +617,12 @@ class RunnerManager:
         return [redact(p) for p in problems]
 
     def _unregister_after_failure(
-        self, client: GitHubClient, plan: AddPlan, agent_id: int | None, report: ProgressFn
+        self,
+        client: GitHubClient,
+        plan: AddPlan,
+        agent_id: int | None,
+        report: ProgressFn,
+        child_env: Mapping[str, str] | None,
     ) -> list[str]:
         runner_dir = plan.target_dir
         if agent_id is None:
@@ -587,7 +634,10 @@ class RunnerManager:
             try:
                 token = client.create_remove_token(plan.owner, plan.repo)
                 installer.unconfigure(
-                    runner_dir, token=token.token.get_secret_value(), run=self._installer_run
+                    runner_dir,
+                    token=token.token.get_secret_value(),
+                    run=self._installer_run,
+                    env=child_env,
                 )
                 log.info("rollback: unregistered %s with config.cmd remove", plan.name)
                 return []
@@ -608,8 +658,11 @@ class RunnerManager:
                     log.info("rollback: no runner named %s on GitHub", plan.name)
                     return []
                 agent_id = remote.id
-            client.delete_runner(plan.owner, plan.repo, agent_id)
-            log.info("rollback: deleted runner %s (id %s) via the API", plan.name, agent_id)
+            if client.delete_runner(plan.owner, plan.repo, agent_id):
+                log.info("rollback: deleted runner %s (id %s) via the API", plan.name, agent_id)
+            else:
+                self._confirm_gone(client, plan.owner, plan.repo, agent_id, kept="")
+                log.info("rollback: runner %s (id %s) already gone", plan.name, agent_id)
             return []
         except Exception as e:
             return [
@@ -617,7 +670,8 @@ class RunnerManager:
                 f"{plan.repo_url}/settings/actions/runners 手动删除（{e}）"
             ]
 
-    def _check_plan_still_valid(self, plan: AddPlan) -> None:
+    def _check_plan_still_valid(self, plan: AddPlan) -> AppConfig:
+        """Re-validate the plan against the current config; returns that config."""
         validate_owner_repo(plan.owner, plan.repo)
         validate_runner_name(plan.name)
         if not plan.target_dir.is_absolute():
@@ -625,6 +679,7 @@ class RunnerManager:
         config = self._store.load()
         self._check_local_conflict(config, plan.owner, plan.repo, plan.name)
         self._check_dir_unused(config, plan.target_dir)
+        return config
 
     @staticmethod
     def _check_local_conflict(config: AppConfig, owner: str, repo: str, name: str) -> None:
@@ -648,18 +703,31 @@ class RunnerManager:
     # --- remove ---------------------------------------------------------------------------------
 
     def remove_runner(
-        self, key: str, *, keep_work: bool = False, progress: ProgressFn | None = None
+        self,
+        key: str,
+        *,
+        keep_work: bool = False,
+        local_only: bool = False,
+        progress: ProgressFn | None = None,
     ) -> RemoveResult:
         """Unregister and delete a runner, then its record.
 
         Refuses (ProcessError) while runner processes live in its directory. Reads `.runner`
         before `config.cmd remove` (which deletes it, spike §3); if remove fails or the
-        directory is gone, falls back to the API DELETE by agentId (or by name), where 404
-        counts as already removed. A GitHub-side failure aborts with nothing deleted locally.
-        A directory that cannot be deleted becomes a warning; the record is deleted last.
+        directory is gone, falls back to the API DELETE by agentId (or by name). A 404 counts
+        as already removed only once list_runners proved the PAT can see the repo; otherwise
+        NotFoundError ("PAT 无法访问仓库"). A GitHub-side failure aborts with nothing deleted
+        locally. A directory that cannot be deleted becomes a warning; the record is deleted
+        last. config.cmd gets the `settings.proxy` environment.
+
+        local_only=True skips GitHub entirely (remote=SKIPPED) and only deletes the directory
+        and the record: the way out when the repo was deleted or the PAT lost access, where
+        every GitHub call answers 404. A registration that still exists is left behind (warned).
         """
         report = progress or _no_progress
-        record = resolve_runner(self._store.load(), key)
+        config = self._store.load()
+        record = resolve_runner(config, key)
+        child_env = _proxy_env(config.settings.proxy)
         runner_dir = Path(record.path)
 
         report(Step.CHECK, f"检查 runner {record.name} 是否在运行")
@@ -690,23 +758,16 @@ class RunnerManager:
             runner_id = file_info.agent_id
 
         remote: RemoteRemoval | None = None
-        with closing(self._client_factory()) as client:
-            if dir_exists and runner_file.is_configured(runner_dir):
-                report(Step.UNCONFIGURE, "注销 runner（config.cmd remove）")
-                try:
-                    token = client.create_remove_token(record.owner, record.repo)
-                    installer.unconfigure(
-                        runner_dir,
-                        token=token.token.get_secret_value(),
-                        run=self._installer_run,
-                    )
-                    remote = RemoteRemoval.UNCONFIGURED
-                except RunnerDeckError as e:
-                    log.warning("config.cmd remove failed for %s: %s", record.name, e)
-                    warnings.append(f"config.cmd remove 失败，已改用 GitHub API 删除：{e}")
-            if remote is None:
-                report(Step.API_DELETE, "通过 GitHub API 删除 runner")
-                remote, runner_id = self._delete_remote(client, record, runner_id)
+        if local_only:
+            remote = RemoteRemoval.SKIPPED
+            warnings.append(
+                "没有在 GitHub 上注销；如果 runner 还在，请到 "
+                f"{record.repo_url}/settings/actions/runners 手动删除"
+            )
+        else:
+            remote, runner_id = self._remove_remote(
+                record, runner_dir, dir_exists, runner_id, child_env, warnings, report
+            )
 
         dir_removed = False
         if os.path.lexists(runner_dir):
@@ -735,18 +796,88 @@ class RunnerManager:
             warnings=tuple(redact(w) for w in warnings),
         )
 
-    @staticmethod
-    def _delete_remote(
-        client: GitHubClient, record: RunnerRecord, runner_id: int | None
+    def _remove_remote(
+        self,
+        record: RunnerRecord,
+        runner_dir: Path,
+        dir_exists: bool,
+        runner_id: int | None,
+        child_env: Mapping[str, str] | None,
+        warnings: list[str],
+        report: ProgressFn,
     ) -> tuple[RemoteRemoval, int | None]:
+        """GitHub half of remove_runner: config.cmd remove, else the API DELETE."""
+        remote: RemoteRemoval | None = None
+        with closing(self._client_factory()) as client:
+            if dir_exists and runner_file.is_configured(runner_dir):
+                report(Step.UNCONFIGURE, "注销 runner（config.cmd remove）")
+                try:
+                    token = client.create_remove_token(record.owner, record.repo)
+                    installer.unconfigure(
+                        runner_dir,
+                        token=token.token.get_secret_value(),
+                        run=self._installer_run,
+                        env=child_env,
+                    )
+                    remote = RemoteRemoval.UNCONFIGURED
+                except RunnerDeckError as e:
+                    if isinstance(e, NotFoundError):
+                        # Usually the PAT cannot see the repo; the API fallback would get the
+                        # same 404 and could not tell it from "already gone". Stop here then.
+                        self._confirm_repo_access(client, record.owner, record.repo, _REMOVE_KEPT)
+                    log.warning("config.cmd remove failed for %s: %s", record.name, e)
+                    warnings.append(f"config.cmd remove 失败，已改用 GitHub API 删除：{e}")
+            if remote is None:
+                report(Step.API_DELETE, "通过 GitHub API 删除 runner")
+                remote, runner_id = self._delete_remote(client, record, runner_id)
+        return remote, runner_id
+
+    @classmethod
+    def _delete_remote(
+        cls, client: GitHubClient, record: RunnerRecord, runner_id: int | None
+    ) -> tuple[RemoteRemoval, int | None]:
+        owner, repo = record.owner, record.repo
         if runner_id is None:
-            match = match_remote(record, client.list_runners(record.owner, record.repo))
+            match = match_remote(
+                record, cls._confirm_repo_access(client, owner, repo, _REMOVE_KEPT)
+            )
             if match is None:
                 return RemoteRemoval.ALREADY_GONE, None
             runner_id = match.id
-        if client.delete_runner(record.owner, record.repo, runner_id):
+        try:
+            deleted = client.delete_runner(owner, repo, runner_id)
+        except NotFoundError as e:
+            raise _no_repo_access(owner, repo, e, _REMOVE_KEPT) from e
+        if deleted:
             return RemoteRemoval.API_DELETED, runner_id
+        cls._confirm_gone(client, owner, repo, runner_id, kept=_REMOVE_KEPT)
         return RemoteRemoval.ALREADY_GONE, runner_id
+
+    @staticmethod
+    def _confirm_repo_access(
+        client: GitHubClient, owner: str, repo: str, kept: str
+    ) -> list[RemoteRunner]:
+        """The repo's runners; a 404 means the PAT cannot see the repo -> NotFoundError.
+
+        GitHub answers 404 for runners that are gone AND for repos the PAT cannot see. A
+        successful list on the same repo is what turns a 404 into "gone". `kept` tells the
+        user what was left alone.
+        """
+        try:
+            return client.list_runners(owner, repo)
+        except NotFoundError as e:
+            raise _no_repo_access(owner, repo, e, kept) from e
+
+    @classmethod
+    def _confirm_gone(
+        cls, client: GitHubClient, owner: str, repo: str, runner_id: int, *, kept: str
+    ) -> None:
+        """After a 404 for runner `runner_id`: raise unless the repo is visible without it."""
+        if any(r.id == runner_id for r in cls._confirm_repo_access(client, owner, repo, kept)):
+            raise RunnerDeckError(
+                f"GitHub 删除 runner（{owner}/{repo}，id {runner_id}）时返回 404，"
+                f"但仓库的 runner 列表里仍有它，请稍后重试。{kept}"
+            )
 
     def _runner_pids(self, runner_dir: Path) -> list[int]:
         try:
@@ -761,9 +892,10 @@ class RunnerManager:
 
         Same path already recorded -> that record (no network). Otherwise reads `.runner`, maps
         `gitHubUrl` to owner/repo and asks GitHub whether the runner still exists (missing ->
-        RunnerDeckError). A recorded runner with the same GitHub id whose directory no longer
-        exists is treated as moved: its path is updated. If its directory still exists, two
-        directories claim one registration -> InvalidInputError.
+        RunnerDeckError, but only once list_runners proved the repo is visible; a repo the PAT
+        cannot see -> NotFoundError). A recorded runner with the same GitHub id whose directory
+        no longer exists is treated as moved: its path is updated. If its directory still
+        exists, two directories claim one registration -> InvalidInputError.
         """
         runner_dir = Path(os.path.abspath(Path(path).expanduser()))
         existing = self._record_for_path(self._store.load(), runner_dir)
@@ -780,7 +912,15 @@ class RunnerManager:
             )
         owner, repo = runner_file.parse_github_url(info.github_url)
         with closing(self._client_factory()) as client:
-            remote = client.get_runner(owner, repo, info.agent_id)
+            try:
+                remote = client.get_runner(owner, repo, info.agent_id)
+            except NotFoundError as e:
+                raise _no_repo_access(owner, repo, e, _IMPORT_KEPT) from e
+            if remote is None:
+                # 404: deleted, or the repo is invisible to this PAT. Never advise deleting a
+                # directory that may hold a live registration before that is ruled out.
+                listed = self._confirm_repo_access(client, owner, repo, _IMPORT_KEPT)
+                remote = next((r for r in listed if r.id == info.agent_id), None)
         if remote is None:
             raise RunnerDeckError(
                 f"GitHub 上已没有 runner “{info.agent_name}”"
@@ -935,7 +1075,9 @@ class RunnerManager:
         """A (not yet started) RunnerProcess for `record`, using the injected popen.
 
         With `settings.proxy` set, run.cmd gets https_proxy / http_proxy so the runner reaches
-        GitHub through it. Callbacks run on background threads (see RunnerProcess).
+        GitHub through it. Only these overrides are passed; RunnerProcess builds the full child
+        environment (without secrets such as RUNNERDECK_PAT) itself. Callbacks run on
+        background threads (see RunnerProcess).
         """
         proxy = self._store.load().settings.proxy
         return RunnerProcess(

@@ -125,7 +125,10 @@ runnerdeck/
 │  │  ├─ process.py         # run.cmd 启停 + 输出解析
 │  │  ├─ runner_file.py     # 解析 .runner
 │  │  ├─ service.py         # Windows 服务模式（M4）
-│  │  └─ cli.py             # 调试用命令行，M1 验收用
+│  │  ├─ errors.py / redact.py / logs.py / winproc.py   # M1 新增：异常、脱敏、日志、Windows 进程工具
+│  │  ├─ status.py          # M1 新增：本地 + 远端状态合并（纯函数）
+│  │  ├─ manager.py         # M1 新增：添加/移除/导入/状态的业务流程与回滚，CLI 和 Controller 共用
+│  │  └─ cli.py             # 调试用命令行（runnerdeck-cli），M1 验收用
 │  ├─ app/                  # Qt 编排层
 │  │  ├─ controller.py      # RunnerController(QObject)：对外的唯一入口
 │  │  ├─ workers.py         # QRunnable + 信号
@@ -399,7 +402,7 @@ Windows 托盘应用：管理多个仓库级 GitHub Actions self-hosted runner�
 ## 常用命令
 - 安装依赖：uv sync
 - 运行：uv run python -m runnerdeck
-- 调试 CLI：uv run python -m runnerdeck.core.cli --help
+- 调试 CLI：uv run runnerdeck-cli --help（或 uv run python -m runnerdeck.core.cli --help）
 - 测试：uv run pytest
 - 检查：uv run ruff check . ; uv run ruff format --check .
 - 打包：./scripts/build.ps1
