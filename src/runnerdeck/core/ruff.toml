@@ -1,0 +1,11 @@
+# Architecture guard: core/ must stay importable without Qt (CLAUDE.md "架构规则").
+extend = "../../../pyproject.toml"
+
+[lint]
+extend-select = ["TID251"]
+
+[lint.flake8-tidy-imports.banned-api]
+"PyQt5".msg = "core/ must not depend on Qt; move this to app/ or ui/"
+"qfluentwidgets".msg = "core/ must not depend on Qt; move this to app/ or ui/"
+"runnerdeck.app".msg = "dependency direction is ui -> app -> core"
+"runnerdeck.ui".msg = "dependency direction is ui -> app -> core"

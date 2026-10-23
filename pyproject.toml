@@ -7,12 +7,16 @@ license = "GPL-3.0-or-later"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "httpx>=0.28",
+    "keyring>=25",
     "psutil>=7.0",
+    "pydantic>=2.9",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.3",
+    "pytest-cov>=6",
+    "respx>=0.22",
     "ruff>=0.14",
 ]
 
