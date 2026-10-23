@@ -4,13 +4,29 @@
 
 ## 路线
 
-- [ ] M0 技术验证 + 工程地基（spike 脚本、stdout 样本、停止方式结论、pyproject/ruff/pytest、ci.yml 首次跑绿）
-- [ ] M1 core 层 + CLI（架构守卫、覆盖率门槛）
+- [x] M0 技术验证 + 工程地基（spike 脚本、stdout 样本、停止方式结论、pyproject/ruff/pytest、ci.yml 首次跑绿）
+- [x] M1 core 层 + CLI（架构守卫、覆盖率门槛）
 - [ ] M2 UI 最小可用 + 打包 + release.yml → v0.1.0
 - [ ] M3 日常可用（托盘、自启、Poller、导入）→ v0.2.0
 - [ ] M4 增强与发布（服务模式、Inno Setup、来源证明）→ v1.0.0
 
-## 当前：M1 已验收（2026-10-23，Windows 真机，通过 SSH）
+## 当前：M2（代码完成，等真机 GUI 验收和发布 v0.1.0）
+
+接口与实现后的修订见 `docs/m2-design.md`（§10 以代码为准）。
+
+- [x] core 地基：`console_helper`（GUI 无控制台时转发 Ctrl+Break）、`account`、`runner_env`（PowerShell 执行策略选项）
+- [x] `app/`：`workers`（QThreadPool 任务）、`controller`（UI 的唯一入口，信号回传）
+- [x] `ui/`：主窗口（FluentWindow）、登录对话框、概览页 + runner 卡片、添加向导、设置页、日志对话框；关窗先优雅停止全部 runner
+- [x] 架构测试：ui 只经 controller 访问 core，app 不 import ui，console_helper 只用标准库
+- [x] 打包：`scripts/build.ps1`（PyInstaller onedir，三个 exe + zip）；`--smoke-test`
+- [x] CI：Windows 离屏 Qt 测试 + `build` job（打包并冒烟三个 exe）；`release.yml`（`v*` tag 发布 zip）
+- [x] 修复：CI / release.yml 读版本号用错 TOML 键（`['project']['version']`），build job 首次因此失败
+- [x] CI（windows-latest，3c30a81）：1837 passed、覆盖率 97.9%；build job 打包并冒烟三个 exe 通过，zip 作为 artifact 上传
+- [ ] XM 真机复跑 `build.ps1` + exe `--smoke-test`（2026-10-23 主机离线，SSH 超时，未跑）
+- [ ] **真机 GUI 验收（用户桌面）**：从零给两个仓库各添加一个 runner、各跑通一次 workflow、界面全程不卡、关窗优雅停止（GitHub 上 runner 很快 offline、无残留进程）
+- [ ] 发布 `v0.1.0`（预发布）：CHANGELOG `[Unreleased]` 改成 `[0.1.0] - 日期`、pyproject 版本、推 tag，Release 页面出现 zip
+
+## M1：已验收（2026-10-23，Windows 真机，通过 SSH）
 
 M0 第 1 轮 spike 已完成；**第 2 轮推迟**（用户决定先做 M1，第 2 轮项目不阻塞 M1，见下方“M0 遗留”）。
 
