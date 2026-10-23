@@ -57,7 +57,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $dist = Join-Path $PWD 'dist\RunnerDeck'
-          $expected = (uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['version'])").Trim()
+          $expected = (uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])").Trim()
           Write-Host "pyproject version: $expected"
 
           foreach ($exe in 'RunnerDeck.exe', 'runnerdeck-helper.exe', 'runnerdeck-cli.exe') {

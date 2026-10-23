@@ -33,7 +33,7 @@ jobs:
         shell: bash
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          PROJECT_VERSION="$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['version'])")"
+          PROJECT_VERSION="$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")"
           echo "tag: $GITHUB_REF_NAME, pyproject: $PROJECT_VERSION"
           if [ "$TAG_VERSION" != "$PROJECT_VERSION" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match pyproject.toml version $PROJECT_VERSION"
