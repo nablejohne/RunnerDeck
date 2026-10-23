@@ -21,7 +21,7 @@ M1 已完成：
 - [x] CI：Windows test job 加 core 覆盖率 ≥ 80% 门槛（实际约 99%）
 - [x] 对抗评审：6 个维度找问题 + 每条独立反驳，确认 16 条（归并为 7 个问题）全部处理，C14 推迟到 M3
 - [x] **M1 验收（Windows 真机）**：`add`（下载 2.338.1 + SHA256 + ACL）→ `start` → workflow 成功 → Ctrl+C 优雅停止 → `status` → `remove`，GitHub 无残留；job 执行中 Ctrl+C 也能优雅停止（job Canceled）；真机 `pytest` 1606 passed，集成测试 6 passed
-- [ ] 桌面会话里手动验证一次 `runnerdeck-cli login` / `whoami` / `logout`（SSH 会话无法访问凭据管理器，见 spike-notes §10）
+- [x] 桌面会话验证 `login`（传统控制台里 Ctrl+V 粘贴）/ `whoami`（来源：系统凭据管理器）/ `logout`（已删除）；SSH 会话无法访问凭据管理器，见 spike-notes §10
 
 验收命令（PowerShell，仓库根目录，先 `git pull` 和 `uv sync`）：
 
@@ -46,6 +46,7 @@ uv run pytest
 ### 2026-10-23 M1 真机验收 + M0 第 2 轮
 
 - 真机发现并修复：runner 在 GitHub 被删除后自己清配置并以 0 退出（改判 ERROR）；job 中停止 15 s 不够导致强杀和僵尸 job（改为 90 s）；DELETE 遇僵尸 job 返回 422（给 force-cancel 提示）；SSH 会话无法用凭据管理器（提示 RUNNERDECK_PAT）；状态文案
+- 用户反馈 login 粘贴失败：传统控制台里 Ctrl+V 只给 getpass 一个 U+0016；新增 `secret_input.read_secret`（Ctrl+V 读剪贴板、支持管道），桌面复测通过
 - 新增真实样本：`deregistered_on_github.txt`、`config_replaced.txt`、`remove_already_gone.txt`、`runner/runner_file.json`、`api/*.json`，`tests/core/test_real_samples.py`
 
 

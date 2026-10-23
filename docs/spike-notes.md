@@ -208,6 +208,6 @@ The runner no longer exists on the server. Cleaning up local configuration.
 
 - **PowerShell 执行策略**：runner 目录 `.env` 写 `PSExecutionPolicyPreference=RemoteSigned` 后，`shell: powershell` 步骤输出 `policy=RemoteSigned`，修复有效，不改系统设置。M2 添加向导里提供这个选项（默认开）。
 - **自更新**：2.337.0 运行 6 分钟、执行过 1 个 job，仍未触发更新；GitHub 不会强制更新只落后一个小版本的 runner，无法按需复现。run-helper 的更新相关输出仍按源码措辞识别，等自然发生时再核对。
-- **凭据管理器**：SSH（密钥登录）会话里 keyring 报 Win32 1312（“指定的登录会话不存在”），桌面会话应正常；CLI 已提示改用 `RUNNERDECK_PAT`。桌面会话下的 `login`/`logout` 待用户手动验证一次。
+- **凭据管理器**：SSH（密钥登录）会话里 keyring 报 Win32 1312（“指定的登录会话不存在”），桌面会话应正常；CLI 已提示改用 `RUNNERDECK_PAT`。桌面会话下 `login` / `whoami` / `logout` 已验证通过（2026-10-23）。传统控制台（powershell.exe 窗口）里 Ctrl+V 对 getpass 只产生 U+0016、不会粘贴，已由 `secret_input` 处理。
 - **关闭终端会结束前台 runner**（控制台关闭事件发给所有进程），算一次强杀；托盘应用不受影响。
 - 目录 ACL：`harden_runner_dir` 生效（只剩 Administrators、SYSTEM、当前用户），runner 注册、运行、移除都正常；`D:\runners` 根目录仍继承 Authenticated Users: 修改（已知缺口）。
