@@ -10,7 +10,7 @@
 - [ ] M3 日常可用（托盘、自启、Poller、导入）→ v0.2.0
 - [ ] M4 增强与发布（服务模式、Inno Setup、来源证明）→ v1.0.0
 
-## 当前：M1（代码完成，等 Windows 实机验收）
+## 当前：M1 已验收（2026-10-23，Windows 真机，通过 SSH）
 
 M0 第 1 轮 spike 已完成；**第 2 轮推迟**（用户决定先做 M1，第 2 轮项目不阻塞 M1，见下方“M0 遗留”）。
 
@@ -20,7 +20,8 @@ M1 已完成：
 - [x] 架构守卫：`core/ruff.toml`（TID251 禁止 Qt/app/ui）+ `tests/core/test_architecture.py`（只有 installer/process 调 cmd.exe，只有 github_client 用 httpx）
 - [x] CI：Windows test job 加 core 覆盖率 ≥ 80% 门槛（实际约 99%）
 - [x] 对抗评审：6 个维度找问题 + 每条独立反驳，确认 16 条（归并为 7 个问题）全部处理，C14 推迟到 M3
-- [ ] **M1 验收（需要 Windows 实机）**：只用 CLI 完成 `login` → `add nablejohne/runnerdeck-sandbox` → `start` + 触发一次 workflow → Ctrl+C 停止 → `remove`；`pytest` 全绿
+- [x] **M1 验收（Windows 真机）**：`add`（下载 2.338.1 + SHA256 + ACL）→ `start` → workflow 成功 → Ctrl+C 优雅停止 → `status` → `remove`，GitHub 无残留；job 执行中 Ctrl+C 也能优雅停止（job Canceled）；真机 `pytest` 1606 passed，集成测试 6 passed
+- [ ] 桌面会话里手动验证一次 `runnerdeck-cli login` / `whoami` / `logout`（SSH 会话无法访问凭据管理器，见 spike-notes §10）
 
 验收命令（PowerShell，仓库根目录，先 `git pull` 和 `uv sync`）：
 
@@ -36,11 +37,17 @@ uv run pytest
 
 验证：`uv run ruff check . && uv run ruff format --check . && uv run pytest`（本地 macOS 1600+ passed）；GitHub CI（ubuntu lint + windows test）绿。
 
-### M0 遗留（第 2 轮 spike，见 spike-notes §9）
+### M0 第 2 轮（已完成，见 spike-notes §10）
 
-不阻塞 M1，但 M2 开始前要跑完：GUI 场景的停止方案（`ctrl_break_helper`）、执行中停止的 job 结论、`.env` 执行策略修复、自更新时的进程与输出、DELETE 兜底、`.runner` 原文、api fixtures；以及 M1 引入的待实测项（§9 末尾）。
+除自更新（无法按需触发）外全部完成：helper 转发 Ctrl+Break 可行（M2 托盘停止方案）、job 中停止需约 15 s（已改为 90 s 超时）、`.env` 执行策略修复有效、`--replace` / 已删除 runner 的输出、DELETE 幂等、`.runner` 与 API 样本入库。
 
 ## 已完成
+
+### 2026-10-23 M1 真机验收 + M0 第 2 轮
+
+- 真机发现并修复：runner 在 GitHub 被删除后自己清配置并以 0 退出（改判 ERROR）；job 中停止 15 s 不够导致强杀和僵尸 job（改为 90 s）；DELETE 遇僵尸 job 返回 422（给 force-cancel 提示）；SSH 会话无法用凭据管理器（提示 RUNNERDECK_PAT）；状态文案
+- 新增真实样本：`deregistered_on_github.txt`、`config_replaced.txt`、`remove_already_gone.txt`、`runner/runner_file.json`、`api/*.json`，`tests/core/test_real_samples.py`
+
 
 ### 2026-10-23 M1 core 层 + CLI（代码）
 
@@ -56,6 +63,10 @@ uv run pytest
 - 创建公开仓库 https://github.com/nablejohne/RunnerDeck，许可证 GPLv3
 
 ## 决策与坑
+
+- M2 托盘应用的停止方案：helper 进程（CREATE_NO_WINDOW，自带隐藏控制台）转发 Ctrl+Break，真机 0.9 s 优雅退出
+- 执行 job 时停止要等 runner 取消 job（约 15 s 起），超时 90 s；强杀会留下僵尸 job（runner busy、不能删除，只有 force-cancel 能解）
+- GitHub `DELETE runner` 对不存在的 id 也返回 204；runner 被 GitHub 删除时输出 “The runner no longer exists on the server” 并以 0 退出
 
 - M1 新增 core 模块 `errors/redact/logs/winproc/status/manager`（理由见 m1-design §0）；Controller（M2）只负责把 manager 的调用放进工作线程
 - 真实 run.cmd 在 Listener 崩溃后仍 `exit /b 0`，异常只能从 run-helper 打印的 Listener 退出码判断；测试用的假 run.cmd 必须照搬这一点

@@ -1,0 +1,11 @@
+﻿{
+  "agentId": 23,
+  "agentName": "LAPTOP-8LU6A21K-runnerdeck-sandbox",
+  "poolId": 1,
+  "poolName": "Default",
+  "serverUrl": "https://pipelinesghubeus5.actions.githubusercontent.com/REDACTED/",
+  "gitHubUrl": "https://github.com/nablejohne/runnerdeck-sandbox",
+  "workFolder": "_work",
+  "useV2Flow": true,
+  "serverUrlV2": "https://broker.actions.githubusercontent.com/"
+}

@@ -1,0 +1,9 @@
+
+# Runner removal
+
+Does not exist. Skipping Removing runner from the server
+
+√ Runner removed successfully
+√ Removed .credentials
+√ Removed .runner
+

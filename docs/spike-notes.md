@@ -3,7 +3,7 @@
 M1 实现以本文为准；没有记录的 runner 行为先补 spike，不要猜。
 
 - 第 1 轮：2026-10-22，Windows（中文系统，控制台代码页 936），runner 2.338.0 / 2.337.0，原始输出见 `tests/fixtures/`
-- 第 2 轮：待跑（见 §9）
+- 第 2 轮：2026-10-23，通过 SSH 在同一台 Windows 上跑（runner 2.338.1 / 2.337.0），结果见 §10
 
 ## 0. 测试环境
 
@@ -104,7 +104,7 @@ A session for this runner already exists.
 5. 用 psutil 结束 Listener（退出码 15）时，run-helper 输出 `Exiting after unknown error code: 15` 后不会重启，所以兜底强杀不会被自动拉起。
 6. `taskkill /T /F` 的进程树：`cmd.exe(run.cmd)` → `cmd.exe(run-helper)` → `Runner.Listener.exe`，三个都会被结束。
 
-## 6. 执行 job 时停止（第 1 轮无效）
+## 6. 执行 job 时停止（第 1 轮无效，第 2 轮结果见 §10）
 
 第 1 轮所有 job 大约 9.5 秒就**自己失败了**，比停止信号还早（`job_settle` 等了 10 秒），所以“执行中停止”的两条数据实际上是在 job 结束后才停的，作废。
 
@@ -114,7 +114,7 @@ A session for this runner already exists.
 - 候选修复：在 runner 目录的 `.env` 写 `PSExecutionPolicyPreference=RemoteSigned`，只对该 runner 的子进程生效（Process 作用域），不改系统设置。第 2 轮验证。
 - sandbox 的 `spike.yml` 已改：sleep 用 `cmd` + `ping`，另加一个 `continue-on-error` 的 PowerShell 探测步骤。
 
-## 7. 自更新（第 1 轮未触发）
+## 7. 自更新（第 1、2 轮都未触发，见 §10）
 
 装 2.337.0 跑了 8 分钟没有更新。runner 的自更新是**分配 job 时**由服务端下发的，第 1 轮那次没有派 job。第 2 轮用 `run --dispatch-seconds` 再测。
 
@@ -127,7 +127,7 @@ A session for this runner already exists.
 - 输出解码：按行，UTF-8 优先，控制台代码页兜底。
 - 待定（第 2 轮决定）：GUI 下的停止方案（helper）、`.env` 里是否默认写入执行策略、自更新期间的进程跟踪。
 
-## 9. 第 2 轮要跑的
+## 9. 第 2 轮要跑的（已完成，结果见 §10）
 
 先 `git pull`，然后：
 
@@ -165,3 +165,49 @@ M1 实现中引入、需要第 2 轮实测确认的（来自 runner 源码，未
 - `harden_runner_dir` 收紧 ACL 后 runner 能正常注册、运行、自更新、移除
 
 发回：`spike-out/`（可以删掉 `cache/` 里的两个 zip，约 200 MB）、`tests/fixtures/api/`、`.runner` 内容，以及 a、f 两步的控制台输出（这两步的部分结果只打印在控制台）。
+
+## 10. 第 2 轮结果（2026-10-23）
+
+环境：`ssh XM`（Windows 11 26200，中文系统，系统代理 v2rayN 127.0.0.1:10808，执行策略未设置 = Restricted），fine-grained PAT（只选 runnerdeck-sandbox）。SSH 会话里 `has_console()` 为 True（sshd 为会话创建了控制台），Ctrl+Break 相关测试都真正执行了。
+
+### 停止
+
+| 场景 | 退出耗时 | 结果 |
+| --- | --- | --- |
+| job 执行中，共享控制台 Ctrl+Break | 15.16 s | 先输出 `Exiting...`，runner 取消 job（`Job spike completed with result: Canceled`），再正常退出；run 的结论是 failure，job 是 Canceled |
+| 空闲，`ctrl_break_helper`（helper 自带隐藏控制台转发 Ctrl+Break） | **0.91 s** | 优雅退出、无残留。**托盘应用（无控制台）的停止方案可行**，M2 采用 |
+| job 执行中，`ctrl_break_helper` | 15.53 s | 同上，job 被取消 |
+| job 执行中，旧 CLI（15 s 超时） | 15 s 后强杀 | job 在 GitHub 上一直卡在 in_progress（> 8 分钟），runner 一直 busy=true，`gh run cancel` 无效，**DELETE 返回 422 “currently running a job and cannot be deleted”**；只有 `POST .../runs/{id}/force-cancel` 能立刻解开 |
+
+结论：job 执行中的优雅停止需要 ≥ 15 s，**process.py 已改为执行 job 时默认等 90 s、空闲 15 s**；真机复测：Ctrl+C 后约 16 s 优雅退出、job Canceled、没有强杀。强杀会让 job 变成僵尸，manager 对 422 给出 force-cancel 的提示。
+
+GitHub API 的 offline 状态在优雅停止后 11–70 s 才更新（有波动），但会话是立即释放的：紧接着重启没有出现 Conflict。强杀后会话约 2–3.5 分钟才过期，期间重启显示“等待旧会话过期”并自动恢复（CLI 已验证）。
+
+### runner 在 GitHub 上被删除
+
+运行中被 `DELETE /actions/runners/{id}` 后，输出（`tests/fixtures/stdout/deregistered_on_github.txt`）：
+
+```text
+The runner no longer exists on the server. Cleaning up local configuration.
+√ Removed .credentials
+√ Removed .runner
+"Runner listener exit with 0 return code, stop the service, no retry needed."
+```
+
+**不是** run-helper 的 “terminated error”，退出码也是 0。process.py 已把这一行识别为 DEREGISTERED -> ERROR（“请先 remove 再重新 add”）。runner 自己删了 `.runner`，所以之后 `remove` 走 API 删除。
+
+### 注册 / 移除 / API
+
+- `--replace` 覆盖同名 runner：`A runner exists with the same name` + `√ Successfully replaced the runner`，**runner id 不变**（`tests/fixtures/config/config_replaced.txt`）。
+- 对已在 GitHub 上不存在的 runner 执行 `config.cmd remove`：`Does not exist. Skipping Removing runner from the server`，随后仍是 `√ Runner removed successfully`，rc=0（`remove_already_gone.txt`）。
+- **`DELETE /actions/runners/{id}` 是幂等的**：对不存在的 id 也返回 204（只有 GET 返回 404）。
+- `.runner` 实际字段：`agentId, agentName, poolId, poolName, serverUrl, gitHubUrl, workFolder, useV2Flow, serverUrlV2`（`tests/fixtures/runner/runner_file.json`，serverUrl 的租户段已替换）。
+- fine-grained PAT：`/user/repos` 只返回 PAT 选中的仓库；6 个 API 调用全部通过（`tests/fixtures/api/`）。
+
+### 其他
+
+- **PowerShell 执行策略**：runner 目录 `.env` 写 `PSExecutionPolicyPreference=RemoteSigned` 后，`shell: powershell` 步骤输出 `policy=RemoteSigned`，修复有效，不改系统设置。M2 添加向导里提供这个选项（默认开）。
+- **自更新**：2.337.0 运行 6 分钟、执行过 1 个 job，仍未触发更新；GitHub 不会强制更新只落后一个小版本的 runner，无法按需复现。run-helper 的更新相关输出仍按源码措辞识别，等自然发生时再核对。
+- **凭据管理器**：SSH（密钥登录）会话里 keyring 报 Win32 1312（“指定的登录会话不存在”），桌面会话应正常；CLI 已提示改用 `RUNNERDECK_PAT`。桌面会话下的 `login`/`logout` 待用户手动验证一次。
+- **关闭终端会结束前台 runner**（控制台关闭事件发给所有进程），算一次强杀；托盘应用不受影响。
+- 目录 ACL：`harden_runner_dir` 生效（只剩 Administrators、SYSTEM、当前用户），runner 注册、运行、移除都正常；`D:\runners` 根目录仍继承 Authenticated Users: 修改（已知缺口）。
