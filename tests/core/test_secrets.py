@@ -254,3 +254,16 @@ def test_set_backend_overrides_global_keyring(memory_keyring, module_backend) ->
 def test_memory_keyring_fixture_is_installed_globally(memory_keyring) -> None:
     assert keyring.get_keyring() is memory_keyring
     assert secrets._keyring() is memory_keyring
+
+
+def test_no_logon_session_error_suggests_env_var(memory_keyring) -> None:
+    # Real 2026-10-23: keyring over SSH -> pywintypes.error (1312, 'CredRead', ...)
+    class NoSession(Exception):
+        winerror = 1312
+
+    def boom(*args, **kwargs):
+        raise NoSession(1312, "CredRead", "A specified logon session does not exist.")
+
+    memory_keyring.get_password = boom  # type: ignore[method-assign]
+    with pytest.raises(SecretStoreError, match="RUNNERDECK_PAT"):
+        secrets.load_pat("someone")

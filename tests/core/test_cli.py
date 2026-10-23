@@ -1210,7 +1210,7 @@ def test_status_table(h: Harness) -> None:
     assert "被其他进程运行" in row(online) and "在线（忙）" in row(online)
     assert "已停止" in row(offline) and "离线" in row(offline)
     assert "已在 GitHub 端删除" in row(gone) and "不存在" in row(gone)
-    assert "被其他进程运行" in row(ext) and "目录下有不归本应用管理" in row(ext)
+    assert "被其他进程运行" in row(ext) and "目录下有不归本进程管理" in row(ext)
     assert "已停止" in row(other) and "未知" in row(other)
     assert f"注意：无法获取 GitHub 状态（{OWNER}/other）：GitHub 服务暂时不可用" in result.out
 
@@ -1763,7 +1763,10 @@ def test_remove_keep_work_via_api(h: Harness) -> None:
     result = h.run("remove", DEFAULT_NAME, "--keep-work", "--yes")
     assert result.code == 0, result.err
     assert h.prompts == []
-    assert f"GitHub：已通过 API 删除（runner id {AGENT_ID}）" in result.out
+    assert (
+        f"GitHub：已通过 API 删除（runner id {AGENT_ID}；GitHub 对已不存在的 id 也返回成功）"
+        in result.out
+    )
     assert "（保留了 _work）" in result.out
     assert (runner_dir / "_work" / "keep.txt").is_file()
     assert not (runner_dir / "config.cmd").exists()

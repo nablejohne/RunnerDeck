@@ -106,4 +106,12 @@ def _check_login(login: str) -> str:
 def _store_error(action: str, e: Exception) -> SecretStoreError:
     detail = redact(str(e)).strip()
     reason = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
-    return SecretStoreError(f"无法{action}凭据管理器中的 PAT：{reason}")
+    message = f"无法{action}凭据管理器中的 PAT：{reason}"
+    # Real (2026-10-23): over SSH (key auth, network logon) CredRead/CredWrite fail with
+    # Win32 error 1312 ERROR_NO_SUCH_LOGON_SESSION; a desktop session works.
+    if getattr(e, "winerror", None) == 1312 or "1312" in detail:
+        message += (
+            "。当前会话无法使用 Windows 凭据管理器（例如通过 SSH 登录）；"
+            "请改用环境变量 RUNNERDECK_PAT"
+        )
+    return SecretStoreError(message)

@@ -53,7 +53,9 @@ DETAIL_MISSING = "GitHub 上已没有这个 runner，请重新注册或移除本
 DETAIL_RECONNECTING = "上次强制停止后 GitHub 端旧会话尚未过期（约 3 分钟），runner 会自动重试"
 DETAIL_CONNECTING = "本地已启动，等待 GitHub 显示在线"
 DETAIL_STALLED = f"本地运行中，但 GitHub 超过 {STALL_AFTER_S} 秒仍显示离线，请检查网络或代理"
-DETAIL_EXTERNAL_LOCAL = "目录下有不归本应用管理的 runner 进程（服务或残留进程）"
+DETAIL_EXTERNAL_LOCAL = (
+    "目录下有不归本进程管理的 runner 进程（另一个终端里的 start、服务或残留进程）"
+)
 DETAIL_EXTERNAL_REMOTE = (
     "GitHub 显示在线，但本应用没有运行它（可能是服务或其他电脑上的同名 runner）"
 )

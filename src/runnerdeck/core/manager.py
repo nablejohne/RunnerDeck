@@ -37,6 +37,7 @@ import psutil
 
 from runnerdeck.core import installer, process, release, runner_file
 from runnerdeck.core.errors import (
+    GitHubError,
     InstallError,
     InvalidInputError,
     NotFoundError,
@@ -848,6 +849,20 @@ class RunnerManager:
             deleted = client.delete_runner(owner, repo, runner_id)
         except NotFoundError as e:
             raise _no_repo_access(owner, repo, e, _REMOVE_KEPT) from e
+        except GitHubError as e:
+            # Real (2026-10-23): 422 "... is currently running a job and cannot be deleted",
+            # e.g. a job orphaned by a hard kill keeps the runner busy on GitHub.
+            if e.status == 422:
+                raise GitHubError(
+                    f"GitHub 认为 runner “{record.name}” 还在执行 job"
+                    "（常见于 job 执行中被强制结束），"
+                    f"暂时不能删除；请在 {record.repo_url}/actions 找到那个仍在运行的 run，"
+                    "取消它（不生效时用“Force cancel”）后重试。本地目录和记录都没有改动",
+                    status=422,
+                    method=e.method,
+                    path=e.path,
+                ) from e
+            raise
         if deleted:
             return RemoteRemoval.API_DELETED, runner_id
         cls._confirm_gone(client, owner, repo, runner_id, kept=_REMOVE_KEPT)

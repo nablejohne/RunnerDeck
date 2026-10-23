@@ -136,12 +136,17 @@ def test_parse_line_ignores_other_lines(line: str) -> None:
     assert parse_line(line) is None
 
 
+CORE_ONLY_EVENTS = {EventKind.DEREGISTERED}
+
+
 def test_parse_line_matches_spike_classifier_on_all_fixtures() -> None:
     spike_common = pytest.importorskip("spike_common")
     for path in sorted(FIXTURES.glob("*.txt")):
         for line in path.read_text(encoding="utf-8").splitlines():
             ours = parse_line(line)
             theirs = spike_common.classify_line(line)
+            if ours is not None and ours.kind in CORE_ONLY_EVENTS:
+                continue  # learnt after the spike classifier was frozen
             if theirs is None:
                 assert ours is None, line
                 continue
@@ -776,6 +781,24 @@ def test_output_lines_are_redacted(
     assert "NOTAREALTOKEN123" not in joined
     assert fake_pat not in joined
     assert "--token ***" in proc.output()[0]
+
+
+def test_runner_deleted_on_github_is_error_although_everything_exits_0(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
+) -> None:
+    # Real output (2026-10-23, runner 2.338.1): DELETE on GitHub while it listens. The runner
+    # wipes its own .runner/.credentials and exits 0 through the normal "exit with 0" line.
+    popen.data = fixture_bytes("deregistered_on_github.txt")
+    popen.exit_code = 0
+    proc = make(runner_dir, popen, rec)
+    proc.start()
+    assert proc.wait(5) == 0
+    assert proc.listener_exit_code == 0
+    assert proc.state == S.ERROR
+    assert proc.last_error is not None and "已在 GitHub 端被删除" in proc.last_error
+    assert parse_line(
+        "The runner no longer exists on the server. Cleaning up local configuration."
+    ) == (RunnerEvent(EventKind.DEREGISTERED))
 
 
 def test_listener_crash_is_error_although_run_cmd_exits_0(
@@ -1933,3 +1956,37 @@ def test_windows_start_twice_refused(tmp_path: Path, real_processes: Any) -> Non
         mp.setattr(winproc, "has_console", lambda: False)
         proc.stop()
     assert not proc.is_running()
+
+
+@pytest.mark.parametrize(
+    ("output", "expected_wait"),
+    [
+        (IDLE_OUTPUT, "idle"),
+        (IDLE_OUTPUT + b"2026-10-23 03:34:44Z: Running job: spike\r\n", "busy"),
+    ],
+    ids=["idle", "busy"],
+)
+def test_stop_default_timeout_depends_on_running_job(
+    runner_dir: Path,
+    popen: FakePopen,
+    win: FakeWin,
+    rec: Recorder,
+    monkeypatch: pytest.MonkeyPatch,
+    output: bytes,
+    expected_wait: str,
+) -> None:
+    # Real 2026-10-23: during a job the runner needs ~15 s to cancel it before exiting.
+    monkeypatch.setattr(process_mod, "DEFAULT_STOP_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(process_mod, "BUSY_STOP_TIMEOUT_S", 1.0)
+    win.console = True
+    win.ctrl_break_tail = None  # never exits by itself: stop() waits the full timeout
+    proc = started(runner_dir, popen, rec, output)
+    wait_until(lambda: proc.state == (S.BUSY if expected_wait == "busy" else S.IDLE))
+    t0 = time.monotonic()
+    result = proc.stop()
+    waited = time.monotonic() - t0
+    assert result.graceful is False
+    if expected_wait == "busy":
+        assert waited >= 0.9
+    else:
+        assert waited < 0.9

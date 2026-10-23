@@ -41,6 +41,10 @@ log = logging.getLogger(__name__)
 
 RUN_SCRIPT = "run.cmd"  # run as `<abs cmd.exe> /c run.cmd` with cwd = runner dir
 DEFAULT_STOP_TIMEOUT_S = 15.0  # spike §8: Ctrl+Break normally ends run.cmd in ~0.4 s
+# Real (2026-10-23): during a job the runner first cancels it ("completed with result: Canceled")
+# and exited 15.2 s after Ctrl+Break for a trivial step; a hard kill instead orphans the job on
+# GitHub (stuck in_progress, runner busy, DELETE refused). Steps with cleanup need longer.
+BUSY_STOP_TIMEOUT_S = 90.0
 KILL_WAIT_S = 10.0  # after kill_tree, how long to wait for cmd.exe to be gone
 READER_JOIN_TIMEOUT_S = 5.0  # after exit, grace for the reader to drain the pipe
 MAX_LINE_BYTES = 64 * 1024  # longer "lines" are split rather than buffered without bound
@@ -59,6 +63,7 @@ class EventKind(StrEnum):
     COMPLETED = "completed"
     STOPPING = "stopping"
     EXITED = "exited"
+    DEREGISTERED = "deregistered"  # deleted on GitHub; the runner wipes .runner/.credentials
 
 
 @dataclass(frozen=True)
@@ -90,6 +95,9 @@ _EVENT_PATTERNS: tuple[tuple[re.Pattern[str], EventKind], ...] = (
     (re.compile(r"^Exiting\.\.\.\s*$"), EventKind.STOPPING),
     (re.compile(r"Runner listener exit with (?P<detail>-?\d+) return code"), EventKind.EXITED),
     (re.compile(r"Exiting after unknown error code: (?P<detail>-?\d+)"), EventKind.EXITED),
+    # Real output 2026-10-23 (runner 2.338.1) after DELETE /actions/runners/{id} while it ran:
+    # it removes .credentials/.runner itself and then exits with code 0 (not "terminated error").
+    (re.compile(r"The runner no longer exists on the server"), EventKind.DEREGISTERED),
 )
 
 # run-helper.cmd's other Listener-exit lines carry no number; each stands for one Listener exit
@@ -149,8 +157,8 @@ class OutputStateMachine:
                 self.runner_version = event.detail
             case _:
                 # CONNECTED is also printed on every conflict retry, so it proves nothing;
-                # EXITED leaves the state alone: RunnerProcess records the Listener's code from
-                # it and decides STOPPED / ERROR when run.cmd ends (cmd.exe itself exits 0).
+                # EXITED / DEREGISTERED leave the state alone: RunnerProcess records them and
+                # decides STOPPED / ERROR when run.cmd ends (cmd.exe itself exits 0).
                 pass
         return (self.state, self.current_job, self.last_job) != before
 
@@ -248,6 +256,7 @@ class RunnerProcess:
         self._state_since = _now()
         self._exit_code: int | None = None
         self._listener_exit: int | None = None
+        self._deregistered = False  # "The runner no longer exists on the server" seen
         self._last_error: str | None = None
         self._last_line: str | None = None
         self._started_at: datetime | None = None
@@ -395,6 +404,7 @@ class RunnerProcess:
                 self._machine = OutputStateMachine()
                 self._exit_code = None
                 self._listener_exit = None
+                self._deregistered = False
                 self._last_error = None
                 self._last_line = None
                 self._started_at = _now()
@@ -430,9 +440,11 @@ class RunnerProcess:
                 self._killed_elsewhere = True
                 self._last_stop_forced = True
 
-    def stop(self, timeout: float = DEFAULT_STOP_TIMEOUT_S) -> StopResult:
+    def stop(self, timeout: float | None = None) -> StopResult:
         """Stop the runner: Ctrl+Break first, hard kill if that fails. Final state STOPPED.
 
+        timeout None: DEFAULT_STOP_TIMEOUT_S when idle, BUSY_STOP_TIMEOUT_S while a job runs (the
+        runner cancels the job before exiting; killing it earlier orphans the job on GitHub).
         Blocks up to `timeout` (+ kill/drain time). Idempotent: when not running, returns the
         result of the stop that ended the latest run, or graceful=True / exit_code=None.
         Safe to call from any thread except from inside this object's callbacks.
@@ -444,6 +456,9 @@ class RunnerProcess:
         self._forbid_in_callback("stop")
         with self._control_lock:
             with self._lock:
+                if timeout is None:
+                    busy = self._state == LocalState.BUSY or self._current_job is not None
+                    timeout = BUSY_STOP_TIMEOUT_S if busy else DEFAULT_STOP_TIMEOUT_S
                 if not self._active:
                     if self._last_stop is not None and self._last_stop[0] == self._gen:
                         return self._last_stop[1]
@@ -566,6 +581,8 @@ class RunnerProcess:
     def _apply_event_locked(self, event: RunnerEvent) -> None:
         machine = self._machine
         machine.feed(event)
+        if event.kind == EventKind.DEREGISTERED:
+            self._deregistered = True
         if event.kind == EventKind.EXITED and event.detail is not None:
             # A relaunch (codes 2/3/4) prints a new line when that Listener exits.
             self._listener_exit = int(event.detail)
@@ -606,6 +623,11 @@ class RunnerProcess:
         cmd.exe's rc alone says nothing: run.cmd returns 0 after any Listener exit (spike §5),
         so a non-zero Listener code from run-helper's line counts as well.
         """
+        if self._deregistered:
+            return (
+                "runner 已在 GitHub 端被删除，并清除了本地的 .runner / .credentials；"
+                "请先 remove 再重新 add"
+            )
         listener = self._listener_exit
         if rc == 0 and not listener:
             return None

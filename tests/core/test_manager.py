@@ -32,6 +32,7 @@ from runnerdeck.core import manager as manager_mod
 from runnerdeck.core.errors import (
     AuthError,
     ChecksumMismatchError,
+    GitHubError,
     InstallError,
     InvalidInputError,
     NetworkError,
@@ -1507,6 +1508,21 @@ def test_remove_runner_api_failure_keeps_everything(env: Env) -> None:
     env.client.failures["delete_runner"] = PermissionDeniedError("需要 Administration 权限")
     with pytest.raises(PermissionDeniedError):
         env.manager.remove_runner(record.id)
+    assert Path(record.path, "config.cmd").is_file()
+    assert env.config().runners == [record]
+
+
+def test_remove_runner_busy_on_github_explains_how_to_unblock(env: Env) -> None:
+    # Real 2026-10-23: a job orphaned by a hard kill keeps the runner busy; DELETE -> 422.
+    record = seed_runner(env)
+    env.cmd.remove_mode = "fail"
+    env.client.failures["delete_runner"] = GitHubError(
+        "Bad request - Runner x is currently running a job and cannot be deleted.", status=422
+    )
+    with pytest.raises(GitHubError) as info:
+        env.manager.remove_runner(record.id)
+    assert info.value.status == 422
+    assert "还在执行 job" in str(info.value) and "Force cancel" in str(info.value)
     assert Path(record.path, "config.cmd").is_file()
     assert env.config().runners == [record]
 

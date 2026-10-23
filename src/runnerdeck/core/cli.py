@@ -160,7 +160,7 @@ class CliDeps:
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], datetime] = _utcnow
     poll_interval_s: float = 0.5  # `start`: how often to check whether runners are still alive
-    stop_timeout_s: float = process.DEFAULT_STOP_TIMEOUT_S
+    stop_timeout_s: float | None = None  # None: RunnerProcess picks (idle vs. running a job)
     stop_grace_s: float = STOP_GRACE_S
 
 
@@ -717,7 +717,10 @@ def _cmd_remove(ctx: _Context, args: argparse.Namespace) -> int:
     elif result.remote is RemoteRemoval.SKIPPED:
         console.print("GitHub：未处理（--local-only）")
     elif result.remote is RemoteRemoval.API_DELETED:
-        console.print(f"GitHub：已通过 API 删除（runner id {result.runner_id}）")
+        console.print(
+            f"GitHub：已通过 API 删除（runner id {result.runner_id}；"
+            "GitHub 对已不存在的 id 也返回成功）"
+        )
     else:
         console.print("GitHub：上面已经没有这个 runner")
     if result.dir_removed:
@@ -971,11 +974,20 @@ class _Supervisor:
     def _announce_stop(self) -> None:
         self.console.print()
         self.console.print(
-            f"收到 Ctrl+C，正在停止所有 runner（每个最多等 {self.ctx.deps.stop_timeout_s:g} 秒；"
+            f"收到 Ctrl+C，正在停止所有 runner（{self._stop_wait_text()}；"
             "再按一次 Ctrl+C 立即强制结束）…"
         )
         if self.skipped:
             self.console.print(f"没有启动：{'、'.join(r.name for r in self.skipped)}")
+
+    def _stop_wait_text(self) -> str:
+        timeout = self.ctx.deps.stop_timeout_s
+        if timeout is not None:
+            return f"每个最多等 {timeout:g} 秒"
+        return (
+            f"空闲的最多等 {process.DEFAULT_STOP_TIMEOUT_S:g} 秒，"
+            f"正在执行 job 的会先取消 job，最多等 {process.BUSY_STOP_TIMEOUT_S:g} 秒"
+        )
 
     def _stop_all(self, targets: Sequence[_Run], *, base: int) -> bool:
         """Stop `targets` at the same time. True if the user gave up waiting (3rd Ctrl+C).
@@ -991,7 +1003,8 @@ class _Supervisor:
                 daemon=True,  # a runner we gave up on must not keep the CLI from exiting
             )
             run.stopper.start()
-        limit = deps.stop_timeout_s + deps.stop_grace_s
+        timeout = deps.stop_timeout_s
+        limit = (process.BUSY_STOP_TIMEOUT_S if timeout is None else timeout) + deps.stop_grace_s
         deadline = time.monotonic() + limit
         forced = gave_up = False
         while busy := [run for run in targets if run.busy()]:
@@ -1017,7 +1030,7 @@ class _Supervisor:
         self._report_stops(targets)
         return gave_up
 
-    def _stop_one(self, run: _Run, timeout: float) -> None:
+    def _stop_one(self, run: _Run, timeout: float | None) -> None:
         try:
             run.result = run.proc.stop(timeout)
         except RunnerDeckError as e:
