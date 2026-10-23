@@ -36,6 +36,13 @@ dev = [
 requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
+[tool.uv]
+# The lock is usually produced on macOS; make uv also pick wheels that exist for Windows
+# (pyqt5-qt5 stopped publishing win_amd64 wheels after 5.15.2).
+required-environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/runnerdeck"]
 
