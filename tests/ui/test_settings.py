@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from PyQt5.QtGui import QDesktopServices
@@ -159,7 +160,7 @@ def test_open_log_dir(page: SettingsPage, monkeypatch: pytest.MonkeyPatch, isola
         staticmethod(lambda url: opened.append(url.toLocalFile()) or True),
     )
     page.logCard.clicked.emit()
-    assert opened and opened[0].startswith(str(isolated_home))
+    assert opened and Path(opened[0]) == isolated_home / "logs"
 
 
 def test_settings_failure_reverts_fields(page: SettingsPage, fake: FakeController) -> None:
