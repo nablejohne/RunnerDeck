@@ -19,7 +19,6 @@ Grounded in docs/spike-notes.md:
 from __future__ import annotations
 
 import argparse
-import getpass
 import logging
 import os
 import signal
@@ -42,7 +41,7 @@ import psutil
 from pydantic import ValidationError
 
 from runnerdeck import __version__
-from runnerdeck.core import logs, paths, process, runner_file, secrets, winproc
+from runnerdeck.core import logs, paths, process, runner_file, secret_input, secrets, winproc
 from runnerdeck.core.errors import (
     InvalidInputError,
     NotFoundError,
@@ -138,10 +137,11 @@ def _default_manager(store: ConfigStore, client_factory: ClientFactory) -> Runne
 class CliDeps:
     """Everything main() touches outside this module; tests replace parts of it.
 
-    stdout / stderr None mean sys.stdout / sys.stderr at call time. read_secret / read_line are
-    getpass.getpass / input (prompt text is passed already redacted). client_factory builds a
-    GitHubClient from (pat, settings.proxy); manager_factory gets the store and a zero-argument
-    client factory that resolves the PAT lazily (RUNNERDECK_PAT > keyring by config.account).
+    stdout / stderr None mean sys.stdout / sys.stderr at call time. read_secret / read_line
+    are secret_input.read_secret / input (prompt text is passed already redacted).
+    client_factory builds a GitHubClient from (pat, settings.proxy); manager_factory gets the
+    store and a zero-argument client factory that resolves the PAT lazily
+    (RUNNERDECK_PAT > keyring by config.account).
     kill_tree is what `start` uses on a second Ctrl+C: kill a run.cmd process tree by PID and
     return (pids gone, pids still alive).
     """
@@ -149,7 +149,7 @@ class CliDeps:
     stdout: TextIO | None = None
     stderr: TextIO | None = None
     environ: Mapping[str, str] = field(default_factory=lambda: os.environ)
-    read_secret: ReadFn = getpass.getpass
+    read_secret: ReadFn = secret_input.read_secret
     read_line: ReadFn = input
     store_factory: Callable[[], ConfigStore] = ConfigStore
     client_factory: CliClientFactory = _default_client
@@ -505,7 +505,9 @@ def _cmd_login(ctx: _Context, args: argparse.Namespace) -> int:
         console.print(f"使用环境变量 {ENV_PAT} 中的 PAT")
     else:
         try:
-            raw = ctx.deps.read_secret(redact("请粘贴 GitHub PAT 的值（输入不会显示）："))
+            raw = ctx.deps.read_secret(
+                redact("请粘贴 GitHub PAT 的值（输入不会显示；Ctrl+V 或鼠标右键粘贴）：")
+            )
         except EOFError:
             raise InvalidInputError("没有读到 PAT（输入已结束）") from None
     register_secret(raw.strip())
