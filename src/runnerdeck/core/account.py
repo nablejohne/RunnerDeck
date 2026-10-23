@@ -25,6 +25,10 @@ TOKEN_KIND_LABELS: Mapping[str, str] = {
 }
 
 
+# The login dialog pre-checks the format locally; ui/ may import account but not secrets.
+validate_pat_format = secrets.validate_pat_format
+
+
 class NotLoggedInError(RunnerDeckError):
     """No PAT: neither RUNNERDECK_PAT nor a stored PAT for config.account."""
 

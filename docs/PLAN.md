@@ -289,7 +289,7 @@ runnerdeck/
 | `lint` | ubuntu-latest | `uv sync --locked` → `ruff check` → `ruff format --check` | M0 |
 | `arch-guard` | ubuntu-latest | 用 ruff `TID251 banned-api` 禁止 `core/` import `PyQt5` / `qfluentwidgets`（`src/runnerdeck/core/ruff.toml` 继承根配置单独加规则），并入 `lint` job 即可 | M1 |
 | `test` | windows-latest，Python 3.11 | `uv run pytest --cov=runnerdeck.core`；core 覆盖率门槛 80%；集成测试因无 `RUNNERDECK_TEST_PAT` 自动跳过 | M0（fixture 解析测试）/ M1 全量 |
-| `ui-smoke` | windows-latest | `QT_QPA_PLATFORM=offscreen` + pytest-qt：主窗口能创建、各页能切换 | M2 |
+| `ui-smoke` | windows-latest | `QT_QPA_PLATFORM=offscreen` + pytest-qt：主窗口能创建、各页能切换。**注记（M2）：并入 `test`（pytest-qt 离屏）+ `build`（exe `--smoke-test`），不单设 job** | M2 |
 | `build` | windows-latest | `scripts/build.ps1` 打 onedir，启动 exe 跑 `--version` 自检，上传 artifact（保留 7 天） | M2 |
 
 约定：

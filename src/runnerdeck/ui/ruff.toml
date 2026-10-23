@@ -1,0 +1,20 @@
+# Architecture guard: ui/ reaches core only through app/controller.py (CLAUDE.md "架构规则",
+# docs/m2-design.md §1.6). Pure data / text modules (models, status, errors, paths, account,
+# redact, secret_input, logs) may be imported directly.
+extend = "../../../pyproject.toml"
+
+[lint]
+extend-select = ["TID251"]
+
+[lint.flake8-tidy-imports.banned-api]
+"runnerdeck.core.manager".msg = "ui/ must go through app/controller.py"
+"runnerdeck.core.github_client".msg = "ui/ must go through app/controller.py"
+"runnerdeck.core.process".msg = "ui/ must go through app/controller.py"
+"runnerdeck.core.installer".msg = "ui/ must go through app/controller.py"
+"runnerdeck.core.release".msg = "ui/ must go through app/controller.py"
+"runnerdeck.core.store".msg = "ui/ must go through app/controller.py"
+"runnerdeck.core.secrets".msg = "ui/ must go through app/controller.py"
+"runnerdeck.core.winproc".msg = "ui/ must go through app/controller.py"
+"runnerdeck.core.cli".msg = "ui/ must go through app/controller.py"
+"httpx".msg = "the UI thread never does network IO; use the controller"
+"subprocess".msg = "the UI thread never spawns processes; use the controller"

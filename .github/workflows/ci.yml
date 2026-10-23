@@ -6,6 +6,7 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Hosted runners only (CLAUDE.md): never `runs-on: self-hosted` in this repo.
 permissions:
   contents: read
 
@@ -16,6 +17,7 @@ concurrency:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.1
@@ -25,9 +27,69 @@ jobs:
 
   test:
     runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # pytest-qt needs a platform plugin; the hosted runner has no desktop session.
+      QT_QPA_PLATFORM: offscreen
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.1
       - run: uv sync --locked
       # Coverage gate on Windows, where the Windows-only process/installer tests also run.
+      # --cov-fail-under applies to the combined total, so only core is measured here;
+      # app/ui tests still run, they just do not count toward the gate.
       - run: uv run pytest --cov=runnerdeck.core --cov-report=term --cov-fail-under=80
+
+  build:
+    # Independent of test: a broken package is worth knowing about even while tests are red.
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.1
+      - name: Build onedir bundle and zip
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/build.ps1
+      - name: Smoke-test the bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = Join-Path $PWD 'dist\RunnerDeck'
+          $expected = (uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['version'])").Trim()
+          Write-Host "pyproject version: $expected"
+
+          foreach ($exe in 'RunnerDeck.exe', 'runnerdeck-helper.exe', 'runnerdeck-cli.exe') {
+            if (-not (Test-Path (Join-Path $dist $exe))) { throw "missing $exe in dist\RunnerDeck" }
+          }
+          $zip = Join-Path $PWD "dist\RunnerDeck-$expected-win-x64.zip"
+          if (-not (Test-Path $zip)) { throw "missing $zip" }
+
+          # runnerdeck-cli.exe --version must print the package version.
+          $out = (& (Join-Path $dist 'runnerdeck-cli.exe') --version | Out-String).Trim()
+          Write-Host "runnerdeck-cli --version -> '$out' (exit $LASTEXITCODE)"
+          if ($LASTEXITCODE -ne 0) { throw "runnerdeck-cli.exe --version exited $LASTEXITCODE" }
+          if ($out -notlike "*$expected*") { throw "runnerdeck-cli.exe --version did not print $expected" }
+
+          # runnerdeck-helper.exe without arguments: usage on stderr, exit code 2.
+          $p = Start-Process -FilePath (Join-Path $dist 'runnerdeck-helper.exe') -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput helper-stdout.txt -RedirectStandardError helper-stderr.txt
+          Write-Host "runnerdeck-helper (no args) -> exit $($p.ExitCode)"
+          Get-Content helper-stderr.txt
+          if ($p.ExitCode -ne 2) { throw "runnerdeck-helper.exe exited $($p.ExitCode), expected 2" }
+          if (-not (Select-String -Path helper-stderr.txt -Pattern 'usage' -Quiet)) { throw "runnerdeck-helper.exe printed no usage" }
+
+          # RunnerDeck.exe --smoke-test: windowed subsystem, so Start-Process -Wait for the exit code.
+          # Redirecting the streams gives the windowed exe real handles for its stderr report.
+          $p = Start-Process -FilePath (Join-Path $dist 'RunnerDeck.exe') -ArgumentList '--smoke-test' -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput smoke-stdout.txt -RedirectStandardError smoke-stderr.txt
+          Write-Host "RunnerDeck.exe --smoke-test -> exit $($p.ExitCode)"
+          Get-Content smoke-stdout.txt, smoke-stderr.txt
+          if ($p.ExitCode -ne 0) { throw "RunnerDeck.exe --smoke-test exited $($p.ExitCode)" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RunnerDeck-win-x64
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7

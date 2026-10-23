@@ -1,0 +1,111 @@
+name: Release
+
+# Push a tag `vX.Y.Z` (after bumping pyproject.toml and CHANGELOG.md on main, see
+# docs/PLAN.md "版本与发布") and this builds the zip and publishes a GitHub Release.
+# Hosted runners only (CLAUDE.md): never `runs-on: self-hosted` in this repo.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.1
+      - run: uv sync --locked
+
+      - name: Check that the tag matches pyproject.toml
+        id: version
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PROJECT_VERSION="$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['version'])")"
+          echo "tag: $GITHUB_REF_NAME, pyproject: $PROJECT_VERSION"
+          if [ "$TAG_VERSION" != "$PROJECT_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject.toml version $PROJECT_VERSION"
+            exit 1
+          fi
+          echo "version=$PROJECT_VERSION" >> "$GITHUB_OUTPUT"
+          case "$GITHUB_REF_NAME" in
+            *-alpha*|*-beta*|*-rc*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      # Do not trust "CI was green earlier": lint and test again on the tagged commit.
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest --cov=runnerdeck.core --cov-report=term --cov-fail-under=80
+
+      - name: Build onedir bundle and zip
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/build.ps1
+
+      - name: Smoke-test the bundle
+        shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = Join-Path $PWD 'dist\RunnerDeck'
+          $expected = $env:EXPECTED_VERSION
+
+          foreach ($exe in 'RunnerDeck.exe', 'runnerdeck-helper.exe', 'runnerdeck-cli.exe') {
+            if (-not (Test-Path (Join-Path $dist $exe))) { throw "missing $exe in dist\RunnerDeck" }
+          }
+          $zip = Join-Path $PWD "dist\RunnerDeck-$expected-win-x64.zip"
+          if (-not (Test-Path $zip)) { throw "missing $zip" }
+
+          $out = (& (Join-Path $dist 'runnerdeck-cli.exe') --version | Out-String).Trim()
+          Write-Host "runnerdeck-cli --version -> '$out' (exit $LASTEXITCODE)"
+          if ($LASTEXITCODE -ne 0) { throw "runnerdeck-cli.exe --version exited $LASTEXITCODE" }
+          if ($out -notlike "*$expected*") { throw "runnerdeck-cli.exe --version did not print $expected" }
+
+          $p = Start-Process -FilePath (Join-Path $dist 'runnerdeck-helper.exe') -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput helper-stdout.txt -RedirectStandardError helper-stderr.txt
+          Write-Host "runnerdeck-helper (no args) -> exit $($p.ExitCode)"
+          Get-Content helper-stderr.txt
+          if ($p.ExitCode -ne 2) { throw "runnerdeck-helper.exe exited $($p.ExitCode), expected 2" }
+          if (-not (Select-String -Path helper-stderr.txt -Pattern 'usage' -Quiet)) { throw "runnerdeck-helper.exe printed no usage" }
+
+          $p = Start-Process -FilePath (Join-Path $dist 'RunnerDeck.exe') -ArgumentList '--smoke-test' -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput smoke-stdout.txt -RedirectStandardError smoke-stderr.txt
+          Write-Host "RunnerDeck.exe --smoke-test -> exit $($p.ExitCode)"
+          Get-Content smoke-stdout.txt, smoke-stderr.txt
+          if ($p.ExitCode -ne 0) { throw "RunnerDeck.exe --smoke-test exited $($p.ExitCode)" }
+
+      - name: Extract release notes from CHANGELOG.md
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          uv run python -I scripts/changelog_section.py "$VERSION" > notes.md
+          echo "--- notes.md ---"
+          cat notes.md
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          extra=()
+          if [ "$PRERELEASE" = "true" ]; then extra+=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --verify-tag \
+            --title "RunnerDeck $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            "${extra[@]}"
