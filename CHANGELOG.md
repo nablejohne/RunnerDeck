@@ -5,6 +5,12 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-24
+
+### Fixed
+- A service runner's card kept showing "停止" (and the stop button) after the service had
+  stopped; cards and the tray now follow the service's real state after every check.
+
 ## [1.0.0] - 2026-10-24
 
 First stable release. RunnerDeck can now be left running all day: it lives in the tray,

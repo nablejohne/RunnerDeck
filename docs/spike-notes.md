@@ -282,3 +282,8 @@ The runner no longer exists on the server. Cleaning up local configuration.
 ### runner 版本
 
 `win32api.GetFileVersionInfo(<dir>\bin\Runner.Listener.exe)`：FileVersion `2.338.1.0`，ProductVersion `2.338.1+e78522a9…`；`Runner.Listener.exe --version` 输出 `2.338.1`。目录里只有 `bin`、`externals`（没有自更新留下的 `bin.<ver>`）。
+
+### 补充（M4 桌面验收）
+
+- **服务名过长会被截断**：`LAPTOP-8LU6A21K-runnerdeck-sandbox2` 转服务后服务名是 `actions.runner.nablejohne-runnerdeck-sandbox2.LAPTOP-8LU6A21K-runnerdeck-sa-5752`（截断并加编号），显示名仍是完整的。服务名一律从 `.service` 读，不要自己拼。
+- 取消注销：Windows 显示“正在关闭 N 个应用并注销”时，部分程序可能已经被关掉（验收时 XM 的 SSH 随后连不上）；RunnerDeck 收到 `WM_ENDSESSION(FALSE)` 后按预期重启了进程 runner。
