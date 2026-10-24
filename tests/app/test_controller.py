@@ -1216,16 +1216,23 @@ def test_import_runner_emits_imported_then_config_changed(make_controller: Any, 
     h.controller.runner_imported.connect(lambda r: order.append(f"imported:{r.name}"))
     h.controller.config_changed.connect(lambda c: order.append(f"config:{len(c.runners)}"))
     changed = Spy(h.controller.display_changed)
-    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
+    with (
+        qtbot.waitSignal(h.controller.discovery_updated, timeout=WAIT_MS),
+        qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS),
+    ):
         h.controller.import_runner("/runners/imported", auto_start=True)
     assert order == ["imported:box-imported", "config:1"]
     (record,) = h.controller.records
     assert record.auto_start
-    assert h.manager.calls[-1] == (
+    # The discover() that refreshes the banner runs after the import, on its own worker.
+    names = [name for name, _ in h.manager.calls]
+    index = names.index("import_runner")
+    assert h.manager.calls[index] == (
         "import_runner",
         {"path": "/runners/imported", "auto_start": True},
     )
-    assert h.manager.threads[-1] is not threading.main_thread()
+    assert names.index("discover") > index
+    assert h.manager.threads[index] is not threading.main_thread()
     assert changed.calls == [(record.id, h.controller.display(record.id))]
 
 
@@ -1245,11 +1252,16 @@ def test_forget_deletes_only_the_record(make_controller: Any, qtbot: Any) -> Non
     h.controller.runner_forgotten.connect(lambda rid: order.append(f"forgotten:{rid}"))
     h.controller.config_changed.connect(lambda c: order.append(f"config:{len(c.runners)}"))
     busy = Spy(h.controller.busy_changed)
-    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
+    with (
+        qtbot.waitSignal(h.controller.discovery_updated, timeout=WAIT_MS),
+        qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS),
+    ):
         h.controller.forget(gone.id)
     assert order == [f"forgotten:{gone.id}", "config:1"]
     assert [r.id for r in h.controller.records] == [keep.id]
-    assert h.manager.calls[-1] == ("forget_runner", {"record_id": gone.id})
+    names = [name for name, _ in h.manager.calls]
+    assert ("forget_runner", {"record_id": gone.id}) in h.manager.calls
+    assert names.index("discover") > names.index("forget_runner")  # banner refreshed after
     assert busy.calls == [(gone.id, True), (gone.id, False)]
     assert gone.id not in h.controller._remotes and gone.id not in h.controller._displays
     assert not h.controller.remote_busy(gone.id)
