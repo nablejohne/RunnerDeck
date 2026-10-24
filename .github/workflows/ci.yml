@@ -117,6 +117,7 @@ jobs:
           }
           # Launch on login as RunnerDeck writes it, plus a foreign value the uninstaller must keep.
           $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          if (-not (Test-Path $run)) { New-Item -Path $run | Out-Null }  # a fresh runner profile has none
           Set-ItemProperty -Path $run -Name 'RunnerDeck' -Value "`"$app\RunnerDeck.exe`" --autostart"
           $out = (& "$app\runnerdeck-cli.exe" --version | Out-String).Trim()
           Write-Host "installed runnerdeck-cli --version -> '$out'"
