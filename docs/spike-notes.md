@@ -286,4 +286,4 @@ The runner no longer exists on the server. Cleaning up local configuration.
 ### 补充（M4 桌面验收）
 
 - **服务名过长会被截断**：`LAPTOP-8LU6A21K-runnerdeck-sandbox2` 转服务后服务名是 `actions.runner.nablejohne-runnerdeck-sandbox2.LAPTOP-8LU6A21K-runnerdeck-sa-5752`（截断并加编号），显示名仍是完整的。服务名一律从 `.service` 读，不要自己拼。
-- 取消注销：Windows 显示“正在关闭 N 个应用并注销”时，部分程序可能已经被关掉（验收时 XM 的 SSH 随后连不上）；RunnerDeck 收到 `WM_ENDSESSION(FALSE)` 后按预期重启了进程 runner。
+- **取消注销（D2，Windows 11 26200，结论：程序内修不了）**：开始注销时 RunnerDeck 收到 `WM_QUERYENDSESSION`（`commitDataRequest`，23:09:18 给进程 runner 发了停止信号），随后**被 Windows 直接结束**——没有 `aboutToQuit`、没有 `WM_ENDSESSION(FALSE)`，“正在关闭 2 个应用并注销”界面只列出阻止注销的窗口和一个资源管理器窗口；Tailscale、v2rayN 同样被关掉（XM 的 SSH 随即断开）。点“取消”时 RunnerDeck 早已不在，`app/session_end.py` 的恢复逻辑没有机会运行。M3 记录的“取消注销后不恢复”根因也是这个。处理：README / CHANGELOG 记为已知限制，建议需要扛住注销的 runner 用服务模式；恢复代码保留（无害，系统真的发 `WM_ENDSESSION(FALSE)` 时生效）。

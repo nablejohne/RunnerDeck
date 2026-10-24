@@ -289,7 +289,7 @@ def run_elevated(op: str, payload: dict, *, timeout_s: float = 300) -> ElevatedR
 **第 5 步（取消注销后恢复）**
 - `app/session_end.SessionEndFilter` 只读 MSG 的前三个字段（hwnd、message、wParam），不依赖 `ctypes.wintypes`；消息从不吞掉。`WM_ENDSESSION` 会发给每个顶层窗口，`_Lifecycle.on_session_cancelled` 只在 `session_ending` 为真时处理一次。
 - `emergency_stop_all` 记下这次发了停止信号的 runner；`resume_after_cancelled_logoff()` 用 500 ms 定时器等它们真正停下（最多 120 s，执行中的 job 先被取消）再逐个 `start`，返回数量；托盘提示“注销已取消，正在重新启动 N 个 runner”。服务 runner 本来就不受注销影响。
-- D2（Qt 能否收到 `WM_ENDSESSION(FALSE)`）没有单独写 spike 脚本：SSH 会话和桌面不是同一个会话，发不了窗口消息；直接用产品在桌面验收里验证。
+- D2（Qt 能否收到 `WM_ENDSESSION(FALSE)`）没有单独写 spike 脚本，直接用产品在桌面验收里验证。**结果（桌面验收）：收不到**——Windows 11 开始注销后就把不阻止注销的程序结束了，取消时 RunnerDeck 已不在（spike-notes §12 补充）。记为已知限制，恢复代码保留。
 
 **第 6 步（打包与发布）**
 - Inno Setup 6.7.1 官方安装里没有简体中文：`packaging/ChineseSimplified.isl` 取自 jrsoftware/issrc `Files/Languages/Unofficial`（tag is-6_7_1），加了 UTF-8 BOM（没有 BOM 时 Inno 按 LanguageCodePage 读）；`.iss` 本身含中文，也带 BOM。

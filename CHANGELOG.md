@@ -11,6 +11,12 @@ All notable changes to this project are documented here. Format follows
 - A service runner's card kept showing "停止" (and the stop button) after the service had
   stopped; cards and the tray now follow the service's real state after every check.
 
+### Known limitations
+- Cancelling a Windows sign-out ("取消" on the "正在关闭 N 个应用并注销" screen) does not
+  bring process-mode runners back: Windows 11 has already closed RunnerDeck by then. Open
+  RunnerDeck again (its auto-start runners start with it), or use service mode for runners
+  that must survive sign-out.
+
 ## [1.0.0] - 2026-10-24
 
 First stable release. RunnerDeck can now be left running all day: it lives in the tray,
@@ -86,8 +92,9 @@ administrator rights) or unzip `RunnerDeck-1.0.0-win-x64.zip`; check either file
   session end.
 
 ### Fixed
-- Cancelling a Windows sign-out ("仍要注销 / 取消") left the runners RunnerDeck had already
-  told to stop stopped; they now start again once they have stopped.
+- If a cancelled Windows sign-out leaves RunnerDeck running, the runners it had told to stop
+  start again. On Windows 11 this does not help: RunnerDeck is closed as soon as sign-out
+  begins, before you can cancel (see Known limitations in 1.0.1).
 - Whether a runner was killed or stopped gracefully was only kept in memory: after a restart,
   or a `runnerdeck-cli stop` from another terminal, a killed runner showed as "被其他进程运行"
   until its GitHub session expired. Stop records are now saved per runner under

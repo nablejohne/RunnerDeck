@@ -40,6 +40,8 @@ PAT 只保存在 Windows 凭据管理器，不写入文件和日志。
   - 服务不使用你的系统代理：设置里的代理会写进 runner 目录的 `.env`，对两种模式都生效。
   - runner 根目录不能在用户目录里（NETWORK SERVICE 无法列出它的上级目录，服务会启动失败）。
   - 导入的服务 runner（别处装的）第一次启停前可以用“授权启停…”授权一次。
+
+**已知限制**：注销 Windows 时 RunnerDeck 会让进程模式的 runner 优雅停止；如果你在“正在关闭 N 个应用并注销”界面点了“取消”，Windows 11 此时已经把 RunnerDeck 关掉了，需要重新打开 RunnerDeck（设为随 RunnerDeck 启动的 runner 会跟着启动）。不想受注销影响的 runner 用服务模式。
   - UAC 弹出的是 `runnerdeck-cli.exe`：它只执行一条预先定义好的操作（注册并安装服务、注销并删除服务、启停、授权），参数逐项校验，请求文件读到就删、超过 10 分钟作废。它和 runner 目录都在你自己可写的位置，所以和手动以管理员身份运行 `config.cmd --runasservice` 一样，前提是你信任以你身份运行的其他程序。
 
 ## 功能概览
