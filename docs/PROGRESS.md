@@ -15,7 +15,7 @@
 契约 `docs/m4-design.md`（§13 记 spike 与实现后的修订）。用户决策：服务模式完整支持（UAC 只提权单条命令；安装时给当前用户授启停权限；服务账号只用 NETWORK SERVICE）；安装包按用户安装到 `%LOCALAPPDATA%\Programs\RunnerDeck`；顺序实现 + 最后 1 个独立 reviewer；M3 不单独发版。
 
 - [x] 计划与契约（用户已确认）
-- [ ] 0 真机 spike S1–S11（`ssh XM`）→ spike-notes §12
+- [x] 0 真机 spike S1–S11（`ssh XM`，2026-10-24）→ spike-notes §12：服务装完即启动、SCM 停止是优雅的（空闲 1 s / job 中 5.4 s Canceled）、授权后非管理员可启停、stdout 原样进 Runner 日志的 `WRITE LINE:`、`.env` 代理生效、转服务 = 注销后重装；**新坑**：Listener 要能列出每一级上级目录，根目录加固须留 `Authenticated Users:(RX)`
 - [ ] 1 依赖与小项：pywin32 / PyYAML、互斥量、runner 版本、根目录加固、代理写进 `.env`
 - [ ] 2 服务 core（service / elevate / elevated、installer、manager、CLI）
 - [ ] 3 服务 app / ui

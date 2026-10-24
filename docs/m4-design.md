@@ -10,7 +10,7 @@ M4 按本文实现，测试按本文约定写。core 接口见 `docs/m1-design.m
 4. 不发 v0.2.0：M3 的改动随 v1.0.0 一起发，CHANGELOG 的 `[Unreleased]` 并入 1.0.0。
 5. 安装服务时给当前用户授启停权限（之后启停不弹 UAC）；服务账号只用 NETWORK SERVICE。
 
-标 **【待 spike】** 的条目依赖 §1 的真机结论，spike 后在 §13 记修订，再开始写对应代码。
+§1 的真机 spike 已完成（2026-10-24，结论见 `spike-notes.md §12`），原来标“待 spike”的条目已按结论改写，改动汇总在 §13。
 
 ## 0. 相对 PLAN.md 的调整
 
@@ -28,7 +28,7 @@ M4 按本文实现，测试按本文约定写。core 接口见 `docs/m1-design.m
 | 应用内检查更新只提示、不下载 | PLAN 原定 |
 | CI 的 `build` job 也出安装包，并在 runner 上静默安装 / 卸载一遍 | 托管 runner 是干净的 Windows，每次推送都验证“可装可卸” |
 
-## 1. 真机 spike（先做，`ssh XM`）
+## 1. 真机 spike（S1–S11 已完成，见 spike-notes §12；D1、D2 待桌面）
 
 前提：用户在 XM 上启动 OpenSSH 服务（`Start-Service sshd`）。先确认 SSH 会话的令牌：`whoami /groups` 里有 `Mandatory Label\High Mandatory Level` 即为管理员令牌（Windows OpenSSH 对管理员账户的密钥登录通常是这样）。没有就请用户在桌面上用管理员终端跑同一个脚本。
 
@@ -77,12 +77,12 @@ class ServiceOps(Protocol):           # 测试注入假实现；非 Windows 默�
     def query(self, name: str) -> ServiceInfo           # 不需要管理员；不存在 -> MISSING
     def start(self, name: str) -> None                  # 拒绝访问 -> ElevationRequiredError
     def stop(self, name: str) -> None                   # 同上；只发 STOP，不等
-    def grant_control(self, name: str, sid: str) -> None  # 提权进程里用：DACL 追加 (A;;RPWPLCLORC;;;sid)
+    def grant_control(self, name: str, sid: str) -> None  # 提权进程里用：DACL 追加 (A;;CCLCRPWPLORC;;;sid)
     def delete(self, name: str) -> None                 # 提权进程里用：目录已丢失时清孤儿服务
 def current_user_sid() -> str
 ```
 
-`ElevationRequiredError(RunnerDeckError)` 新增在 `errors.py`。等待停止完成由调用方按 `query` 轮询（超时 120 s，执行 job 时的取消耗时见 S5）。
+`ElevationRequiredError(RunnerDeckError)` 新增在 `errors.py`。等待停止完成由调用方按 `query` 轮询（超时 120 s；实测空闲 1 s、执行 job 时 5.4 s 且 job Canceled）。`ServiceInfo` 另带 `exit_code`（`Win32ExitCode`）：Listener 启动失败时服务是 STOPPED + 1。
 
 ### 2.3 提权：`core/elevate.py` + `core/elevated.py`
 
@@ -103,9 +103,9 @@ def run_elevated(op: str, payload: dict, *, timeout_s: float = 300) -> ElevatedR
 
 | op | payload | 做什么 |
 | --- | --- | --- |
-| `install_service` | `runner_dir, url, token, name, labels, work, grant_sid` | `installer.configure(..., run_as_service=True)` → 读 `.service` → `grant_control` |
+| `install_service` | `runner_dir, url, token, name, labels, work, grant_sid` | `installer.configure(..., run_as_service=True)` → 读 `.service` → `grant_control` → 确认服务 15 s 内没有退出（退出了就把最新 Runner 日志里的 `WRITE ERROR:` 行放进结果；注册保留，由调用方按失败回滚） |
 | `convert_to_service` | 上面 + `remove_token` | `installer.unconfigure` → `configure(run_as_service=True)` → `grant_control` |
-| `remove_service` | `runner_dir, remove_token, service_name` | `installer.unconfigure`（S9：预期 config.cmd 自己停服务、删服务）；目录不在时 `service.delete` |
+| `remove_service` | `runner_dir, remove_token, service_name` | `installer.unconfigure`（config.cmd 自己停服务、删服务和本地组）；目录不在时 `service.delete` |
 | `control_service` | `service_name, action` | 未授权的服务（导入的、或用户选了“每次 UAC”）启停 |
 | `grant_control` | `service_name, sid` | 导入的服务 runner 补授权（“授权启停…”） |
 
@@ -115,27 +115,28 @@ def run_elevated(op: str, payload: dict, *, timeout_s: float = 300) -> ElevatedR
 
 ### 2.4 `installer.py`
 
-`build_config_command(..., run_as_service: bool = False)` 追加 `--runasservice`；超时同 configure（120 s，S1 若更慢再调）。服务模式下 `.env` 在 configure **之前**写（服务装完可能立即启动，S1/S4 确认）。
+`build_config_command(..., run_as_service: bool = False)` 追加 `--runasservice`；超时同 configure（120 s，实测 7 s）。服务模式下 `.env` 在 configure **之前**写（服务装完立即启动；config.cmd 不改 `.env`）。进程模式维持现状（注册后写）。
 
 ### 2.5 `manager.py`
 
-- `plan_add(..., mode=RunnerMode.SERVICE)`：步骤多一步 `ELEVATE`（“等待管理员授权（UAC）…”）。下载 / 解压 / ACL / `.env` 不提权；拿到注册 token 后 `run_elevated("install_service")`。UAC 取消或失败 → 和进程模式一样回滚（删目录；已注册则 API DELETE）。
+- `plan_add(..., mode=RunnerMode.SERVICE)`：runner 目录在当前用户主目录（`%USERPROFILE%`）下时拒绝（NETWORK SERVICE 列不了上级目录，服务必然起不来，spike-notes §12）；步骤多一步 `ELEVATE`（“等待管理员授权（UAC）…”）。下载 / 解压 / ACL / `.env` 不提权；拿到注册 token 后 `run_elevated("install_service")`。UAC 取消或失败 → 和进程模式一样回滚（删目录；已注册则 API DELETE）。
 - `start_service(record)` / `stop_service(record)`：先 SCM；`ElevationRequiredError` 时由 controller 决定是否走 `control_service`（一次 UAC）。
 - `remove_runner(SERVICE)`：remove token → `run_elevated("remove_service")` → 普通权限删目录（S9）→ 删记录。提权失败 / 取消时什么都不删。
 - `convert_to_service(record_id)`：进程模式且已停止才可以；remove token + 注册 token → `run_elevated("convert_to_service")` → 记录改成 `mode=SERVICE`、新 `github_runner_id`、`service_name`。**已知风险**：注销成功、装服务失败时 runner 已从 GitHub 注销，记录保持进程模式，状态显示“已在 GitHub 端被删除”，错误信息说明“删除记录后重新添加”。
 - `import_runner`：目录有 `.service` → 导入为 SERVICE 记录（读服务名）；之后可“授权启停…”。
-- `statuses()` / `_local_snapshot`：SERVICE 记录的本地状态来自 `service.query`：RUNNING → IDLE（是否 busy 由远端 / 日志决定，**【待 spike】S7**），START_PENDING → STARTING，STOP_PENDING → STOPPING，STOPPED → STOPPED，MISSING → ERROR（“服务已不存在”），UNKNOWN → 原样交给合并规则。
+- `statuses()` / `_local_snapshot`：SERVICE 记录的本地状态来自 `service.query` + Runner 日志（§2.7）：RUNNING → 日志解析出的 STARTING / IDLE / BUSY（日志读不到时 IDLE，busy 看远端），START_PENDING → STARTING，STOP_PENDING → STOPPING，STOPPED 且退出码 0 → STOPPED，STOPPED 且退出码非 0 → ERROR（detail = 最新 Runner 日志的最后一条 `WRITE ERROR:`），MISSING → ERROR（“服务已不存在”），UNKNOWN → 原样交给合并规则。
 - `start_all` / `stop_all`：包含已授权的服务 runner；需要 UAC 的跳过并汇总提示。退出 RunnerDeck、注销、`emergency_stop_all` **不动**服务 runner。
 - `kill_external` / `take_over` 对服务 runner 仍拒绝；discover 已把含 `.service` 的目录标成 service（M3）。
 
 ### 2.6 状态合并（`status.merge_status`）
 
-服务记录走同一套规则，补两点：本地 STOPPED + 远端 ONLINE 不显示 EXTERNAL，在 90 s 内显示 STOPPED（`DETAIL_OFFLINE_LAG`），之后 STALLED 改为 ERROR“服务已停止但 GitHub 仍在线”；服务记录没有 SESSION_LINGERING（强杀不由我们做）。具体以 S5 的 offline 延迟为准。
+服务记录走同一套规则，补两点：本地 STOPPED + 远端 ONLINE 不显示 EXTERNAL，在 90 s 内显示 STOPPED（`DETAIL_OFFLINE_LAG`；实测停止后约 36 s 变 offline），之后显示 ERROR“服务已停止但 GitHub 仍在线”；服务记录没有 SESSION_LINGERING（SCM 停止都是优雅的，强杀不由我们做）。
 
-### 2.7 服务模式的输出、job 与通知【待 spike】S7
+### 2.7 服务模式的输出、job 与通知（S7 已确认）
 
-- 若 `_diag/Runner_*.log` 有 job 开始 / 结束行：controller 的 5 s 重算顺带读最新 Runner 日志的新增字节，喂给 `process` 的同一个解析器，得到 busy / 当前 job / job 结果 → 状态和通知与进程模式一致；详情页的“实时输出”对服务 runner 显示这份日志的尾部。
-- 若没有：busy 只看 GitHub 的 `busy`，job 结束通知改为“busy → 空闲”时查最近一次 run 的结论（需要 Actions: Read）；“实时输出”页隐藏，只留诊断日志。
+- `diag.LogFollower(runner_dir)`（core，纯文件 IO）：跟踪 `_diag` 里最新的 `Runner_*.log`（每次 Listener 启动换一个新文件，跟随时切到最新的），每次 `poll()` 返回新增的完整行；`[... INFO Terminal] WRITE LINE: <line>` 去前缀得到 stdout 行，`[... ERR  Terminal] WRITE ERROR: <line>` 记为最后一条错误。首次跟踪从文件尾部 64 KB 开始，只用来恢复当前状态，不对其中已结束的 job 发通知。
+- controller 的 5 s 重算对每个运行中的服务 runner 调一次 `poll()`，把 stdout 行喂给 `process` 的同一个解析器 → busy / 当前 job / job 结果、状态和通知与进程模式一致；详情页“实时输出”对服务 runner 显示这些行。
+- 事件日志（来源 `ActionsRunnerService`）有同样内容，不用：要多一个 pywin32 依赖面，而 Runner 日志已经够用。
 
 ### 2.8 app / ui
 
@@ -173,13 +174,13 @@ def run_elevated(op: str, payload: dict, *, timeout_s: float = 300) -> ElevatedR
 
 ## 6. `runners_root` 的 ACL（M3 遗留）
 
-- `installer.harden_root_dir(path)`：与 `harden_runner_dir` 相同的受保护 DACL（Administrators、SYSTEM、当前用户完全控制，继承到子项）。已加固的 runner 目录本身是受保护 DACL，不受影响；服务 runner 的目录由 config.cmd 另加服务账号（S3 验证根目录加固后服务仍可访问）。
+- `installer.harden_root_dir(path)`：受保护 DACL = Administrators、SYSTEM、当前用户完全控制（继承到子项）+ **`Authenticated Users:(RX)` 只作用于本层**（服务的 Listener 启动时要能列出每一级上级目录，否则直接退出，spike-notes §12）。别的用户能看到 runner 目录名，但不能在根目录里创建或改动任何东西。已加固的 runner 目录本身是受保护 DACL，不受影响；服务 runner 的目录由 config.cmd 另加 `GITHUB_ActionsRunner_*` 组。
 - 添加 runner 时，根目录不存在、由 RunnerDeck 创建 → 自动加固。
 - 设置页“runner 根目录”下加“加固权限”按钮（确认框说明效果）；根目录是盘符根、用户主目录或系统目录时拒绝。
 
-## 7. runner 版本（M3 遗留）【待 spike】S11
+## 7. runner 版本（M3 遗留）
 
-`runner_file.read_runner_version(runner_dir) -> str | None`（按 S11 的结论读文件版本，按 mtime 缓存）；`RunnerStatusRow` / 详情页头部显示“版本 2.338.1”。读不到显示“—”。顺带改正 CHANGELOG 里提前写了的“runner version”。
+`runner_file.read_runner_version(runner_dir) -> str | None`：`bin\Runner.Listener.exe` 的 FileVersion（`win32api.GetFileVersionInfo`，`2.338.1.0` 取前三段；S11），按 mtime 缓存，不起子进程；`RunnerStatusRow` / 详情页头部显示“版本 2.338.1”。读不到显示“—”。顺带改正 CHANGELOG 里提前写了的“runner version”。
 
 ## 8. 检查新版本（可选）
 
@@ -213,7 +214,7 @@ def run_elevated(op: str, payload: dict, *, timeout_s: float = 300) -> ElevatedR
 
 ## 11. 实现顺序（顺序实现，每步可跑闭环、本地全绿后提交并推 main）
 
-0. spike S1–S11（`ssh XM`）→ `spike-notes.md §12`、fixtures、本文 §13 修订 → 向用户报告结论，有颠覆性发现再确认。
+0. ~~spike S1–S11~~（已完成，spike-notes §12）。
 1. 依赖与小项：pywin32 / PyYAML、互斥量、runner 版本（§7）、根目录加固（§6）、代理 `.env`（§3）。
 2. 服务 core：`service` / `elevate` / `elevated`、installer、manager、CLI（§2.2–2.5、2.9）；XM 上用提权的 SSH 会话跑 CLI 全流程（`elevated` 子命令直接调用；UAC 弹窗本身留给 D1）。
 3. 服务 app / ui（§2.6–2.8）。
@@ -244,4 +245,13 @@ def run_elevated(op: str, payload: dict, *, timeout_s: float = 300) -> ElevatedR
 
 ## 13. 实现后的修订（以代码为准）
 
-（spike 与实现后填写）
+**spike（2026-10-24）**
+- 根目录加固必须给 `Authenticated Users` 留本层的列目录权限（§6）；runner 目录在用户主目录下时拒绝服务模式（§2.5）。
+- 服务装完立即启动、延迟自动启动；Listener 启动失败时服务 STOPPED + 退出码 1，错误原文在 Runner 日志的 `WRITE ERROR:` 行（§2.2、§2.3、§2.5）。
+- 授权 ACE 定为 `CCLCRPWPLORC`（§2.2）。
+- 服务模式的状态、job 与通知改从 Runner 日志的 `WRITE LINE:` 行解析（§2.7），不再走“查最近 run”的备选方案。
+- runner 版本读 `Runner.Listener.exe` 的文件版本（§7）。
+- 转服务确认是“注销 → `--runasservice`”，`.env` 保留、id 变（§2.5 原文成立）。
+- 非管理员跑 `--runasservice` 的报错没测到（SSH 里拿不到能起子进程的受限令牌）；产品不会这样调用。
+
+（实现后继续填写）

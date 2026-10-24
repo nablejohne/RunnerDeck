@@ -222,3 +222,63 @@ The runner no longer exists on the server. Cleaning up local configuration.
 - 强杀约 1 分钟后重新启动：显示 RECONNECTING（等待旧会话过期），Ctrl+Break 优雅停止正常（`graceful=True`）。
 - 真机 `pytest`：2328 passed、12 skipped（SSH 会话有控制台，真实 helper / Ctrl+Break 用例都执行了）。**坑**：cmd 里 `set X=v & ...` 会把 `&` 前的空格写进值（`QT_QPA_PLATFORM="offscreen "` -> Qt 找不到插件、进程静默退出、输出为空），要写成 `set "X=v"`。
 
+
+## 12. M4 服务模式 spike（2026-10-24，`ssh XM`，runner 2.338.1）
+
+脚本只在 XM 上临时运行（`D:\tmp\spike_m4.py`，pywin32），用 sandbox 仓库临时注册 `XM-svc1`（id 29）、`XM-proc1`（id 30 → 转服务后 31），测完全部移除（服务、本地组、目录、GitHub 注册都没有残留）。sandbox 的 `spike.yml` 加了 `label`（默认 `runnerdeck-spike`）和 `probe` 两个输入，让 job 只派给指定标签的 runner。**SSH 会话是管理员高完整性令牌**（`S-1-16-12288`，`TokenElevation=1`），需要管理员的命令都直接在 SSH 里跑；UAC 弹窗本身只能在桌面测（m4-design D1）。
+
+### 安装（`config.cmd --unattended ... --runasservice`）
+
+- 约 7 s，rc 0。输出在 `√ Settings Saved.` 之后多出：`Granting file permissions to 'NT AUTHORITY\NETWORK SERVICE'.`、`Service actions.runner.{owner}-{repo}.{name} successfully installed` / `set recovery option` / `set to delayed auto start` / `configured`、`Waiting for service to start...`、`... started successfully`。**装完立即启动。**
+- 服务名 `actions.runner.nablejohne-runnerdeck-sandbox.XM-svc1`，写在 runner 目录的 `.service`（纯文本一行）；显示名 `GitHub Actions Runner (nablejohne-runnerdeck-sandbox.XM-svc1)`；可执行文件 `"<dir>\bin\RunnerService.exe"`；启动类型自动（延迟启动）+ 失败重启；账号 `NT AUTHORITY\NETWORK SERVICE`。
+- config.cmd 新建本地组 `GITHUB_ActionsRunner_G<6 位十六进制>`（成员 NETWORK SERVICE，每个服务一个），并给它 runner 目录 `(OI)(CI)(F)`；我们加固过的 DACL 其余部分不变。不生成 `.path`；不改 `.env`（之前写好的 `PSExecutionPolicyPreference` 原样保留）。
+- 已注册的目录再跑 `--runasservice`：`Cannot configure the runner because it is already configured...`，rc 1，0.7 s。**进程模式转服务 = `config.cmd remove` 后再 `--runasservice`**：可行，`.env`、`_diag` 保留，agentId 变了（30 → 31）。
+- 非管理员令牌下跑 `--runasservice` 的报错**没测到**：提权 SSH 会话里 `runas /trustlevel:0x20000` 仍给高完整性令牌；用 `CreateRestrictedToken`（Administrators 仅拒绝 + Medium）起子进程在 SSH 里 `0xC0000142`（拿不到窗口站）。产品永远经 UAC 跑这一步，影响不大。
+
+### 根目录 ACL：**Listener 要能列出每一级上级目录**
+
+第一次装在只给 Administrators / SYSTEM / 当前用户的根目录 `D:\tmp\m4spike` 下（与 `harden_runner_dir` 相同的 DACL）：服务启动后立刻退出（服务 STOPPED，`Win32ExitCode=1`），Runner 日志：
+
+```text
+[... ERR  Terminal] WRITE ERROR: An error occurred: Permission to read the directory contents is required for 'D:\tmp\m4spike\XM-svc1' and each directory up the hierarchy. Access to the path 'D:\tmp\m4spike' is denied.
+```
+
+事件日志随后是 `Runner listener exit with terminated error, stop the service, no retry needed.`。给根目录加一条**只作用于本层**的 `Authenticated Users:(RX)` 后，服务正常。结论：根目录加固要保留列目录权限；runner 放在当前用户的主目录下（`C:\Users\<me>` 不让 NETWORK SERVICE 列）时服务模式必然失败。
+
+### 启停（SCM，`win32service`）
+
+| 场景 | 结果 |
+| --- | --- |
+| 空闲时 STOP | 1.0 s STOPPED；日志 `Exiting...`（优雅）；GitHub 约 36 s 后 offline |
+| 停止后立即 START | 0.2 s RUNNING；约 10 s 后 online、`Listening for Jobs`；没有 Conflict |
+| 执行 job 时 STOP | 5.4 s STOPPED；`Job spike completed with result: Canceled`；run 结论 failure |
+| 首次启动、不配代理 | 约 70 s 才 online（`GetConnectionData` 重试了一分多钟）；XM 能直连 GitHub |
+
+### 授权启停
+
+- 服务默认 DACL：`(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)`：交互用户只能查询；**网络登录（如 SSH）的非管理员连查询都被拒**（5）。
+- 追加 `(A;;LCRPWPLORC;;;<用户 SID>)`（`SetServiceObjectSecurity`）后，非管理员令牌（同一用户、Administrators 仅拒绝、Medium，`ImpersonateLoggedOnUser` 模拟）能启动 / 停止 / 查询状态。产品授权时再加 `CC`（查询配置），网络登录下也能读启动类型和账号。
+- 非管理员测试方法：在本进程里 `ImpersonateLoggedOnUser(受限令牌)`，SCM 和文件系统的访问检查都按线程令牌做；不要用它测要起子进程的东西。
+
+### 服务模式的日志
+
+- `_diag\Runner_<utc>.log` 每次 Listener 启动一个新文件（属主 NETWORK SERVICE，继承 ACL，当前用户可读）；`Worker_*.log` 同理。
+- **stdout 原样进 Runner 日志**：`[2026-10-24 06:08:11Z INFO Terminal] WRITE LINE: 2026-10-24 06:08:11Z: Running job: spike`，`... WRITE LINE: ...: Job spike completed with result: Succeeded`，`... WRITE LINE: Exiting...`；错误是 `[... ERR  Terminal] WRITE ERROR: ...`。去掉 `[...] WRITE LINE: ` 前缀后就是进程模式的 stdout 行，§4 的关键字原样适用。
+- Windows 事件日志（Application，来源 `ActionsRunnerService`，事件 ID 100）也有同样的行，外加 `Starting Actions Runner Service` 和服务启停；ID 0 是“服务已成功启动 / 停止”（本地化文字）。
+- 版本：`Listener] Version: 2.338.1`。
+
+### job 以 NETWORK SERVICE 运行
+
+`whoami` = `nt authority\network service`，`USERPROFILE=C:\WINDOWS\ServiceProfiles\NetworkService`；PATH 是机器级 PATH（里面指向 `C:\Users\RCHC\...` 的条目读不了：`where python` 找不到 Python39，`git`（Program Files）正常）。`.env` 的 `PSExecutionPolicyPreference=RemoteSigned` 生效（`policy=RemoteSigned`）。
+
+### 代理
+
+`.env` 写 `https_proxy` / `http_proxy`（v2rayN `127.0.0.1:10808`）后重启服务：Runner 日志 `Configuring anonymous proxy http://127.0.0.1:10808 for all HTTPS requests.`，job 里能看到两个变量，`curl api.github.com` 经代理 0.38 s。XM 本身能直连，所以没能证明“不写就连不上”；服务账号不读当前用户的系统代理（WinINET 是按用户的）。
+
+### 移除
+
+管理员 `config.cmd remove --token`（服务在运行）：`Removing service` → `Waiting for service to stop...` → `√ Runner service removed` → `√ Runner removed successfully`，约 5–7 s；服务（1060）和本地组都删掉了。之后**非管理员令牌能删掉整个目录**（`_work` / `_diag` 里 NETWORK SERVICE 建的文件继承了目录 ACL）。
+
+### runner 版本
+
+`win32api.GetFileVersionInfo(<dir>\bin\Runner.Listener.exe)`：FileVersion `2.338.1.0`，ProductVersion `2.338.1+e78522a9…`；`Runner.Listener.exe --version` 输出 `2.338.1`。目录里只有 `bin`、`externals`（没有自更新留下的 `bin.<ver>`）。
