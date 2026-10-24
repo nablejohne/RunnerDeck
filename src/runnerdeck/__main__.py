@@ -239,6 +239,7 @@ class _Lifecycle:
         self._controller = controller
         self._window = window
         self.session_ending = False
+        self.session_filter: Any = None  # app/session_end.py, kept alive here
 
     def on_commit_data(self, _manager: object = None) -> None:
         """Logoff / shutdown: signal every runner to stop, without waiting. Never raises.
@@ -251,6 +252,19 @@ class _Lifecycle:
             self._window.on_session_end()
         except Exception:  # noqa: BLE001 - see docstring
             log.exception("on_session_end failed")
+
+    def on_session_cancelled(self) -> None:
+        """WM_ENDSESSION(FALSE): the logoff was cancelled after on_commit_data stopped the
+        runners. Start them again and quit normally from now on. Runs once per logoff (the
+        message reaches every top-level window). Never raises."""
+        if not self.session_ending:
+            return
+        self.session_ending = False
+        try:
+            count = self._controller.resume_after_cancelled_logoff()
+            self._window.on_session_resumed(count)
+        except Exception:  # noqa: BLE001 - called from the native event filter
+            log.exception("resuming after the cancelled logoff failed")
 
     def on_about_to_quit(self) -> None:
         """Safety net: quitting by any route other than quit_app() still stops the runners."""
@@ -325,6 +339,9 @@ def _run_app(app: Any, *, autostart: bool, factories: _Factories) -> int:
         has_tray = _has_tray(window)
         lifecycle = _Lifecycle(controller, window)
         _connect_app(app, lifecycle, has_tray=has_tray)
+        from runnerdeck.app import session_end
+
+        lifecycle.session_filter = session_end.install(app, lifecycle.on_session_cancelled)
         instance.message_received.connect(lifecycle.on_message)
 
         poller = factories.poller(controller)

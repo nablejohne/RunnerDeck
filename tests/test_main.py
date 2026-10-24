@@ -779,3 +779,28 @@ def test_default_instance_factory_uses_the_data_directory(
     instance = entry._default_instance_factory()
     assert isinstance(instance, SingleInstance)
     assert instance.name == server_name(paths.local_dir())
+
+
+def test_lifecycle_resumes_after_a_cancelled_logoff() -> None:
+    calls: list[Any] = []
+
+    class Controller:
+        def resume_after_cancelled_logoff(self) -> int:
+            calls.append("resume")
+            return 2
+
+    class Window:
+        def on_session_end(self) -> None:
+            calls.append("end")
+
+        def on_session_resumed(self, count: int) -> None:
+            calls.append(("resumed", count))
+
+    lifecycle = entry._Lifecycle(controller=Controller(), window=Window())
+    lifecycle.on_session_cancelled()  # no logoff in progress: ignored
+    assert calls == []
+    lifecycle.on_commit_data()
+    lifecycle.on_session_cancelled()
+    lifecycle.on_session_cancelled()  # the message reaches every top-level window
+    assert calls == ["end", "resume", ("resumed", 2)]
+    assert not lifecycle.session_ending

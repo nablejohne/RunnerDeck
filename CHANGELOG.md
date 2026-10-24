@@ -71,6 +71,8 @@ job fails.
   session end.
 
 ### Fixed
+- Cancelling a Windows sign-out ("仍要注销 / 取消") left the runners RunnerDeck had already
+  told to stop stopped; they now start again once they have stopped.
 - Whether a runner was killed or stopped gracefully was only kept in memory: after a restart,
   or a `runnerdeck-cli stop` from another terminal, a killed runner showed as "被其他进程运行"
   until its GitHub session expired. Stop records are now saved per runner under

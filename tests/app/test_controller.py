@@ -1864,3 +1864,21 @@ def test_check_updates(make_controller: Any, qtbot: Any) -> None:
     with qtbot.waitSignal(h.controller.update_checked, timeout=WAIT_MS) as blocker:
         h.controller.check_updates()
     assert blocker.args[0].error == "网络不通"
+
+
+def test_resume_after_cancelled_logoff(make_controller: Any, qtbot: Any) -> None:
+    a, b = record_model("a", repo="one"), record_model("b", repo="two")
+    h = _started(make_controller, qtbot, a, b)
+    first_a = h.process(a.id)
+    assert h.controller.emergency_stop_all() == 2
+    assert h.controller.resume_after_cancelled_logoff() == 2
+    assert h.controller.resume_after_cancelled_logoff() == 0  # once per logoff
+    qtbot.wait(700)
+    assert h.process(a.id) is first_a  # still stopping: not restarted yet
+    for record in (a, b):
+        h.process(record.id)._running = False  # the runners exit after Ctrl+Break
+    qtbot.waitUntil(lambda: h.process(a.id) is not first_a, timeout=WAIT_MS)
+    for record in (a, b):
+        _wait_idle(qtbot, h, record.id)
+        assert h.controller.is_running(record.id)
+    assert not h.controller._resume_timer.isActive()

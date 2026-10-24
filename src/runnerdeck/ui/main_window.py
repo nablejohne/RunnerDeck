@@ -320,3 +320,8 @@ class MainWindow(FluentWindow):
             log.exception("emergency stop failed")
             return
         log.info("session ending: signalled %d runner(s) to stop", count)
+
+    def on_session_resumed(self, count: int) -> None:
+        """The logoff was cancelled after on_session_end(): `count` runners restart."""
+        if count and self.tray is not None:
+            self.tray.notify("注销已取消", f"正在重新启动 {count} 个 runner")

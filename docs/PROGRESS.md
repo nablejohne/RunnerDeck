@@ -20,7 +20,7 @@
 - [x] 2 服务 core（service / elevate / elevated、installer、manager、CLI）：XM 提权 SSH 下 CLI 全流程通过（添加→job→停/启→转服务→移除，无残留），真机 pytest 2486 passed；修订见 m4-design §13
 - [x] 3 服务 app / ui：向导选项、卡片 / 详情 / 托盘、转服务 / 授权、Runner 日志解析的状态与 job 通知（桌面验收放在第 8 步）
 - [x] 4 Workflow 扫描、最近运行、检查更新（XM 上用真实 PAT 验证了接口）
-- [ ] 5 取消注销后恢复
+- [x] 5 取消注销后恢复（`WM_ENDSESSION(FALSE)` 原生事件过滤器 + 等停下后重启；桌面验证放在第 8 步）
 - [ ] 6 打包与发布：Inno Setup、CI 安装冒烟、SHA256SUMS、来源证明
 - [ ] 7 独立评审（1 个 reviewer）
 - [ ] 8 CI 绿 → 真机 pytest → 桌面验收 → 发布 v1.0.0 → 回流评估

@@ -89,6 +89,8 @@ REMERGE_INTERVAL_MS = 5000  # re-merge every display: some states only change wi
 # Same as core.diag.DIAG_DIR (core.diag is only imported inside CoreDiag's calls).
 DIAG_DIR = "_diag"
 INSIGHTS_TTL = timedelta(minutes=10)
+RESUME_TIMEOUT = timedelta(seconds=120)  # a job is cancelled first (spike §10: ~15 s)
+RESUME_POLL_MS = 500
 AUTOSTART_SKIPPED = "runner 目录下已有其他进程在运行，未自动启动："
 AUTOSTART_UNSUPPORTED = "开机自启只支持 Windows"
 
@@ -322,6 +324,11 @@ class RunnerController(QObject):
         self._locals: dict[str, LocalSnapshot] = {}  # last row.local
         self._service_logs: dict[str, _ServiceLog] = {}  # service runners' Runner logs
         self._insights: dict[str, RepoInsights] = {}  # load_repo_insights cache
+        self._session_stopped: list[str] = []  # signalled by the last emergency_stop_all
+        self._resume_pending: dict[str, datetime] = {}  # id -> give up after
+        self._resume_timer = QTimer(self)
+        self._resume_timer.setInterval(RESUME_POLL_MS)
+        self._resume_timer.timeout.connect(self._on_resume_timer)
         # Anonymous client for the app's own release check (the PAT is not needed there).
         self._release_client = release_client or (lambda proxy: GitHubClient(None, proxy=proxy))
         self._service_polling = False
@@ -1280,17 +1287,49 @@ class RunnerController(QObject):
         """Windows is logging off / shutting down: ask every running runner to stop
         (RunnerProcess.signal_stop: no waiting, no kill, no disk IO) and return how many were
         asked. Main thread, never blocks."""
-        count = 0
+        signalled: list[str] = []
         for rid, proc in list(self._processes.items()):
             if not proc.is_running():
                 continue
             try:
                 if proc.signal_stop():
-                    count += 1
+                    signalled.append(rid)
             except Exception:  # one runner must not keep the others from being signalled
                 log.exception("emergency stop of %s failed", rid)
-        log.info("emergency stop: signalled %d runner(s)", count)
-        return count
+        self._session_stopped = signalled  # resumed if the logoff gets cancelled
+        log.info("emergency stop: signalled %d runner(s)", len(signalled))
+        return len(signalled)
+
+    def resume_after_cancelled_logoff(self) -> int:
+        """The logoff / shutdown that emergency_stop_all() reacted to was cancelled
+        (WM_ENDSESSION with wParam FALSE, app/session_end.py): start those runners again once
+        each has actually stopped (a job is cancelled first, up to RESUME_TIMEOUT). Returns
+        how many will be restarted; a second call before the next logoff returns 0."""
+        ids = [rid for rid in self._session_stopped if self._config.get(rid) is not None]
+        self._session_stopped = []
+        if not ids:
+            return 0
+        deadline = self._clock() + RESUME_TIMEOUT
+        for rid in ids:
+            self._resume_pending[rid] = deadline
+        if not self._resume_timer.isActive():
+            self._resume_timer.start()
+        log.info("logoff cancelled: restarting %d runner(s) once they stopped", len(ids))
+        return len(ids)
+
+    def _on_resume_timer(self) -> None:
+        now = self._clock()
+        for rid, deadline in list(self._resume_pending.items()):
+            if self._config.get(rid) is None:
+                del self._resume_pending[rid]
+            elif not self.is_running(rid) and not self.is_busy(rid):
+                del self._resume_pending[rid]
+                self.start(rid)
+            elif now > deadline:
+                del self._resume_pending[rid]
+                log.warning("runner %s did not stop after the cancelled logoff", rid)
+        if not self._resume_pending:
+            self._resume_timer.stop()
 
     # --- bridge slots (main thread) ---------------------------------------------------------------
 
