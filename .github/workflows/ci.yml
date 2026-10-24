@@ -119,6 +119,13 @@ jobs:
           $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
           if (-not (Test-Path $run)) { New-Item -Path $run | Out-Null }  # a fresh runner profile has none
           Set-ItemProperty -Path $run -Name 'RunnerDeck' -Value "`"$app\RunnerDeck.exe`" --autostart"
+          # Upgrade over an older install: its leftover dist-info must go (it shadowed the version).
+          $stale = Join-Path $app '_internal\runnerdeck-0.0.1.dist-info'
+          New-Item -ItemType Directory -Path $stale | Out-Null
+          Set-Content -LiteralPath (Join-Path $stale 'METADATA') -Value "Metadata-Version: 2.1`nName: runnerdeck`nVersion: 0.0.1"
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "upgrade setup exited $($p.ExitCode)" }
+          if (Test-Path $stale) { throw "upgrade kept a stale dist-info: $stale" }
           $out = (& "$app\runnerdeck-cli.exe" --version | Out-String).Trim()
           Write-Host "installed runnerdeck-cli --version -> '$out'"
           if ($out -notlike "*$expected*") { throw "installed CLI is not $expected" }

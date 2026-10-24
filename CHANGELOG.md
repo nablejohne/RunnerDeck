@@ -5,6 +5,13 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-10-24
+
+### Fixed
+- Upgrading in place with the setup.exe left the previous version's files in `_internal`,
+  so RunnerDeck kept reporting the old version number (settings → 关于, update check). The
+  installer now replaces `_internal` as a whole.
+
 ## [1.0.1] - 2026-10-24
 
 ### Fixed

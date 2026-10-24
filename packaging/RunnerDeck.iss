@@ -62,6 +62,11 @@ chinesesimplified.KeptData=RunnerDeck 已卸载。你的设置、runner 目录�
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
+[InstallDelete]
+; An upgrade over an older version must not keep its PyInstaller files: a leftover
+; runnerdeck-<old>.dist-info made the new version report the old version number.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
