@@ -39,7 +39,16 @@ from typing import Any
 
 import psutil
 
-from runnerdeck.core import diag, installer, process, release, runner_file, service, winproc
+from runnerdeck.core import (
+    diag,
+    installer,
+    process,
+    release,
+    runner_file,
+    service,
+    winproc,
+    workflows,
+)
 from runnerdeck.core.elevate import ElevatedResult, Elevator
 from runnerdeck.core.errors import (
     ElevationRequiredError,
@@ -62,6 +71,7 @@ from runnerdeck.core.models import (
     ProxyApplyResult,
     RemoteRunner,
     RemoteStatus,
+    RepoInsights,
     RunnerMode,
     RunnerRecord,
     StrayRunner,
@@ -1574,6 +1584,25 @@ class RunnerManager:
             current_job=proc.current_job,
             last_error=proc.last_error,
         )
+
+    # --- workflow insights (docs/m4-design.md §4) ------------------------------------------
+
+    def repo_insights(self, record_id: str) -> RepoInsights:
+        """The repo's workflow jobs matched against this runner's labels (GitHub's list when
+        it answers, else defaults + the record's) and its newest runs."""
+        record = self._require_record(self._store.load(), record_id)
+        with closing(self._client_factory()) as client:
+            remote_labels: list[str] | None = None
+            if record.github_runner_id is not None:
+                try:
+                    found = client.get_runner(record.owner, record.repo, record.github_runner_id)
+                    remote_labels = list(found.labels) if found is not None else None
+                except RunnerDeckError as e:
+                    log.info("runner labels of %s unavailable: %s", record.name, e)
+            labels = workflows.runner_labels(record.labels, remote_labels)
+            return workflows.collect_insights(
+                client, record.owner, record.repo, labels, now=self._clock()
+            )
 
     # --- service mode (docs/m4-design.md §2.5) ------------------------------------------
 

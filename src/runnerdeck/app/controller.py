@@ -31,15 +31,16 @@ import sys
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
 from PyQt5.QtCore import QObject, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices
 
+from runnerdeck import __version__
 from runnerdeck.app.workers import Task, submit
-from runnerdeck.core import account, diag, runner_file, secrets
+from runnerdeck.core import account, diag, runner_file, secrets, update_check
 from runnerdeck.core.errors import InvalidInputError, RunnerDeckError
 from runnerdeck.core.github_client import GitHubClient
 from runnerdeck.core.manager import (
@@ -60,8 +61,10 @@ from runnerdeck.core.models import (
     ProxyApplyResult,
     RemoteStatus,
     Repo,
+    RepoInsights,
     RunnerMode,
     RunnerRecord,
+    UpdateInfo,
 )
 from runnerdeck.core.process import (
     EventKind,
@@ -85,6 +88,7 @@ STEP_STOP = "stop"
 REMERGE_INTERVAL_MS = 5000  # re-merge every display: some states only change with time
 # Same as core.diag.DIAG_DIR (core.diag is only imported inside CoreDiag's calls).
 DIAG_DIR = "_diag"
+INSIGHTS_TTL = timedelta(minutes=10)
 AUTOSTART_SKIPPED = "runner 目录下已有其他进程在运行，未自动启动："
 AUTOSTART_UNSUPPORTED = "开机自启只支持 Windows"
 
@@ -271,6 +275,8 @@ class RunnerController(QObject):
     proxy_applied = pyqtSignal(object)  # ProxyApplyResult, after a proxy change was saved
     service_converted = pyqtSignal(object)  # RunnerRecord now in service mode
     service_granted = pyqtSignal(str)  # record id: start / stop no longer need UAC
+    repo_insights_loaded = pyqtSignal(str, object)  # record id, RepoInsights
+    update_checked = pyqtSignal(object)  # UpdateInfo (an error is inside, never `failed`)
     runners_root_hardened = pyqtSignal(str)  # runners root path
 
     def __init__(
@@ -286,6 +292,7 @@ class RunnerController(QObject):
         autostart: AutostartOps | None = None,
         diag: DiagOps | None = None,
         clock: Clock | None = None,
+        release_client: Callable[[str | None], GitHubClient] | None = None,
         parent: QObject | None = None,
     ) -> None:
         """Raises StoreError when config.json exists but cannot be read (never resets it).
@@ -314,6 +321,9 @@ class RunnerController(QObject):
         # Live-merge inputs and outputs per record id (see the module docstring).
         self._locals: dict[str, LocalSnapshot] = {}  # last row.local
         self._service_logs: dict[str, _ServiceLog] = {}  # service runners' Runner logs
+        self._insights: dict[str, RepoInsights] = {}  # load_repo_insights cache
+        # Anonymous client for the app's own release check (the PAT is not needed there).
+        self._release_client = release_client or (lambda proxy: GitHubClient(None, proxy=proxy))
         self._service_polling = False
         self._service_poll_again = False
         self._remotes: dict[str, RemoteSnapshot] = {}  # last row.remote of a remote refresh
@@ -1167,6 +1177,54 @@ class RunnerController(QObject):
             self._manager.harden_runners_root,
             on_finished=lambda root: self.runners_root_hardened.emit(str(root)),
         )
+
+    # --- workflow insights / update check (docs/m4-design.md §4, §8) ----------------------------
+
+    def load_repo_insights(self, record_id: str, *, force: bool = False) -> None:
+        """Workflow jobs vs. this runner's labels + recent runs, on a worker;
+        `repo_insights_loaded(id, RepoInsights)` (from a 10-minute cache unless force)."""
+        record = self._record_for("insights", record_id)
+        if record is None:
+            return
+        cached = self._insights.get(record_id)
+        if (
+            not force
+            and cached is not None
+            and cached.fetched_at is not None
+            and self._clock() - cached.fetched_at < INSIGHTS_TTL
+        ):
+            self.repo_insights_loaded.emit(record_id, cached)
+            return
+        self._submit(
+            "insights",
+            self._manager.repo_insights,
+            record_id,
+            on_finished=lambda insights: self._insights_loaded(record_id, insights),
+        )
+
+    def _insights_loaded(self, record_id: str, insights: RepoInsights) -> None:
+        if self._config.get(record_id) is None:
+            return
+        self._insights[record_id] = insights
+        self.repo_insights_loaded.emit(record_id, insights)
+
+    def check_updates(self) -> None:
+        """Ask GitHub for RunnerDeck's latest release on a worker; `update_checked(info)`."""
+        self._submit(
+            "update_check",
+            self._do_check_updates,
+            self._config.settings.proxy,
+            on_finished=self.update_checked.emit,
+            on_failed=lambda message, _e: self.update_checked.emit(
+                UpdateInfo(current=__version__, error=message)
+            ),
+            quiet=True,
+        )
+
+    def _do_check_updates(self, proxy: str | None) -> UpdateInfo:  # worker
+        with closing(self._release_client(proxy)) as client:
+            release = client.get_latest_release(*update_check.APP_REPO)
+        return update_check.compare(__version__, release)
 
     def runner_version(self, record_id: str) -> str | None:
         """The runner version installed in the record's directory (cached by the exe's

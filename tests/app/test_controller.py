@@ -1814,3 +1814,53 @@ def test_plan_add_service(make_controller: Any, qtbot: Any) -> None:
     with qtbot.waitSignal(h.controller.plan_ready, timeout=WAIT_MS):
         h.controller.plan_add(OWNER, REPO, service=True)
     assert h.manager.calls[-1][1]["mode"] is RunnerMode.SERVICE
+
+
+# --- workflow insights / update check (docs/m4-design.md §4, §8) --------------------------------
+
+
+def test_repo_insights_are_cached_for_ten_minutes(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = make_controller(records=[record])
+    for _ in range(2):
+        with qtbot.waitSignal(h.controller.repo_insights_loaded, timeout=WAIT_MS) as blocker:
+            h.controller.load_repo_insights(record.id)
+        assert blocker.args[0] == record.id
+    assert [name for name, _ in h.manager.calls].count("repo_insights") == 1
+    with qtbot.waitSignal(h.controller.repo_insights_loaded, timeout=WAIT_MS):
+        h.controller.load_repo_insights(record.id, force=True)
+    assert [name for name, _ in h.manager.calls].count("repo_insights") == 2
+
+
+class _ReleaseClient:
+    def __init__(self, release: Any) -> None:
+        self.release = release
+
+    def get_latest_release(self, owner: str, repo: str) -> Any:
+        if isinstance(self.release, Exception):
+            raise self.release
+        return self.release
+
+    def close(self) -> None:
+        pass
+
+
+def test_check_updates(make_controller: Any, qtbot: Any) -> None:
+    from runnerdeck import __version__
+
+    h = make_controller()
+    proxies: list[str | None] = []
+
+    def factory(proxy: str | None) -> _ReleaseClient:
+        proxies.append(proxy)
+        return _ReleaseClient({"tag_name": "v99.0.0", "html_url": "https://x/r"})
+
+    h.controller._release_client = factory
+    with qtbot.waitSignal(h.controller.update_checked, timeout=WAIT_MS) as blocker:
+        h.controller.check_updates()
+    (info,) = blocker.args
+    assert (info.current, info.latest, info.newer) == (__version__, "99.0.0", True)
+    h.controller._release_client = lambda _p: _ReleaseClient(RunnerDeckError("网络不通"))
+    with qtbot.waitSignal(h.controller.update_checked, timeout=WAIT_MS) as blocker:
+        h.controller.check_updates()
+    assert blocker.args[0].error == "网络不通"

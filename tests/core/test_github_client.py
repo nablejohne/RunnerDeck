@@ -1291,3 +1291,76 @@ def test_download_requires_https(
     with pytest.raises(InvalidInputError, match="下载地址"):
         client.download(url, tmp_path / "a.zip")
     assert not mock.calls
+
+
+# --- M4: workflows, runs, releases (docs/m4-design.md §4, §8) ------------------------------
+
+
+def test_list_workflow_files(mock: respx.MockRouter, client: GitHubClient) -> None:
+    items = [
+        {"name": "ci.yml", "path": ".github/workflows/ci.yml", "type": "file"},
+        {"name": "b.YAML", "path": ".github/workflows/b.YAML", "type": "file"},
+        {"name": "README.md", "path": ".github/workflows/README.md", "type": "file"},
+        {"name": "sub", "path": ".github/workflows/sub", "type": "dir"},
+    ]
+    mock.get(api("/repos/octo/demo/contents/.github/workflows")).respond(200, json=items)
+    assert client.list_workflow_files("octo", "demo") == [
+        ".github/workflows/b.YAML",
+        ".github/workflows/ci.yml",
+    ]
+
+
+def test_list_workflow_files_missing_dir_and_permission(
+    mock: respx.MockRouter, client: GitHubClient
+) -> None:
+    route = mock.get(api("/repos/octo/demo/contents/.github/workflows"))
+    route.respond(404, json={"message": "Not Found"})
+    assert client.list_workflow_files("octo", "demo") == []
+    route.respond(403, json={"message": "Resource not accessible by personal access token"})
+    with pytest.raises(PermissionDeniedError, match="Contents: Read"):
+        client.list_workflow_files("octo", "demo")
+
+
+def test_get_text_file(mock: respx.MockRouter, client: GitHubClient) -> None:
+    import base64
+
+    text = "on: push\njobs:\n  a:\n    runs-on: [self-hosted]\n"
+    encoded = base64.b64encode(("\ufeff" + text).encode()).decode()
+    route = mock.get(api("/repos/octo/demo/contents/.github/workflows/ci.yml"))
+    route.respond(200, json={"type": "file", "encoding": "base64", "content": encoded})
+    assert client.get_text_file("octo", "demo", ".github/workflows/ci.yml") == text
+    route.respond(200, json={"type": "file", "encoding": "none", "content": ""})  # > 1 MB
+    assert client.get_text_file("octo", "demo", ".github/workflows/ci.yml") is None
+    route.respond(404, json={"message": "Not Found"})
+    assert client.get_text_file("octo", "demo", ".github/workflows/ci.yml") is None
+    with pytest.raises(InvalidInputError):
+        client.get_text_file("octo", "demo", "../secrets")
+
+
+def test_list_runs(mock: respx.MockRouter, client: GitHubClient) -> None:
+    run = {
+        "id": 7, "run_number": 3, "name": "spike", "display_title": "spike", "status": "completed",
+        "conclusion": "failure", "event": "workflow_dispatch", "head_branch": "main",
+        "created_at": "2026-10-24T06:08:11Z", "html_url": "https://github.com/octo/demo/actions/runs/7",
+    }  # fmt: skip
+    route = mock.get(api("/repos/octo/demo/actions/runs"))
+    route.respond(200, json={"total_count": 1, "workflow_runs": [run]})
+    (got,) = client.list_runs("octo", "demo", per_page=5)
+    assert (got.id, got.conclusion, got.head_branch) == (7, "failure", "main")
+    assert route.calls.last.request.url.params["per_page"] == "5"
+    route.respond(403, json={"message": "Resource not accessible by personal access token"})
+    with pytest.raises(PermissionDeniedError, match="Actions: Read"):
+        client.list_runs("octo", "demo")
+
+
+def test_anonymous_client_and_latest_release(mock: respx.MockRouter) -> None:
+    route = mock.get(api("/repos/nablejohne/RunnerDeck/releases/latest"))
+    route.respond(200, json={"tag_name": "v1.0.0", "html_url": "https://x"})
+    with GitHubClient(None) as anonymous:
+        assert anonymous.get_latest_release("nablejohne", "RunnerDeck") == {
+            "tag_name": "v1.0.0",
+            "html_url": "https://x",
+        }
+        route.respond(404, json={"message": "Not Found"})
+        assert anonymous.get_latest_release("nablejohne", "RunnerDeck") is None
+    assert "authorization" not in route.calls.last.request.headers

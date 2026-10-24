@@ -37,14 +37,13 @@ from qfluentwidgets import FluentIcon as FIF
 from runnerdeck import __version__
 from runnerdeck.core import paths
 from runnerdeck.core.account import TOKEN_KIND_LABELS, format_expiry
-from runnerdeck.core.models import AppSettings, AutostartState, ProxyApplyResult
+from runnerdeck.core.models import AppSettings, AutostartState, ProxyApplyResult, UpdateInfo
 from runnerdeck.ui.components.login_dialog import LoginDialog
 from runnerdeck.ui.theme import THEME_LABELS
 
 if TYPE_CHECKING:
     from runnerdeck.app.controller import RunnerController
 
-# TODO(settings): point this at the published repository once it exists.
 REPO_URL = "https://github.com/nablejohne/RunnerDeck"
 PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
 NOT_LOGGED_IN = "未登录"
@@ -60,6 +59,7 @@ HARDEN_ROOT_CONFIRM = (
     "将改写这个目录的权限：管理员、SYSTEM 和你完全控制（子目录继承），其他用户只能列出目录名，"
     "不能在里面新建或修改文件。已有的 runner 目录各有自己的权限，不受影响。"
 )
+UPDATE_IDLE_TEXT = "到 GitHub 查看是否有新版本"
 LAUNCH_TEXT = "登录 Windows 后自动在托盘启动 RunnerDeck（并拉起设为随 RunnerDeck 启动的 runner）"
 LAUNCH_ON_TEXT = "已开启：登录 Windows 后自动在托盘启动 RunnerDeck"
 LAUNCH_DISABLED_TEXT = "已在任务管理器中禁用，请在任务管理器的‘启动’页启用"
@@ -320,7 +320,19 @@ class SettingsPage(ScrollArea):
         self.logCard = PushSettingCard(
             "打开", FIF.DOCUMENT, "日志目录", str(paths.log_dir()), self.aboutGroup
         )
+        self.updateCard = PushSettingCard(
+            "检查更新", FIF.UPDATE, "检查更新", UPDATE_IDLE_TEXT, self.aboutGroup
+        )
+        self.checkUpdatesCard = SwitchCard(
+            FIF.SYNC,
+            "启动时检查更新",
+            "RunnerDeck 启动约 30 秒后查一次 GitHub 上的最新版本（只提示，不自动安装）",
+            self.aboutGroup,
+        )
+        self._update_url: str | None = None
         self.aboutGroup.addSettingCard(self.versionCard)
+        self.aboutGroup.addSettingCard(self.updateCard)
+        self.aboutGroup.addSettingCard(self.checkUpdatesCard)
         self.aboutGroup.addSettingCard(self.repoCard)
         self.aboutGroup.addSettingCard(self.logCard)
 
@@ -343,6 +355,11 @@ class SettingsPage(ScrollArea):
         self.notifyCard.selected.connect(lambda value: self._save(notify_jobs=value))
         self.themeCard.selected.connect(lambda value: self._save(theme=value))
         self.logCard.clicked.connect(self.open_log_dir)
+        self.updateCard.clicked.connect(self.check_or_download_update)
+        self.checkUpdatesCard.checkedChanged.connect(
+            lambda checked: self._save_switch(check_updates=checked)
+        )
+        controller.update_checked.connect(self._on_update_checked)
 
         controller.config_changed.connect(self.refresh)
         controller.account_loaded.connect(self._on_account_loaded)
@@ -393,6 +410,7 @@ class SettingsPage(ScrollArea):
         try:
             self.startMinimizedCard.setChecked(settings.start_minimized)
             self.closeToTrayCard.setChecked(settings.close_to_tray)
+            self.checkUpdatesCard.setChecked(settings.check_updates)
         finally:
             self._syncing = False
         self._refresh_launch_card()
@@ -558,6 +576,29 @@ class SettingsPage(ScrollArea):
             self.accountCard.setContent("读取 token 信息失败，详情见上方提示")
 
     # --- about -------------------------------------------------------------------------
+
+    def check_or_download_update(self) -> None:
+        if self._update_url is not None:
+            QDesktopServices.openUrl(QUrl(self._update_url))
+            return
+        self.updateCard.setContent("正在检查…")
+        self.updateCard.button.setEnabled(False)
+        self._controller.check_updates()
+
+    def _on_update_checked(self, info: UpdateInfo) -> None:
+        self.updateCard.button.setEnabled(True)
+        if info.error:
+            self.updateCard.setContent(f"检查失败：{info.error}")
+        elif info.newer and info.latest:
+            self._update_url = info.url
+            self.updateCard.setContent(
+                f"有新版本 {info.latest}（当前 {info.current}），点“下载”打开发布页"
+            )
+            self.updateCard.button.setText("下载")
+        elif info.latest:
+            self.updateCard.setContent(f"已是最新版本（{info.current}）")
+        else:
+            self.updateCard.setContent("GitHub 上还没有正式版本")
 
     def open_log_dir(self) -> None:
         log_dir = paths.log_dir()

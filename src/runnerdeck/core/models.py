@@ -144,6 +144,8 @@ class AppSettings(BaseModel):
     theme: Literal["auto", "light", "dark"] = "auto"
     # Tray notification when a job ends: every job / only Failed or Abandoned / never.
     notify_jobs: Literal["all", "failed", "off"] = "failed"
+    # Look up RunnerDeck's latest release shortly after start (only shown, never installed).
+    check_updates: bool = True
 
 
 CONFIG_SCHEMA_VERSION = 1
@@ -330,6 +332,77 @@ class AutostartState:
             and self.expected is not None
             and self.command.casefold() == self.expected.casefold()
         )
+
+
+class WorkflowRun(BaseModel):
+    """One entry of GET /repos/{owner}/{repo}/actions/runs (the detail page's recent runs)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    run_number: int | None = None
+    name: str | None = None
+    display_title: str | None = None
+    status: str | None = None  # queued / in_progress / completed ...
+    conclusion: str | None = None  # success / failure / cancelled ... (None while running)
+    event: str | None = None
+    head_branch: str | None = None
+    created_at: AwareDatetime | None = None
+    html_url: str = ""
+
+
+class MatchKind(StrEnum):
+    """Whether a workflow job can be picked up by a runner (docs/m4-design.md §4)."""
+
+    OK = "ok"  # the runner has every label the job asks for
+    MISSING = "missing"  # self-hosted job, but labels the runner lacks: it queues forever
+    NOT_SELF_HOSTED = "not_self_hosted"  # a GitHub-hosted job (not shown)
+    UNKNOWN = "unknown"  # an expression (${{ }}) or a runner group: cannot tell offline
+
+
+@dataclass(frozen=True)
+class JobTarget:
+    """`runs-on` of one job. labels None: none could be read (dynamic / group only)."""
+
+    workflow: str  # .github/workflows/ci.yml
+    job: str  # the job id
+    labels: tuple[str, ...] | None
+    group: str | None = None
+    dynamic: bool = False
+
+
+@dataclass(frozen=True)
+class JobMatch:
+    target: JobTarget
+    kind: MatchKind
+    missing: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RepoInsights:
+    """What the detail page's Workflow tab shows for one runner (controller cache).
+
+    matches: self-hosted (and undecidable) jobs only. workflow_error / runs_error: why that
+    half could not be loaded (e.g. a missing PAT permission). parse_errors: unreadable files.
+    """
+
+    matches: tuple[JobMatch, ...] = ()
+    runs: tuple[WorkflowRun, ...] = ()
+    workflow_error: str | None = None
+    runs_error: str | None = None
+    parse_errors: tuple[str, ...] = ()
+    fetched_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class UpdateInfo:
+    """Result of the app's own update check (docs/m4-design.md §8)."""
+
+    current: str
+    latest: str | None = None
+    newer: bool = False
+    url: str | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)

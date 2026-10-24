@@ -523,6 +523,12 @@ class FakeManager:
     def grant_service_control(self, record_id: str) -> None:
         self._call("grant_service_control", record_id=record_id)
 
+    def repo_insights(self, record_id: str) -> Any:
+        from runnerdeck.core.models import RepoInsights
+
+        self._call("repo_insights", record_id=record_id)
+        return RepoInsights(fetched_at=NOW)
+
     def apply_proxy(self, old: str | None, new: str | None) -> ProxyApplyResult:
         self._call("apply_proxy", old=old, new=new)
         return ProxyApplyResult(updated=("r1",))

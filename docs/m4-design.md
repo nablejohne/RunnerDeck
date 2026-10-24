@@ -278,4 +278,12 @@ def run_elevated(op: str, payload: dict, *, timeout_s: float = 300) -> ElevatedR
 - ui：向导“以 Windows 服务运行”（选中后隐藏“立即启动 / 随 RunnerDeck 启动”，摘要多一行“运行方式”）；卡片名称旁“服务”标记，菜单“转为服务…”（进程，停止时可用）/“授权启停…”（服务），服务不显示“随 RunnerDeck 启动”；详情页多“运行方式”一行，菜单同卡片，服务隐藏自启开关；托盘“全部停止”把服务 runner 也算作运行中。确认框辅助函数 `confirm_convert` / `confirm_grant` 在 `runner_card.py`。
 - UAC 被取消仍走 `failed(op, "已取消：…")`，界面按普通错误提示（没有单独做成警告）。
 
-（第 4 步起继续填写）
+**第 4 步（Workflow 扫描、最近运行、检查更新）**
+- `GitHubClient(None)` 是匿名客户端（不带 Authorization）：检查更新用它，PAT 不发给不需要它的接口；`get_latest_release(owner, repo)` 没有正式版本（只有预发布）时 404 -> None，设置页显示“GitHub 上还没有正式版本”。
+- `list_workflow_files` / `get_text_file` / `list_runs`：403 改写成“PAT 缺少 Contents: Read / Actions: Read 权限”；`.github/workflows` 不存在 -> []。
+- `workflows.collect_insights` 两半各自失败、互不影响；`manager.repo_insights` 先用 GitHub 上的 runner 标签，拿不到再用默认标签 + 记录标签。
+- `runs-on` 部分是表达式（如 `[self-hosted, Windows, "${{ inputs.label }}"]`）：静态标签照样比对，缺了就是 MISSING，不缺才是 UNKNOWN。不含 `self-hosted` 但标签全部吻合的也算 OK（GitHub 按标签匹配）；不吻合的当作托管 job 不展示。
+- 详情页第三个页签“Workflow”（切过去才加载，controller 按记录缓存 10 分钟，“刷新”强制重取）；设置页“关于”多“检查更新”卡（有新版本时按钮变“下载”，打开发布页）和“启动时检查更新”开关（`AppSettings.check_updates`，默认开；`__main__` 启动 30 s 后调用一次）。
+- XM 上用真实 PAT 验证：sandbox 的 spike.yml 读到、3 条最近运行、匿名查 RunnerDeck 最新版本返回 404（目前只有预发布）。
+
+（第 5 步起继续填写）

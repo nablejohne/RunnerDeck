@@ -99,6 +99,8 @@ class FakeController(QObject):
     runners_root_hardened = pyqtSignal(str)  # runners root path
     service_converted = pyqtSignal(object)  # RunnerRecord
     service_granted = pyqtSignal(str)  # record id
+    repo_insights_loaded = pyqtSignal(str, object)  # record id, RepoInsights
+    update_checked = pyqtSignal(object)  # UpdateInfo
 
     def __init__(self, config: AppConfig | None = None, *, logged_in: bool = True) -> None:
         super().__init__()
@@ -275,6 +277,12 @@ class FakeController(QObject):
     def is_service(self, record_id: str) -> bool:
         record = self.config.get(record_id)
         return record is not None and record.mode == "service"
+
+    def load_repo_insights(self, record_id: str, *, force: bool = False) -> None:
+        self._record("load_repo_insights", record_id, force=force)
+
+    def check_updates(self) -> None:
+        self._record("check_updates")
 
     def convert_to_service(self, record_id: str) -> None:
         self._record("convert_to_service", record_id)

@@ -8,6 +8,7 @@ files happens in the controller's worker thread (load_diag_logs / load_diag_text
 
 from __future__ import annotations
 
+import html
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -27,12 +28,21 @@ from qfluentwidgets import (
     RoundMenu,
     SegmentedWidget,
     SwitchButton,
+    TextBrowser,
     TitleLabel,
     TransparentToolButton,
 )
 from qfluentwidgets import FluentIcon as FIF
 
-from runnerdeck.core.models import DiagLog, DisplayState, LocalState, RunnerMode, RunnerRecord
+from runnerdeck.core.models import (
+    DiagLog,
+    DisplayState,
+    LocalState,
+    MatchKind,
+    RepoInsights,
+    RunnerMode,
+    RunnerRecord,
+)
 from runnerdeck.core.status import DisplayStatus
 from runnerdeck.ui.components.log_view import LogView
 from runnerdeck.ui.components.runner_card import (
@@ -52,7 +62,69 @@ if TYPE_CHECKING:
     from runnerdeck.app.controller import RunnerController
 
 EMPTY_TEXT = "没有选中的 runner（可能已被移除或取消登记），请返回概览选择一个"
-TAB_OUTPUT, TAB_DIAG = "output", "diag"
+TAB_OUTPUT, TAB_DIAG, TAB_WORKFLOW = "output", "diag", "workflow"
+CONCLUSION_TEXT = {
+    "success": "成功",
+    "failure": "失败",
+    "cancelled": "已取消",
+    "skipped": "已跳过",
+    "timed_out": "超时",
+    "action_required": "待批准",
+}
+STATUS_TEXT = {
+    "queued": "排队中",
+    "in_progress": "运行中",
+    "waiting": "等待中",
+    "pending": "等待中",
+}
+
+
+def insights_html(insights: RepoInsights) -> str:
+    """The Workflow tab: which jobs this runner can take, then the recent runs (escaped)."""
+    esc = html.escape
+    parts = ["<h4>会用到 self-hosted runner 的 job</h4>"]
+    if insights.workflow_error:
+        parts.append(f"<p>无法读取 workflow：{esc(insights.workflow_error)}</p>")
+    elif not insights.matches:
+        parts.append("<p>没有找到要求 self-hosted runner 的 job。</p>")
+    else:
+        parts.append("<ul>")
+        for item in insights.matches:
+            target = item.target
+            where = f"{esc(target.workflow)} → <b>{esc(target.job)}</b>"
+            asks = ", ".join(target.labels or ()) or (target.group or "")
+            if item.kind is MatchKind.OK:
+                verdict = "✓ 这台 runner 可以接"
+            elif item.kind is MatchKind.MISSING:
+                missing = ", ".join(item.missing)
+                verdict = f"✗ 缺少标签 <b>{esc(missing)}</b>：这个 job 会一直排队"
+            else:
+                verdict = "? 使用了表达式或 runner 组，无法判断"
+            asks_text = f"（runs-on: {esc(asks)}）" if asks else ""
+            parts.append(f"<li>{where}{asks_text}<br/>{verdict}</li>")
+        parts.append("</ul>")
+    for error in insights.parse_errors:
+        parts.append(f"<p>跳过：{esc(error)}</p>")
+    parts.append("<h4>最近运行</h4>")
+    if insights.runs_error:
+        parts.append(f"<p>无法读取运行记录：{esc(insights.runs_error)}</p>")
+    elif not insights.runs:
+        parts.append("<p>还没有运行记录。</p>")
+    else:
+        parts.append("<ul>")
+        for run in insights.runs:
+            title = esc(run.display_title or run.name or f"#{run.run_number or run.id}")
+            state = CONCLUSION_TEXT.get(run.conclusion or "", run.conclusion or "") or (
+                STATUS_TEXT.get(run.status or "", run.status or "")
+            )
+            when = run.created_at.astimezone().strftime("%m-%d %H:%M") if run.created_at else ""
+            branch = f" · {esc(run.head_branch)}" if run.head_branch else ""
+            link = f'<a href="{esc(run.html_url)}">{title}</a>' if run.html_url else title
+            parts.append(f"<li>{link} — {esc(state)}{branch} · {esc(when)}</li>")
+        parts.append("</ul>")
+    return "".join(parts)
+
+
 OUTPUT_MAX_LINES = 5000  # the controller keeps 2000; room for what arrives while open
 DIAG_DIR = "_diag"  # same name as core/diag.DIAG_DIR (ui/ may not import core.diag)
 DIAG_KIND_LABELS = {"runner": "Runner", "worker": "Worker", "other": "其他"}
@@ -141,6 +213,7 @@ class RunnerDetailPage(QWidget):
         self.segmented = SegmentedWidget(self.content)
         self.segmented.addItem(TAB_OUTPUT, "实时输出")
         self.segmented.addItem(TAB_DIAG, "诊断日志")
+        self.segmented.addItem(TAB_WORKFLOW, "Workflow")
         self.tabStack = QStackedWidget(self.content)
         self.outputView = LogView(self.content, max_lines=OUTPUT_MAX_LINES)
         self.outputView.textEdit.setPlaceholderText(NO_OUTPUT_TEXT)
@@ -153,8 +226,22 @@ class RunnerDetailPage(QWidget):
         self.diagStatusLabel = CaptionLabel("", self.diagPanel)
         self.diagStatusLabel.setWordWrap(True)
         self.diagView = LogView(self.diagPanel)
+        self.workflowPanel = QWidget(self.content)
+        self.workflowRefreshButton = PushButton(FIF.SYNC, "刷新", self.workflowPanel)
+        self.workflowStatusLabel = CaptionLabel("", self.workflowPanel)
+        self.workflowView = TextBrowser(self.workflowPanel)
+        self.workflowView.setOpenExternalLinks(True)
+        workflow_layout = QVBoxLayout(self.workflowPanel)
+        workflow_layout.setContentsMargins(0, 0, 0, 0)
+        workflow_bar = QHBoxLayout()
+        workflow_bar.addWidget(self.workflowRefreshButton)
+        workflow_bar.addWidget(self.workflowStatusLabel, 1)
+        workflow_layout.addLayout(workflow_bar)
+        workflow_layout.addWidget(self.workflowView, 1)
+        self._insights_for: str | None = None  # record id the Workflow tab shows / loads
         self.tabStack.addWidget(self.outputView)
         self.tabStack.addWidget(self.diagPanel)
+        self.tabStack.addWidget(self.workflowPanel)
         self.segmented.setCurrentItem(TAB_OUTPUT)
 
         self._build_layout()
@@ -178,6 +265,8 @@ class RunnerDetailPage(QWidget):
         controller.runner_line.connect(self._on_runner_line)
         controller.diag_logs_loaded.connect(self._on_diag_logs_loaded)
         controller.diag_text_loaded.connect(self._on_diag_text_loaded)
+        controller.repo_insights_loaded.connect(self._on_insights_loaded)
+        self.workflowRefreshButton.clicked.connect(lambda: self.reload_insights(force=True))
         controller.failed.connect(self._on_failed)
 
         self.show_record(None)
@@ -289,8 +378,12 @@ class RunnerDetailPage(QWidget):
         if changed:
             self.outputView.set_lines(self._controller.output(record.id))
             self._reset_diag()
+            self._insights_for = None
+            self.workflowView.clear()
             if self.current_tab == TAB_DIAG:
                 self.reload_diag_logs()
+            elif self.current_tab == TAB_WORKFLOW:
+                self.reload_insights()
 
     def _fill_facts(self, record: RunnerRecord) -> None:
         self.nameLabel.setText(record.name)
@@ -472,9 +565,27 @@ class RunnerDetailPage(QWidget):
 
     # --- diag logs ------------------------------------------------------------------
 
-    def _on_tab_changed(self, key: str) -> None:
-        self.tabStack.setCurrentWidget(self.diagPanel if key == TAB_DIAG else self.outputView)
+    def reload_insights(self, *, force: bool = False) -> None:
         record = self._record
+        if record is None:
+            return
+        self._insights_for = record.id
+        self.workflowStatusLabel.setText("正在读取 workflow 和运行记录…")
+        self._controller.load_repo_insights(record.id, force=force)
+
+    def _on_insights_loaded(self, record_id: str, insights: RepoInsights) -> None:
+        if record_id != self._insights_for:
+            return
+        fetched = insights.fetched_at.astimezone().strftime("%H:%M") if insights.fetched_at else ""
+        self.workflowStatusLabel.setText(f"{fetched} 读取（最多缓存 10 分钟，点刷新重新读取）")
+        self.workflowView.setHtml(insights_html(insights))
+
+    def _on_tab_changed(self, key: str) -> None:
+        panels = {TAB_DIAG: self.diagPanel, TAB_WORKFLOW: self.workflowPanel}
+        self.tabStack.setCurrentWidget(panels.get(key, self.outputView))
+        record = self._record
+        if key == TAB_WORKFLOW and record is not None and self._insights_for != record.id:
+            self.reload_insights()
         if key == TAB_DIAG and record is not None and self._diag_loaded_for != record.id:
             self.reload_diag_logs()
 

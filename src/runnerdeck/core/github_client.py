@@ -28,6 +28,8 @@ direct transport, every proxy mount (also for TLS to an https:// proxy) and the 
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import ipaddress
 import logging
@@ -42,6 +44,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal, Self, TypeVar
+from urllib.parse import quote
 
 import httpx
 import truststore
@@ -63,6 +66,7 @@ from runnerdeck.core.models import (
     RemoteRunner,
     Repo,
     RunnerToken,
+    WorkflowRun,
     validate_owner_repo,
 )
 from runnerdeck.core.redact import redact, register_secret
@@ -235,6 +239,16 @@ class _SharedTransport(httpx.BaseTransport):
 # --- response helpers ------------------------------------------------------------------
 
 
+def _needs(e: PermissionDeniedError, permission: str) -> PermissionDeniedError:
+    return PermissionDeniedError(
+        f"PAT 缺少 {permission} 权限：fine-grained PAT 请在 token 设置里为该仓库加上它；"
+        "classic PAT 勾选 repo 即可",
+        status=e.status,
+        method=e.method,
+        path=e.path,
+    )
+
+
 def parse_token_expiration(value: str | None) -> datetime | None:
     """Parse `github-authentication-token-expiration` leniently; None if absent or unparsable.
 
@@ -338,7 +352,7 @@ class GitHubClient:
 
     def __init__(
         self,
-        pat: str,
+        pat: str | None,
         *,
         proxy: str | None = None,
         base_url: str = API_URL,
@@ -349,13 +363,16 @@ class GitHubClient:
 
         `transport` is for tests only: it replaces the network (proxy settings are then ignored).
         Raises InvalidInputError for an empty / malformed PAT or an unusable proxy URL.
+        pat=None: anonymous, no Authorization header; public endpoints only (the app's own
+        update check must not send the PAT anywhere it is not needed).
         """
-        register_secret(pat)
-        pat = pat.strip()
-        register_secret(pat)
-        if not pat or not pat.isascii() or not pat.isprintable() or " " in pat:
-            raise InvalidInputError("PAT 格式不正确：请粘贴 token 的值（不要包含空格或换行）")
-        self._pat = pat
+        if pat is not None:
+            register_secret(pat)
+            pat = pat.strip()
+            register_secret(pat)
+            if not pat or not pat.isascii() or not pat.isprintable() or " " in pat:
+                raise InvalidInputError("PAT 格式不正确：请粘贴 token 的值（不要包含空格或换行）")
+        self._pat = pat or ""
         self._proxy = _normalize_proxy(proxy)
         if self._proxy is not None:
             try:
@@ -372,7 +389,7 @@ class GitHubClient:
         self._http = self._new_client(
             base_url=base_url,
             headers={
-                "Authorization": f"Bearer {pat}",
+                **({"Authorization": f"Bearer {pat}"} if pat else {}),
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": API_VERSION,
                 "User-Agent": USER_AGENT,
@@ -478,6 +495,77 @@ class GitHubClient:
             path = f"{_RUNNER_RELEASES}/tags/v{match.group(1)}"
             not_found = f"找不到 runner 版本 v{match.group(1)}"
         resp = self._request("GET", path, not_found=not_found)
+        data = self._json(resp, "GET", path)
+        if not isinstance(data, dict):
+            raise self._bad_payload(resp, "GET", path)
+        return data
+
+    # --- M4: workflows, runs, releases (docs/m4-design.md §4, §8)
+
+    def list_workflow_files(self, owner: str, repo: str) -> list[str]:
+        """Paths of `.github/workflows/*.yml|yaml`; [] when the directory does not exist.
+        403 -> PermissionDeniedError naming Contents: Read."""
+        path = self._repo_path(owner, repo) + "/contents/.github/workflows"
+        try:
+            resp = self._request("GET", path, ok_statuses=frozenset({404}))
+        except PermissionDeniedError as e:
+            raise _needs(e, "Contents: Read（读取 workflow 文件）") from e
+        if resp.status_code == 404:
+            return []
+        data = self._json(resp, "GET", path)
+        if not isinstance(data, list):
+            raise self._bad_payload(resp, "GET", path)
+        return sorted(
+            str(item["path"])
+            for item in data
+            if isinstance(item, dict)
+            and item.get("type") == "file"
+            and str(item.get("name", "")).lower().endswith((".yml", ".yaml"))
+            and isinstance(item.get("path"), str)
+        )
+
+    def get_text_file(self, owner: str, repo: str, file_path: str) -> str | None:
+        """A repository file's text (contents API, base64); None for a missing file, a
+        directory or anything over 1 MB (the API then omits the content)."""
+        if ".." in file_path.split("/") or file_path.startswith("/"):
+            raise InvalidInputError(f"文件路径不合法：{file_path!r}")
+        path = self._repo_path(owner, repo) + "/contents/" + quote(file_path)
+        try:
+            resp = self._request("GET", path, ok_statuses=frozenset({404}))
+        except PermissionDeniedError as e:
+            raise _needs(e, "Contents: Read（读取 workflow 文件）") from e
+        if resp.status_code == 404:
+            return None
+        data = self._json(resp, "GET", path)
+        if not isinstance(data, dict) or data.get("type") != "file":
+            return None
+        content = data.get("content")
+        if data.get("encoding") != "base64" or not isinstance(content, str) or not content:
+            return None
+        try:
+            return base64.b64decode(content).decode("utf-8-sig", errors="replace")
+        except (ValueError, binascii.Error):
+            return None
+
+    def list_runs(self, owner: str, repo: str, per_page: int = 10) -> list[WorkflowRun]:
+        """The newest workflow runs of the repo. 403 -> PermissionDeniedError (Actions: Read)."""
+        path = self._repo_path(owner, repo) + "/actions/runs"
+        try:
+            resp = self._request("GET", path, params={"per_page": per_page})
+        except PermissionDeniedError as e:
+            raise _needs(e, "Actions: Read（读取运行记录）") from e
+        data = self._json(resp, "GET", path)
+        runs = data.get("workflow_runs") if isinstance(data, dict) else None
+        if not isinstance(runs, list):
+            raise self._bad_payload(resp, "GET", path)
+        return [self._model(WorkflowRun, item, resp, "GET", path) for item in runs]
+
+    def get_latest_release(self, owner: str, repo: str) -> dict[str, Any] | None:
+        """Raw JSON of the repo's latest (non pre-release) release; None when it has none."""
+        path = self._repo_path(owner, repo) + "/releases/latest"
+        resp = self._request("GET", path, ok_statuses=frozenset({404}))
+        if resp.status_code == 404:
+            return None
         data = self._json(resp, "GET", path)
         if not isinstance(data, dict):
             raise self._bad_payload(resp, "GET", path)

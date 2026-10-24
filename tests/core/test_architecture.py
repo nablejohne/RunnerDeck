@@ -55,6 +55,7 @@ BANNED_IN_UI = (
     "runnerdeck.core.service",
     "runnerdeck.core.elevate",
     "runnerdeck.core.elevated",
+    "runnerdeck.core.workflows",  # calls GitHub through the client it is given
     "httpx",
     "subprocess",
     "winreg",

@@ -50,6 +50,12 @@ job fails.
   "授权启停…" grants start / stop rights for a service runner you imported. Status, live output
   and job notifications of a service runner come from its `_diag` Runner log; removing one
   deletes the service too. CLI: `to-service`, `grant-service`.
+- Detail page "Workflow" tab: which jobs of the repository's workflows this runner can take
+  (labels compared with `runs-on`; a job asking for a label the runner lacks is flagged, as it
+  would stay queued forever) and the latest runs with links. Needs Contents: Read and
+  Actions: Read on a fine-grained PAT (optional).
+- Update check: "检查更新" on the settings page, and once shortly after start (can be turned
+  off). It only tells you about a newer release and links to it; nothing is downloaded.
 - "加固权限" on the settings page restricts the runner root to Administrators, SYSTEM and you
   (other users can only list it). A root RunnerDeck creates itself gets this automatically.
 

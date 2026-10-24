@@ -31,7 +31,8 @@ NEW_TOKEN_URL = "https://github.com/settings/personal-access-tokens/new"
 PERMISSION_HELP = (
     "需要的权限：\n"
     "• fine-grained PAT：Repository access 选中要添加 runner 的仓库，"
-    "Repository permissions 里 Administration: Read and write（推荐）\n"
+    "Repository permissions 里 Administration: Read and write（推荐）；"
+    "想在详情页看 workflow 标签匹配和最近运行，再加 Contents: Read、Actions: Read\n"
     "• classic PAT：勾选 repo"
 )
 EMPTY_INPUT = "请输入 PAT"

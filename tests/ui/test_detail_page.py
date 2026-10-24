@@ -334,3 +334,45 @@ def test_service_record_facts_and_menu(
     actions = {a.text(): a for a in page.build_menu().actions() if a.text()}
     actions["授权启停…"].trigger()
     assert fake.calls_of("grant_service_control") == [((record.id,), {})]
+
+
+def test_workflow_tab_loads_and_renders(
+    page: RunnerDetailPage, fake_with_records: FakeController
+) -> None:
+    from datetime import UTC, datetime
+
+    from runnerdeck.core.models import (
+        JobMatch,
+        JobTarget,
+        MatchKind,
+        RepoInsights,
+        WorkflowRun,
+    )
+    from runnerdeck.ui.pages.runner_detail_page import TAB_WORKFLOW, insights_html
+
+    record = fake_with_records.records[0]
+    page.show_record(record.id)
+    page.switch_tab(TAB_WORKFLOW)
+    assert fake_with_records.calls_of("load_repo_insights") == [((record.id,), {"force": False})]
+    insights = RepoInsights(
+        matches=(
+            JobMatch(JobTarget("ci.yml", "ok", ("self-hosted",)), MatchKind.OK),
+            JobMatch(
+                JobTarget("ci.yml", "gpu", ("self-hosted", "gpu")), MatchKind.MISSING, ("gpu",)
+            ),
+            JobMatch(JobTarget("ci.yml", "<m>", None, dynamic=True), MatchKind.UNKNOWN),
+        ),
+        runs=(
+            WorkflowRun(id=1, display_title="build", conclusion="failure", html_url="https://r/1"),
+        ),
+        fetched_at=datetime(2026, 10, 24, tzinfo=UTC),
+    )
+    text = insights_html(insights)
+    assert "缺少标签 <b>gpu</b>" in text and "&lt;m&gt;" in text and "失败" in text
+    assert 'href="https://r/1"' in text
+    fake_with_records.repo_insights_loaded.emit("other", insights)  # not ours: ignored
+    assert page.workflowView.toPlainText() == ""
+    fake_with_records.repo_insights_loaded.emit(record.id, insights)
+    assert "这台 runner 可以接" in page.workflowView.toPlainText()
+    errors = insights_html(RepoInsights(workflow_error="缺少 Contents", runs_error="缺少 Actions"))
+    assert "缺少 Contents" in errors and "缺少 Actions" in errors

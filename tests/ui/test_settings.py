@@ -341,3 +341,34 @@ def test_root_hardened_and_proxy_applied_show_info_bars(
     assert kinds == ["success", "success", "warning", "error"]
     assert "D:\\runners" in shown[0][2]
     assert "2 个" in shown[1][2] and "b" in shown[2][2] and "c：无法写入" in shown[3][2]
+
+
+def test_update_card_checks_then_offers_the_download(
+    page: SettingsPage, fake: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from runnerdeck.core.models import UpdateInfo
+
+    opened: list[str] = []
+    monkeypatch.setattr(
+        QDesktopServices, "openUrl", staticmethod(lambda url: opened.append(url.toString()) or True)
+    )
+    page.updateCard.clicked.emit()
+    assert fake.calls_of("check_updates") == [((), {})]
+    fake.update_checked.emit(UpdateInfo(current="1.0.0", latest="1.0.0"))
+    assert "已是最新" in page.updateCard.contentLabel.text()
+    fake.update_checked.emit(UpdateInfo(current="1.0.0", error="网络不通"))
+    assert "网络不通" in page.updateCard.contentLabel.text()
+    fake.update_checked.emit(
+        UpdateInfo(current="1.0.0", latest="1.1.0", newer=True, url="https://x/r")
+    )
+    assert (
+        "1.1.0" in page.updateCard.contentLabel.text() and page.updateCard.button.text() == "下载"
+    )
+    page.updateCard.clicked.emit()
+    assert opened == ["https://x/r"] and len(fake.calls_of("check_updates")) == 1
+
+
+def test_check_updates_switch_saves(page: SettingsPage, fake: FakeController) -> None:
+    assert page.checkUpdatesCard.isChecked()
+    page.checkUpdatesCard.setChecked(False)
+    assert fake.config.settings.check_updates is False

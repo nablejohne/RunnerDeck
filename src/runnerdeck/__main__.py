@@ -37,6 +37,7 @@ from runnerdeck.core.redact import redact
 PROG = "runnerdeck"
 APP_NAME = "RunnerDeck"
 LOG_FILE_NAME = "runnerdeck.log"
+UPDATE_CHECK_DELAY_MS = 30_000  # m4-design §8
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
@@ -331,6 +332,11 @@ def _run_app(app: Any, *, autostart: bool, factories: _Factories) -> int:
         controller.reconcile_autostart()
         controller.discover()
         controller.start_auto_runners()
+        check_updates = getattr(controller, "check_updates", None)
+        if settings.check_updates and callable(check_updates):
+            from PyQt5.QtCore import QTimer
+
+            QTimer.singleShot(UPDATE_CHECK_DELAY_MS, check_updates)  # after startup settles
 
         if should_show_window(
             autostart=autostart, start_minimized=settings.start_minimized, has_tray=has_tray
