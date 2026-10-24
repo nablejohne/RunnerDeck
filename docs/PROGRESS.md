@@ -8,9 +8,9 @@
 - [x] M1 core 层 + CLI（架构守卫、覆盖率门槛）
 - [x] M2 UI 最小可用 + 打包 + release.yml → v0.1.0（2026-10-24 发布，预发布）
 - [x] M3 日常可用（托盘、自启、Poller、导入）：验收全部通过；不单独发 v0.2.0，随 v1.0.0 一起发布
-- [x] M4 增强与发布（服务模式、Inno Setup、来源证明）→ v1.0.0（2026-10-24 发布；桌面上的 UAC / 取消注销 / 图形界面待用户验收）
+- [x] M4 增强与发布（服务模式、Inno Setup、来源证明）→ v1.0.0（2026-10-24），桌面验收后修复发布 v1.0.1、v1.0.2
 
-## M4：已发布 v1.0.0（2026-10-24）
+## M4：已完成（2026-10-24，v1.0.0 → 验收修复 v1.0.2）
 
 契约 `docs/m4-design.md`（§13 记 spike 与实现后的修订）。用户决策：服务模式完整支持（UAC 只提权单条命令；安装时给当前用户授启停权限；服务账号只用 NETWORK SERVICE）；安装包按用户安装到 `%LOCALAPPDATA%\Programs\RunnerDeck`；顺序实现 + 最后 1 个独立 reviewer；M3 不单独发版。
 
@@ -26,17 +26,19 @@
 - [x] 8 发布：CI 绿、XM 真机 pytest 2543 passed、XM 提权 SSH 下服务模式 CLI 全流程两遍（含评审修复后）、真实 `ShellExecuteExW` 路径（提权进程拉起、退出码、结果文件、清理）→ **v1.0.0** https://github.com/nablejohne/RunnerDeck/releases/tag/v1.0.0 （正式版；`RunnerDeck-1.0.0-setup.exe` 51.3 MB、`RunnerDeck-1.0.0-win-x64.zip` 68.4 MB、`SHA256SUMS.txt`；`shasum -c` 通过；`gh attestation verify` 两个文件都通过，SLSA provenance 来自 `release.yml@refs/tags/v1.0.0`）；设置页的检查更新现在拿到 v1.0.0
   - 发布插曲：第一次 release 在“提取发布说明”失败（说明里有中文，Windows runner 的 stdout 是 cp1252），Release 未创建；`changelog_section.py` 改为写 UTF-8 字节，标签移到 bd5bee4 重发
   - 干净机器“可装可卸”：CI windows-latest 每次推送静默安装 → 已安装的 CLI / `--smoke-test` → 静默卸载 → 安装目录、开始菜单、卸载键都消失；卸载只删指向本安装的开机自启值（另一份副本的值保留）
-- [ ] **桌面验收（用户，XM 桌面；SSH 做不到的部分）**：用户要求先发布、不等确认，以下在 v1.0.0 上补做（发现问题发 1.0.1）
-  1. 向导“以 Windows 服务运行”：弹一次 UAC → 服务运行、在线 → 跑 job（job 由我在开发机 `gh workflow run spike.yml -R nablejohne/runnerdeck-sandbox -f label=runnerdeck-svc` 触发）
-  2. 卡片 / 托盘启停服务 runner 不弹 UAC；执行 job 时停止先确认；job 通知
-  3. 退出 RunnerDeck 后服务 runner 仍在线
-  4. 进程 runner“转为服务…”：一次 UAC
-  5. 添加时在 UAC 点“否”：提示已取消，什么都没留下
-  6. 移除服务 runner：一次 UAC → 服务、注册、目录都没了
-  7. 详情页：runner 版本、Workflow 页签、最近运行
-  8. 设置里改代理 → `.env` 更新并提示
-  9. **D2**：注销 → 在“仍要注销 / 取消”界面点取消 → 托盘提示并重启 runner（需要一个会阻止注销的程序制造这个界面）
-  10. 桌面上用 setup.exe 安装 / 运行中卸载（应提示先退出）/ 卸载
+- [x] **桌面验收（2026-10-24，XM 桌面，用户操作 + 我在开发机触发 job / SSH 核对）**：发现 2 个 bug（1.0.1、1.0.2 修复并发布）+ 1 个已知限制
+  1. 向导添加服务 runner `XM-svc-acc`：一次 UAC、不闪控制台 → 服务运行、GitHub id 36 在线 → job（`label=runnerdeck-svc`）成功并弹通知 ✓
+  2. 卡片 / 托盘 / 详情页启停服务不弹 UAC ✓；执行 job 时停止先确认、job 被取消 ✓。**bug**：卡片停止后按钮不变回“启动”（`runner_state` 停在 Runner 日志的“停止中”）→ **1.0.1** 改为每次服务轮询按合并后的实时状态发 `runner_state`，升级后复测通过
+  3. 退出 RunnerDeck：服务仍 RUNNING、id 36 在线；两个进程 runner 约 1 分钟后 offline ✓
+  4. sandbox2“转为服务…”：一次 UAC，id 2 → 3，服务在线（服务名过长被截断成 `…runnerdeck-sa-5752`，从 `.service` 读，正常）✓
+  5. 添加时 UAC 点“否”：提示已取消，没有目录、没有注册 ✓
+  6. 移除 `XM-svc-acc`：一次 UAC → 服务、本地组、目录、id 36 都没了 ✓
+  7. 详情页：runner 版本 2.338.1、Workflow 页签（sandbox 新增的 `labels.yml` 显示“缺少标签 gpu-not-here”）、最近运行 ✓
+  8. 设置代理 → 两个 runner 的 `.env` 写入 `https_proxy` / `http_proxy`；清空 → 只删掉这两行 ✓
+  9. **取消注销：已知限制**。Windows 11 开始注销就把 RunnerDeck（以及 Tailscale、v2rayN）结束了，点“取消”时它已不在，恢复逻辑没机会运行（spike-notes §12 补充）；README / CHANGELOG 已说明，建议需要扛住注销的 runner 用服务模式
+  10. 安装包：按用户安装不弹 UAC（这次用户自选了 `D:\tmp\RunnerDeck`）；运行中升级 / 卸载都提示先退出 ✓；卸载提示保留数据、配置还在、服务 runner 不受影响、开机自启值随卸载删掉 ✓；重装到默认目录 `%LOCALAPPDATA%\Programs\RunnerDeck`，开机自启自动改指新位置 ✓。**bug**：原地升级后“关于”仍显示旧版本（`_internal` 里旧的 `runnerdeck-1.0.0.dist-info` 没删）→ **1.0.2** 安装前清空 `{app}\_internal`（CI 加了“植入旧 dist-info 再升级”的检查），1.0.1 → 1.0.2 复测显示 1.0.2 ✓
+- 发布：v1.0.1（卡片状态）、v1.0.2（升级残留）均为正式版，资产齐全（zip、setup.exe、SHA256SUMS + 来源证明）；v1.0.0 / v1.0.1 的发布说明已按更正后的 CHANGELOG 更新
+- 验收后 XM 的状态：RunnerDeck 1.0.2 装在默认目录；`runnerdeck-sandbox`（id 28）是进程 runner，`runnerdeck-sandbox2`（id 3）现在是服务 runner；sandbox 仓库多了只能手动触发的 `labels.yml`；我的 XM 开发副本 `D:\tmp\RunnerDeck` 已随卸载删除（下次真机测试另建目录，rd.cmd / rd4.cmd / m4.cmd 要改路径）
 
 ## M3：已完成（2026-10-24，随 v1.0.0 发布）
 
@@ -147,6 +149,9 @@ uv run pytest
 - Windows 上往重定向的 stdout 写非 ASCII（发布说明）要显式写 UTF-8 字节：GitHub 托管 runner 的 Python stdout 是 cp1252
 - GitHub Actions 的 pwsh 步骤以最后的 `$LASTEXITCODE` 结束：故意测非零退出码之后要清零；新用户配置文件里 HKCU Run 键可能不存在
 - 卸载程序只删指向本安装目录的开机自启值（用户可能同时用 zip 版）
+- PyInstaller onedir 的原地升级必须先清空 `_internal`：旧的 `*.dist-info` 留着会让 `importlib.metadata` 读到旧版本号
+- 服务 runner 的界面状态要从“SCM + Runner 日志”的合并结果发 `runner_state`，不能只在日志事件时发（停止后日志最后一行是 Exiting...）
+- 取消注销救不回进程 runner：Windows 11 在用户点“取消”前就结束了不阻止注销的程序
 
 - GitHub 只在 job 入队时按标签匹配 runner；之后再给 runner 加标签，已排队的 job 不会被分配，要取消重派
 - 发布：`v0.*` 自动标记预发布（SemVer 0.x = 初始开发）；版本号只读 `[project].version`
