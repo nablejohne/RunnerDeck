@@ -378,14 +378,17 @@ def _smoke_windows_modules() -> None:
     """pywin32 and PyYAML made it into the bundle and work (m4-design §9)."""
     from pathlib import Path
 
+    import win32api
     import win32service  # noqa: F401 - imported to prove the bundle has it (service mode)
     import yaml
 
     from runnerdeck.app.single_instance import APP_MUTEX_NAME, AppMutex, app_mutex_exists
     from runnerdeck.core import runner_file
 
-    if runner_file.pe_file_version(Path(sys.executable)) is None:
-        raise RuntimeError("pywin32: no file version for the running executable")
+    # The Python DLL always has a version resource (a PyInstaller exe has none of its own).
+    python_dll = Path(win32api.GetModuleFileName(sys.dllhandle))  # type: ignore[attr-defined]
+    if runner_file.pe_file_version(python_dll) is None:
+        raise RuntimeError(f"pywin32: no file version for {python_dll}")
     if yaml.safe_load("runs-on: [self-hosted]") != {"runs-on": ["self-hosted"]}:
         raise RuntimeError("PyYAML: unexpected parse result")
     mutex = AppMutex(f"{APP_MUTEX_NAME}-smoke-{os.getpid()}")

@@ -60,8 +60,8 @@ M4 按本文实现，测试按本文约定写。core 接口见 `docs/m1-design.m
 ### 2.1 数据
 
 ```python
-class RunnerRecord:          # 新增字段
-    service_name: str | None = None   # 服务模式：.service 的内容；目录丢失时用它删服务
+class RunnerRecord:  # 新增字段
+    service_name: str | None = None  # 服务模式：.service 的内容；目录丢失时用它删服务
 ```
 
 `mode` 已有 `RunnerMode.SERVICE`。服务模式的记录 `auto_start` 恒为 False（启动类型由服务自己决定，界面隐藏这个开关）。
