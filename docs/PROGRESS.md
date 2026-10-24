@@ -8,9 +8,9 @@
 - [x] M1 core 层 + CLI（架构守卫、覆盖率门槛）
 - [x] M2 UI 最小可用 + 打包 + release.yml → v0.1.0（2026-10-24 发布，预发布）
 - [x] M3 日常可用（托盘、自启、Poller、导入）：验收全部通过；不单独发 v0.2.0，随 v1.0.0 一起发布
-- [ ] M4 增强与发布（服务模式、Inno Setup、来源证明）→ v1.0.0（进行中）
+- [x] M4 增强与发布（服务模式、Inno Setup、来源证明）→ v1.0.0（2026-10-24 发布；桌面上的 UAC / 取消注销 / 图形界面待用户验收）
 
-## M4：进行中（2026-10-24 起）
+## M4：已发布 v1.0.0（2026-10-24）
 
 契约 `docs/m4-design.md`（§13 记 spike 与实现后的修订）。用户决策：服务模式完整支持（UAC 只提权单条命令；安装时给当前用户授启停权限；服务账号只用 NETWORK SERVICE）；安装包按用户安装到 `%LOCALAPPDATA%\Programs\RunnerDeck`；顺序实现 + 最后 1 个独立 reviewer；M3 不单独发版。
 
@@ -23,7 +23,20 @@
 - [x] 5 取消注销后恢复（`WM_ENDSESSION(FALSE)` 原生事件过滤器 + 等停下后重启；桌面验证放在第 8 步）
 - [x] 6 打包与发布：Inno Setup（按用户安装，中英文）、CI 静默装 / 跑 / 卸、SHA256SUMS、来源证明；README / CLAUDE.md 更新
 - [x] 7 独立评审（1 个 reviewer）：无高危，13 条修 12 条（两条 reviewer 复现：拒绝执行时误删目录、服务启动即退出被当成功），见 m4-design §13
-- [ ] 8 CI 绿 → 真机 pytest → 桌面验收 → 发布 v1.0.0 → 回流评估
+- [x] 8 发布：CI 绿、XM 真机 pytest 2543 passed、XM 提权 SSH 下服务模式 CLI 全流程两遍（含评审修复后）、真实 `ShellExecuteExW` 路径（提权进程拉起、退出码、结果文件、清理）→ **v1.0.0** https://github.com/nablejohne/RunnerDeck/releases/tag/v1.0.0 （正式版；`RunnerDeck-1.0.0-setup.exe` 51.3 MB、`RunnerDeck-1.0.0-win-x64.zip` 68.4 MB、`SHA256SUMS.txt`；`shasum -c` 通过；`gh attestation verify` 两个文件都通过，SLSA provenance 来自 `release.yml@refs/tags/v1.0.0`）；设置页的检查更新现在拿到 v1.0.0
+  - 发布插曲：第一次 release 在“提取发布说明”失败（说明里有中文，Windows runner 的 stdout 是 cp1252），Release 未创建；`changelog_section.py` 改为写 UTF-8 字节，标签移到 bd5bee4 重发
+  - 干净机器“可装可卸”：CI windows-latest 每次推送静默安装 → 已安装的 CLI / `--smoke-test` → 静默卸载 → 安装目录、开始菜单、卸载键都消失；卸载只删指向本安装的开机自启值（另一份副本的值保留）
+- [ ] **桌面验收（用户，XM 桌面；SSH 做不到的部分）**：用户要求先发布、不等确认，以下在 v1.0.0 上补做（发现问题发 1.0.1）
+  1. 向导“以 Windows 服务运行”：弹一次 UAC → 服务运行、在线 → 跑 job（job 由我在开发机 `gh workflow run spike.yml -R nablejohne/runnerdeck-sandbox -f label=runnerdeck-svc` 触发）
+  2. 卡片 / 托盘启停服务 runner 不弹 UAC；执行 job 时停止先确认；job 通知
+  3. 退出 RunnerDeck 后服务 runner 仍在线
+  4. 进程 runner“转为服务…”：一次 UAC
+  5. 添加时在 UAC 点“否”：提示已取消，什么都没留下
+  6. 移除服务 runner：一次 UAC → 服务、注册、目录都没了
+  7. 详情页：runner 版本、Workflow 页签、最近运行
+  8. 设置里改代理 → `.env` 更新并提示
+  9. **D2**：注销 → 在“仍要注销 / 取消”界面点取消 → 托盘提示并重启 runner（需要一个会阻止注销的程序制造这个界面）
+  10. 桌面上用 setup.exe 安装 / 运行中卸载（应提示先退出）/ 卸载
 
 ## M3：已完成（2026-10-24，随 v1.0.0 发布）
 
@@ -126,6 +139,14 @@ uv run pytest
 - 创建公开仓库 https://github.com/nablejohne/RunnerDeck，许可证 GPLv3
 
 ## 决策与坑
+
+- M4（spike-notes §12）：服务的 Listener 要能列出 runner 目录的每一级上级目录，否则启动即退出（服务 STOPPED、退出码 1）：根目录加固留 `Authenticated Users:(RX)` 本层；用户主目录下不能用服务模式
+- 服务模式的 stdout 原样在 `_diag/Runner_*.log` 的 `[... INFO Terminal] WRITE LINE:` 行里；状态、job、通知都从它解析
+- 进程转服务 = `config.cmd remove` 后再 `--runasservice`（已注册的目录 config.cmd 拒绝），GitHub 上的 runner id 会变
+- 提权：一次 UAC 只做一条白名单操作（请求 / 结果文件）；已经是管理员（管理员终端、XM 的 SSH）时在本进程里做
+- Windows 上往重定向的 stdout 写非 ASCII（发布说明）要显式写 UTF-8 字节：GitHub 托管 runner 的 Python stdout 是 cp1252
+- GitHub Actions 的 pwsh 步骤以最后的 `$LASTEXITCODE` 结束：故意测非零退出码之后要清零；新用户配置文件里 HKCU Run 键可能不存在
+- 卸载程序只删指向本安装目录的开机自启值（用户可能同时用 zip 版）
 
 - GitHub 只在 job 入队时按标签匹配 runner；之后再给 runner 加标签，已排队的 job 不会被分配，要取消重派
 - 发布：`v0.*` 自动标记预发布（SemVer 0.x = 初始开发）；版本号只读 `[project].version`

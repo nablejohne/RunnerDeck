@@ -38,3 +38,5 @@ Windows 托盘应用：管理多个仓库级 GitHub Actions self-hosted runner�
 - CI 和发布只用 GitHub 托管 runner，本仓库 workflow 不得使用 `runs-on: self-hosted`
 - 每个里程碑收尾更新 docs/PROGRESS.md
 - 对 runner 行为不确定时，先查 docs/spike-notes.md；没有记录就先写 spike 验证，不要猜
+- Windows 上写给重定向 stdout 的脚本（发布说明等）显式输出 UTF-8 字节；CI 的 pwsh 步骤里预期的非零退出码之后清零 `$LASTEXITCODE`
+- 只在 Windows 上走到的代码（pywin32、注册表、原生事件、Windows 路径）改完先在 XM 上跑一遍真机 pytest 再推送（同步用完整的 `git archive HEAD` + `COPYFILE_DISABLE=1 tar` 未提交改动）

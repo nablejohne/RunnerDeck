@@ -309,4 +309,8 @@ def run_elevated(op: str, payload: dict, *, timeout_s: float = 300) -> ElevatedR
 - 检查更新只打开本仓库的发布页链接；安装包的 `VersionInfoVersion` 用去掉预发布后缀的数字版本。
 - 未改（已知、可接受）：结果文件写在用户可写目录、提权的 exe 在用户可写目录——与手动以管理员身份运行 config.cmd 的信任前提相同，README 已说明；提权超时后如果服务已装上，非管理员回滚删不掉服务，错误信息提示到“服务”里检查。
 
-（第 8 步起继续填写）
+**第 8 步（发布）**
+- 用户要求第 6–8 步不等确认、直接做完：v1.0.0 先发布，§12 里只有桌面能做的验收项（真实 UAC 弹窗、取消注销 D2、图形界面流程、桌面上装卸）记在 PROGRESS.md 待用户补做，有问题发 1.0.1。
+- 已经验证的替代证据：XM 提权 SSH 下服务模式 CLI 全流程（两遍）；真实 `ShellExecuteExW` 路径（已提权时不弹窗，但结构体、等待、退出码、结果文件都走了真代码）；CI 干净机器上的静默装 / 跑 / 卸；真实 API 的 workflow / runs / 最新版本。
+- 发布说明写 UTF-8 字节（Windows runner 的 stdout 是 cp1252，第一次发布在这一步失败，未创建 Release，标签移到修复后的提交重发）。
+- 回流评估（三问）：**新约定**——Windows 上写重定向 stdout 一律 UTF-8 字节、pwsh 步骤清零 `$LASTEXITCODE`、只在 Windows 走到的代码推送前先跑 XM 真机 pytest（已写进 CLAUDE.md）；**新坑**——Listener 要求上级目录可列、Inno 的简体中文是非官方文件且要 BOM、卸载别误删其他副本的开机自启、新用户配置文件没有 HKCU Run 键（已写进 PROGRESS“决策与坑”和 spike-notes §12）；**颠覆**——原 §6“根目录用与 runner 目录相同的 DACL”被 spike 推翻（要留本层列目录权限），原 §2.7 的“查最近 run 判断 job 结果”备选方案不再需要（Runner 日志里就有 stdout）。
