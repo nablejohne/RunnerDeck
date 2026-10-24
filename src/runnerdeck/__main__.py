@@ -378,9 +378,13 @@ def _smoke_test(factories: _Factories) -> int:
     try:
         from PyQt5.QtWidgets import QApplication
 
-        from runnerdeck.ui.compat import disable_mac_native_frameless
+        from runnerdeck.ui.compat import (
+            disable_mac_native_frameless,
+            tolerate_offscreen_window_handles,
+        )
 
         disable_mac_native_frameless()  # dev machines only; a no-op on Windows
+        tolerate_offscreen_window_handles()  # offscreen on Windows: no real HWNDs
         app = QApplication.instance() or QApplication([APP_NAME])
         # Lock + local server (QtNetwork) under the throwaway home: proves the bundle has them.
         instance = factories.instance()

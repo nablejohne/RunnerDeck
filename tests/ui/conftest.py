@@ -29,9 +29,13 @@ from runnerdeck.core.models import (
     RunnerRecord,
 )
 from runnerdeck.core.status import DisplayStatus, LocalSnapshot, RemoteSnapshot, display_label
-from runnerdeck.ui.compat import disable_mac_native_frameless
+from runnerdeck.ui.compat import (
+    disable_mac_native_frameless,
+    tolerate_offscreen_window_handles,
+)
 
 disable_mac_native_frameless()
+tolerate_offscreen_window_handles()
 
 
 @pytest.fixture(autouse=True)

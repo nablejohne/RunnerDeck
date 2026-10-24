@@ -1,9 +1,10 @@
 """Tests for runnerdeck.app.single_instance (docs/m3-design.md §6.1, §6.4).
 
-Two SingleInstance objects in one process stand in for two processes: QLockFile refuses a
-second lock on the same file even within a process, and the local socket is real. Everything
-lives under a temporary RUNNERDECK_HOME, so the server names never collide with a real
-RunnerDeck on the machine.
+Two SingleInstance objects in one process stand in for two processes where only the lock is
+involved: QLockFile refuses a second lock on the same file even within a process. Messages are
+sent from a real second process (as in production): on Windows a named-pipe client in the same
+thread cannot finish its write while the server's event loop is blocked by it. Everything lives
+under a temporary RUNNERDECK_HOME, so the server names never collide with a real RunnerDeck.
 """
 
 from __future__ import annotations
@@ -16,14 +17,54 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from PyQt5.QtNetwork import QLocalSocket
 from pytestqt.qtbot import QtBot
 
 from runnerdeck.app import single_instance
 from runnerdeck.app.single_instance import SHOW_MESSAGE, SingleInstance, server_name
 from runnerdeck.core import paths
 
-SIGNAL_MS = 5000
+SIGNAL_MS = 15000  # includes starting a Python + Qt subprocess on a CI runner
+SENDER = textwrap.dedent(
+    """
+    import sys
+    from PyQt5.QtCore import QCoreApplication
+    from PyQt5.QtNetwork import QLocalSocket
+    from runnerdeck.app.single_instance import SingleInstance
+
+    app = QCoreApplication([])
+    name, message, raw = sys.argv[1], sys.argv[2], sys.argv[3] == "raw"
+    if raw:  # bytes as given, through a bare socket
+        socket = QLocalSocket()
+        socket.connectToServer(name)
+        ok = socket.waitForConnected(5000)
+        socket.write(message.encode("utf-8").decode("unicode_escape").encode("utf-8"))
+        ok = ok and (socket.waitForBytesWritten(5000) or socket.bytesToWrite() == 0)
+        socket.disconnectFromServer()
+        if socket.state() != QLocalSocket.UnconnectedState:
+            socket.waitForDisconnected(5000)
+    else:
+        ok = SingleInstance(name=name).send_to_primary(message)
+    sys.exit(0 if ok else 1)
+    """
+)
+
+
+def send_from_another_process(
+    primary: SingleInstance, message: str = SHOW_MESSAGE, *, raw: bool = False
+) -> subprocess.Popen[bytes]:
+    """Start a second process that sends `message` to `primary` (the caller waits for it)."""
+    mode = "raw" if raw else "send"
+    return subprocess.Popen([sys.executable, "-c", SENDER, primary.name, message, mode])
+
+
+def finished_ok(proc: subprocess.Popen[bytes]) -> bool:
+    return proc.wait(timeout=SIGNAL_MS / 1000) == 0
+
+
+def finished_ok_while_pumping(qtbot: QtBot, proc: subprocess.Popen[bytes]) -> bool:
+    """Wait for a sender whose message produces no signal, keeping the primary's loop alive."""
+    qtbot.waitUntil(lambda: proc.poll() is not None, timeout=SIGNAL_MS)
+    return proc.returncode == 0
 
 
 @pytest.fixture
@@ -113,7 +154,8 @@ def test_second_instance_activates_the_primary(
     assert not second.is_primary
 
     with qtbot.waitSignal(primary.message_received, timeout=SIGNAL_MS) as blocker:
-        assert second.send_to_primary()
+        sender = send_from_another_process(primary)
+    assert finished_ok(sender)
     assert blocker.args == [SHOW_MESSAGE]
 
 
@@ -125,9 +167,9 @@ def test_custom_message_and_several_clients(
     received: list[str] = []
     primary.message_received.connect(received.append)
 
-    assert make(instances).send_to_primary("hello")
-    assert make(instances).send_to_primary(SHOW_MESSAGE)
+    senders = [send_from_another_process(primary, m) for m in ("hello", SHOW_MESSAGE)]
     qtbot.waitUntil(lambda: len(received) == 2, timeout=SIGNAL_MS)
+    assert all(finished_ok(proc) for proc in senders)
     assert sorted(received) == sorted(["hello", SHOW_MESSAGE])
 
 
@@ -139,14 +181,10 @@ def test_several_lines_in_one_connection(
     received: list[str] = []
     primary.message_received.connect(received.append)
 
-    socket = QLocalSocket()
-    socket.connectToServer(primary.name)
-    assert socket.waitForConnected(SIGNAL_MS)
-    socket.write(b"one\n\n  two  \nthree")  # blank lines dropped, last line without newline
-    assert socket.waitForBytesWritten(SIGNAL_MS) or socket.bytesToWrite() == 0
-    socket.disconnectFromServer()
-
+    # blank lines dropped, last line without newline
+    sender = send_from_another_process(primary, "one\\n\\n  two  \\nthree", raw=True)
     qtbot.waitUntil(lambda: len(received) == 3, timeout=SIGNAL_MS)
+    assert finished_ok(sender)
     assert received == ["one", "two", "three"]
 
 
@@ -158,9 +196,11 @@ def test_oversized_message_is_dropped(
     received: list[str] = []
     primary.message_received.connect(received.append)
 
-    assert make(instances).send_to_primary("x" * (single_instance.MAX_MESSAGE_BYTES + 10))
-    assert make(instances).send_to_primary("after")
+    big = send_from_another_process(primary, "x" * (single_instance.MAX_MESSAGE_BYTES + 10))
+    assert finished_ok_while_pumping(qtbot, big)
+    after = send_from_another_process(primary, "after")
     qtbot.waitUntil(lambda: "after" in received, timeout=SIGNAL_MS)
+    assert finished_ok(after)
     assert received == ["after"]
 
 
@@ -185,7 +225,8 @@ def test_release_lets_the_next_instance_take_over(
     assert second.name == first.name  # same home, same server name: reused after release
     assert second.acquire()
     with qtbot.waitSignal(second.message_received, timeout=SIGNAL_MS):
-        assert make(instances).send_to_primary()
+        sender = send_from_another_process(second)
+    assert finished_ok(sender)
 
 
 def test_different_homes_do_not_interfere(tmp_path: Path, instances: list[SingleInstance]) -> None:
