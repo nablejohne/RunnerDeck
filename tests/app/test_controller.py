@@ -1712,3 +1712,105 @@ def test_save_settings_from_a_stale_copy_keeps_the_other_save(
     assert saved.poll_interval_s == 120
     assert saved.launch_on_login  # not undone
     assert h.autostart.calls == []  # and the Run entry was not touched
+
+
+# --- service mode (docs/m4-design.md §2.8) ------------------------------------------------------
+
+SERVICE_NAME = "actions.runner.octo-demo.box-demo"
+LISTEN = "[2026-10-24 06:07:11Z INFO Terminal] WRITE LINE: 2026-10-24 06:07:11Z: Listening for Jobs"
+RUNNING = (
+    "[2026-10-24 06:08:11Z INFO Terminal] WRITE LINE: 2026-10-24 06:08:11Z: Running job: spike"
+)
+DONE = (
+    "[2026-10-24 06:08:35Z INFO Terminal] WRITE LINE: "
+    "2026-10-24 06:08:35Z: Job spike completed with result: Failed"
+)
+
+
+def _service_record(tmp_path: Path) -> RunnerRecord:
+    from runnerdeck.core.models import RunnerMode
+
+    return record_model(path=str(tmp_path / "svc")).model_copy(
+        update={"mode": RunnerMode.SERVICE, "service_name": SERVICE_NAME}
+    )
+
+
+def _scm(running: bool) -> Any:
+    from runnerdeck.core.status import LocalSnapshot
+
+    state = LocalState.IDLE if running else LocalState.STOPPED
+    return LocalSnapshot(state=state, running=running, external=False, state_since=NOW)
+
+
+def _poll(qtbot: Any, h: Harness) -> None:
+    h.controller._poll_services()
+    qtbot.waitUntil(lambda: not h.controller._service_polling, timeout=WAIT_MS)
+
+
+def test_service_start_stop_go_through_the_service(
+    make_controller: Any, qtbot: Any, tmp_path: Path
+) -> None:
+    record = _service_record(tmp_path)
+    h = make_controller(records=[record])
+    h.manager.service_states[record.id] = _scm(False)
+    _poll(qtbot, h)
+    assert not h.controller.is_running(record.id) and h.controller.is_service(record.id)
+    h.controller.start(record.id)
+    _wait_idle(qtbot, h, record.id)
+    assert ("start_service", {"record_id": record.id, "elevate": True}) in h.manager.calls
+    h.manager.service_states[record.id] = _scm(True)
+    _poll(qtbot, h)
+    assert h.controller.is_running(record.id)
+    h.controller.stop_all()  # never a UAC prompt from "stop all"
+    _wait_idle(qtbot, h, record.id)
+    assert ("stop_service", {"record_id": record.id, "elevate": False}) in h.manager.calls
+    assert record.id not in h.controller.running_ids()  # quitting RunnerDeck leaves it alone
+
+
+def test_service_log_gives_state_output_and_job_notifications(
+    make_controller: Any, qtbot: Any, tmp_path: Path
+) -> None:
+    record = _service_record(tmp_path)
+    log_file = Path(record.path) / "_diag" / "Runner_1.log"
+    log_file.parent.mkdir(parents=True)
+    log_file.write_text(f"{LISTEN}\n{RUNNING}\n", encoding="utf-8")
+    h = make_controller(records=[record])
+    h.manager.service_states[record.id] = _scm(True)
+    jobs: list[tuple[str, str, str]] = []
+    lines: list[tuple[str, str]] = []
+    h.controller.runner_job_finished.connect(lambda *a: jobs.append(a))
+    h.controller.runner_line.connect(lambda *a: lines.append(a))
+    _poll(qtbot, h)  # catch-up: state restored, nothing announced
+    assert h.controller.local_state(record.id) == (LocalState.BUSY, "spike")
+    assert h.controller.display(record.id).state is DisplayState.BUSY
+    assert len(h.controller.output(record.id)) == 2 and lines == [] and jobs == []
+    with log_file.open("a", encoding="utf-8") as f:
+        f.write(DONE + "\n")
+    _poll(qtbot, h)
+    assert jobs == [(record.id, "spike", "Failed")]
+    assert lines and lines[-1][1].endswith("result: Failed")
+    assert h.controller.local_state(record.id) == (LocalState.IDLE, None)
+
+
+def test_convert_and_grant(make_controller: Any, qtbot: Any, tmp_path: Path) -> None:
+    from runnerdeck.core.models import RunnerMode
+
+    record = record_model(path=str(tmp_path / "proc"))
+    h = make_controller(records=[record])
+    with qtbot.waitSignal(h.controller.service_converted, timeout=WAIT_MS) as blocker:
+        h.controller.convert_to_service(record.id)
+    (updated,) = blocker.args
+    assert updated.mode is RunnerMode.SERVICE
+    assert h.controller.config.get(record.id).mode is RunnerMode.SERVICE  # type: ignore[union-attr]
+    with qtbot.waitSignal(h.controller.service_granted, timeout=WAIT_MS) as blocker:
+        h.controller.grant_service_control(record.id)
+    assert blocker.args == [record.id]
+
+
+def test_plan_add_service(make_controller: Any, qtbot: Any) -> None:
+    from runnerdeck.core.models import RunnerMode
+
+    h = make_controller()
+    with qtbot.waitSignal(h.controller.plan_ready, timeout=WAIT_MS):
+        h.controller.plan_add(OWNER, REPO, service=True)
+    assert h.manager.calls[-1][1]["mode"] is RunnerMode.SERVICE

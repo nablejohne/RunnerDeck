@@ -14,6 +14,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import keyring
@@ -40,6 +41,7 @@ from runnerdeck.core.models import (
     ProxyApplyResult,
     RemoteStatus,
     Repo,
+    RunnerMode,
     RunnerRecord,
 )
 from runnerdeck.core.process import ExternalStop, Launch, StopMethod, StopResult
@@ -363,6 +365,7 @@ class FakeManager:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.threads: list[threading.Thread] = []
         self.errors: dict[str, Exception] = {}
+        self.service_states: dict[str, LocalSnapshot] = {}  # service_locals() answers
         self.processes: dict[str, FakeProcess] = {}
         self.rows: list[RunnerStatusRow] = []
         self.statuses_seen: list[Mapping[str, Any]] = []
@@ -394,9 +397,17 @@ class FakeManager:
         root: Any = None,
         version: str | None = None,
         runner_env: Mapping[str, str] | None = None,
+        mode: RunnerMode = RunnerMode.PROCESS,
     ) -> AddPlan:
+        extra = {"mode": mode} if mode is not RunnerMode.PROCESS else {}
         self._call(
-            "plan_add", owner=owner, repo=repo, name=name, labels=labels, runner_env=runner_env
+            "plan_add",
+            owner=owner,
+            repo=repo,
+            name=name,
+            labels=labels,
+            runner_env=runner_env,
+            **extra,
         )
         return plan_model(
             repo,
@@ -482,6 +493,35 @@ class FakeManager:
         config.upsert(updated)
         self.store.save(config)
         return updated
+
+    # service mode (docs/m4-design.md §2)
+
+    def service_locals(self, record_ids: Sequence[str]) -> dict[str, LocalSnapshot]:
+        self._call("service_locals", record_ids=list(record_ids))
+        return {rid: self.service_states[rid] for rid in record_ids if rid in self.service_states}
+
+    def start_service(self, record_id: str, *, elevate: bool = True) -> Any:
+        self._call("start_service", record_id=record_id, elevate=elevate)
+        return SimpleNamespace(state="running")
+
+    def stop_service(self, record_id: str, *, elevate: bool = True) -> Any:
+        self._call("stop_service", record_id=record_id, elevate=elevate)
+        return SimpleNamespace(state="stopped")
+
+    def convert_to_service(self, record_id: str) -> RunnerRecord:
+        self._call("convert_to_service", record_id=record_id)
+        config = self.store.load()
+        record = config.get(record_id)
+        assert record is not None, record_id
+        updated = record.model_copy(
+            update={"mode": RunnerMode.SERVICE, "service_name": "actions.runner.o-r.x"}
+        )
+        config.upsert(updated)
+        self.store.save(config)
+        return updated
+
+    def grant_service_control(self, record_id: str) -> None:
+        self._call("grant_service_control", record_id=record_id)
 
     def apply_proxy(self, old: str | None, new: str | None) -> ProxyApplyResult:
         self._call("apply_proxy", old=old, new=new)

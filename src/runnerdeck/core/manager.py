@@ -1488,7 +1488,9 @@ class RunnerManager:
             rows.append(
                 RunnerStatusRow(
                     record=record,
-                    display=merge_status(local, snapshot, now=now),
+                    display=merge_status(
+                        local, snapshot, now=now, service=record.mode is RunnerMode.SERVICE
+                    ),
                     local=local,
                     remote=snapshot,
                     remote_runner=remote_runner,
@@ -1707,6 +1709,16 @@ class RunnerManager:
         if result.registered and result.agent_id is not None:
             self._update_record(record_id, github_runner_id=result.agent_id)
         raise ServiceInstallError(_elevated_failure(result, "转为服务失败"), result)
+
+    def service_locals(self, record_ids: Sequence[str]) -> dict[str, LocalSnapshot]:
+        """Local snapshots of these service records from the SCM only (no process scan,
+        no GitHub): the GUI polls this every few seconds."""
+        wanted, now = set(record_ids), self._clock()
+        return {
+            r.id: self._service_snapshot(r, now)
+            for r in self._store.load().runners
+            if r.id in wanted and r.mode is RunnerMode.SERVICE
+        }
 
     def _service_snapshot(self, record: RunnerRecord, now: datetime) -> LocalSnapshot:
         """Local view of a service runner from the service control manager. Busy / job come

@@ -168,7 +168,8 @@ class TrayIcon(QSystemTrayIcon):
         start_all = self._action(FIF.PLAY, "全部启动", controller.start_all)
         stop_all = self._action(FIF.PAUSE, "全部停止", self.stop_all)
         start_all.setEnabled(bool(records))
-        stop_all.setEnabled(bool(controller.running_ids()))
+        # running_ids() is our processes only; service runners count here too
+        stop_all.setEnabled(any(controller.is_running(r.id) for r in records))
         self.menu.addAction(open_window)
         self.menu.addSeparator()
         self.menu.addActions([start_all, stop_all])

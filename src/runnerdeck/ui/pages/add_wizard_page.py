@@ -52,6 +52,14 @@ SUCCESS_RETURN_DELAY_MS = 2000
 REPO_ROLE = Qt.UserRole
 PS_POLICY_TEXT = "允许 PowerShell 步骤（.env 写入 PSExecutionPolicyPreference=RemoteSigned）"
 AUTO_START_TEXT = "随 RunnerDeck 自动启动"
+MODE_SERVICE = "Windows 服务（NETWORK SERVICE）"
+MODE_PROCESS = "进程（由 RunnerDeck 启动）"
+SERVICE_TEXT = "以 Windows 服务运行（需要一次管理员授权）"
+SERVICE_HINT = (
+    "服务以 NETWORK SERVICE 账号运行：开机即运行、不需要登录，退出 RunnerDeck 也不停。"
+    "job 看不到你的用户目录和用户级 PATH（例如装在用户目录里的 Python），也不使用你的系统代理；"
+    "需要代理请先在设置里填写，会写进 runner 的 .env。runner 根目录不能在用户目录里。"
+)
 CONFIRM_TEXT = "我已了解上述风险"
 # Progress rows in the order manager.Step reports them (rollback is shown in the status line).
 PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
@@ -180,6 +188,10 @@ class ConfigStep(QWidget):
         self.labelsEdit.setClearButtonEnabled(True)
         self.psPolicyBox = CheckBox(PS_POLICY_TEXT, self)
         self.psPolicyBox.setChecked(True)
+        self.serviceBox = CheckBox(SERVICE_TEXT, self)
+        self.serviceHint = CaptionLabel(SERVICE_HINT, self)
+        self.serviceHint.setWordWrap(True)
+        self.serviceHint.hide()
         self.startAfterBox = CheckBox("添加后立即启动", self)
         self.startAfterBox.setChecked(True)
         # Not part of the plan: toggling it never invalidates the checked plan.
@@ -211,6 +223,8 @@ class ConfigStep(QWidget):
         layout.addWidget(BodyLabel("标签", self))
         layout.addWidget(self.labelsEdit)
         layout.addWidget(self.psPolicyBox)
+        layout.addWidget(self.serviceBox)
+        layout.addWidget(self.serviceHint)
         layout.addWidget(self.startAfterBox)
         layout.addWidget(self.autoStartBox)
         layout.addSpacing(8)
@@ -221,7 +235,15 @@ class ConfigStep(QWidget):
         for signal in (self.nameEdit.textChanged, self.labelsEdit.textChanged):
             signal.connect(lambda _text: self.changed.emit())
         self.psPolicyBox.toggled.connect(lambda _on: self.changed.emit())
+        self.serviceBox.toggled.connect(self._on_service_toggled)
         self.clear_plan()
+
+    def _on_service_toggled(self, on: bool) -> None:
+        # A service starts right away and with Windows: neither option applies.
+        self.serviceHint.setVisible(on)
+        self.startAfterBox.setVisible(not on)
+        self.autoStartBox.setVisible(not on)
+        self.changed.emit()
 
     @property
     def name(self) -> str | None:
@@ -236,12 +258,16 @@ class ConfigStep(QWidget):
         return self.psPolicyBox.isChecked()
 
     @property
+    def service(self) -> bool:
+        return self.serviceBox.isChecked()
+
+    @property
     def start_after(self) -> bool:
-        return self.startAfterBox.isChecked()
+        return self.startAfterBox.isChecked() and not self.service
 
     @property
     def auto_start(self) -> bool:
-        return self.autoStartBox.isChecked()
+        return self.autoStartBox.isChecked() and not self.service
 
     @property
     def confirmed(self) -> bool:
@@ -258,6 +284,7 @@ class ConfigStep(QWidget):
             self.nameEdit,
             self.labelsEdit,
             self.psPolicyBox,
+            self.serviceBox,
             self.startAfterBox,
             self.autoStartBox,
         ):
@@ -277,7 +304,8 @@ class ConfigStep(QWidget):
             f"名称：{plan.name}\n"
             f"目录：{plan.target_dir}\n"
             f"版本：{version}\n"
-            f"标签：{labels}"
+            f"标签：{labels}\n"
+            f"运行方式：{MODE_SERVICE if self.service else MODE_PROCESS}"
         )
         warnings = list(plan.warnings)
         self.warningLabel.setText("\n".join(f"⚠ {w}" for w in warnings))
@@ -554,6 +582,7 @@ class AddWizardPage(QWidget):
             name=self.configStep.name,
             labels=self.configStep.labels,
             ps_policy=self.configStep.ps_policy,
+            service=self.configStep.service,
         )
 
     def _start_add(self) -> None:

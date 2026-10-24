@@ -271,4 +271,11 @@ def run_elevated(op: str, payload: dict, *, timeout_s: float = 300) -> ElevatedR
 - 测试：Windows 上 pytest 的 `tmp_path` 在用户目录下，服务模式的测试夹具屏蔽“用户目录下拒绝”这条检查（有专门的用例测它）。
 - XM（提权 SSH，独立 `RUNNERDECK_HOME`）：CLI `add --service`（新建根目录自动加固、代理先写 `.env`）→ 跑 job 成功 → `stop` / `start` → 进程 runner `to-service` → 两个 `remove`，服务、本地组、目录、GitHub 注册都没有残留；真机全量 pytest 2486 passed。
 
-（第 3 步起继续填写）
+**第 3 步（服务 app / ui）**
+- 服务 runner 的本地状态：controller 的 5 s 重算顺带提交一个 worker 任务 `_poll_services`（同一时刻最多一个）：`manager.service_locals(ids)`（只查 SCM，不扫进程）+ 每个服务 runner 的 `LogFollower.poll()`。新行喂给 `process.parse_line` + `OutputStateMachine`；catch-up 读到的只恢复状态，不发 `runner_line` / `runner_job_finished`。SCM 从未运行变为运行时状态机重置。SCM 说运行（IDLE）且日志里已有事件时，显示日志得出的 STARTING / IDLE / BUSY 和 job 名。
+- `merge_status(..., service=True)`：停止的服务 runner、GitHub 超过 90 s 仍在线 -> STOPPED + `DETAIL_SERVICE_ONLINE`，不显示 EXTERNAL（接管 / 结束进程对服务没有意义）。
+- controller：`start` / `stop` 对服务记录走 `manager.start_service` / `stop_service`（`elevate` 参数；`start_all` / `stop_all` 传 False，不弹 UAC）；`is_running` / `local_state` / `output` 对服务记录用 SCM + 日志；`running_ids()` 仍只含本进程的 runner（退出 RunnerDeck 不动服务）；新增 `is_service`、`convert_to_service`（信号 `service_converted`）、`grant_service_control`（`service_granted`）、`plan_add(service=)`；服务记录添加后不再 `start_after`。
+- ui：向导“以 Windows 服务运行”（选中后隐藏“立即启动 / 随 RunnerDeck 启动”，摘要多一行“运行方式”）；卡片名称旁“服务”标记，菜单“转为服务…”（进程，停止时可用）/“授权启停…”（服务），服务不显示“随 RunnerDeck 启动”；详情页多“运行方式”一行，菜单同卡片，服务隐藏自启开关；托盘“全部停止”把服务 runner 也算作运行中。确认框辅助函数 `confirm_convert` / `confirm_grant` 在 `runner_card.py`。
+- UAC 被取消仍走 `failed(op, "已取消：…")`，界面按普通错误提示（没有单独做成警告）。
+
+（第 4 步起继续填写）

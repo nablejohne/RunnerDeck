@@ -291,6 +291,8 @@ class DashboardPage(QWidget):
         card.kill_requested.connect(controller.kill_external)
         card.auto_start_toggled.connect(controller.set_auto_start)
         card.forget_requested.connect(controller.forget)
+        card.convert_requested.connect(controller.convert_to_service)
+        card.grant_requested.connect(controller.grant_service_control)
         return card
 
     def _update_summary(self) -> None:

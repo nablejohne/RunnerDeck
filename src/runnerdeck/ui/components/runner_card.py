@@ -36,7 +36,7 @@ from qfluentwidgets import (
 )
 from qfluentwidgets import FluentIcon as FIF
 
-from runnerdeck.core.models import DisplayState, LocalState, RunnerRecord
+from runnerdeck.core.models import DisplayState, LocalState, RunnerMode, RunnerRecord
 from runnerdeck.core.status import DisplayStatus
 from runnerdeck.ui.components.status_badge import StatusBadge
 
@@ -110,6 +110,33 @@ def forget_question(record: RunnerRecord) -> str:
     )
 
 
+CONVERT_QUESTION = (
+    "将把 runner “{name}” 重新注册为 Windows 服务：\n"
+    "· 会弹出一次管理员授权（UAC）；\n"
+    "· 先在 GitHub 注销再注册，runner id 会变；\n"
+    "· 服务以 NETWORK SERVICE 账号运行，开机即运行、不需要登录，退出 RunnerDeck 也不停；\n"
+    "· job 看不到你的用户目录和用户级 PATH，也不使用你的系统代理（设置里的代理会写进 .env）。"
+)
+GRANT_QUESTION = (
+    "允许你（当前用户）不经管理员授权启动、停止 runner “{name}” 的服务？需要一次管理员授权（UAC）。"
+)
+SERVICE_BADGE_TIP = "以 Windows 服务运行（NETWORK SERVICE）：开机即运行，退出 RunnerDeck 不影响"
+
+
+def confirm_convert(record: RunnerRecord, parent: QWidget) -> bool:
+    box = MessageBox("转为服务", CONVERT_QUESTION.format(name=record.name), parent)
+    box.yesButton.setText("转为服务")
+    box.cancelButton.setText("取消")
+    return bool(box.exec())
+
+
+def confirm_grant(record: RunnerRecord, parent: QWidget) -> bool:
+    box = MessageBox("授权启停", GRANT_QUESTION.format(name=record.name), parent)
+    box.yesButton.setText("授权")
+    box.cancelButton.setText("取消")
+    return bool(box.exec())
+
+
 def confirm_forget(record: RunnerRecord, parent: QWidget) -> bool:
     box = MessageBox(f"取消登记 runner {record.name}", forget_question(record), parent)
     box.yesButton.setText("取消登记")
@@ -170,6 +197,8 @@ class RunnerCard(CardWidget):
     kill_requested = pyqtSignal(str)
     auto_start_toggled = pyqtSignal(str, bool)
     forget_requested = pyqtSignal(str)
+    convert_requested = pyqtSignal(str)  # confirmed
+    grant_requested = pyqtSignal(str)  # confirmed
 
     def __init__(
         self,
@@ -188,6 +217,9 @@ class RunnerCard(CardWidget):
 
         self.nameLabel = StrongBodyLabel(record.name, self)
         self.repoLabel = CaptionLabel(record.full_name, self)
+        self.modeLabel = CaptionLabel("服务", self)
+        self.modeLabel.setToolTip(SERVICE_BADGE_TIP)
+        self.modeLabel.setVisible(record.mode is RunnerMode.SERVICE)
         self.badge = StatusBadge(self)
         self.detailLabel = CaptionLabel("", self)
         self.detailLabel.setWordWrap(True)
@@ -221,6 +253,7 @@ class RunnerCard(CardWidget):
         head = QHBoxLayout()
         head.setSpacing(8)
         head.addWidget(self.nameLabel)
+        head.addWidget(self.modeLabel)
         head.addWidget(self.badge)
         head.addStretch(1)
         left.addLayout(head)
@@ -240,6 +273,7 @@ class RunnerCard(CardWidget):
         self.record = record
         self.nameLabel.setText(record.name)
         self.repoLabel.setText(record.full_name)
+        self.modeLabel.setVisible(record.mode is RunnerMode.SERVICE)
 
     @property
     def running(self) -> bool:
@@ -339,6 +373,14 @@ class RunnerCard(CardWidget):
         if keep_work is not None and self._alive():
             self.remove_requested.emit(self.record.id, keep_work)
 
+    def ask_convert(self) -> None:
+        if confirm_convert(self.record, self.window()) and self._alive():
+            self.convert_requested.emit(self.record.id)
+
+    def ask_grant(self) -> None:
+        if confirm_grant(self.record, self.window()) and self._alive():
+            self.grant_requested.emit(self.record.id)
+
     def ask_forget(self) -> None:
         if confirm_forget(self.record, self.window()) and self._alive():
             self.forget_requested.emit(self.record.id)
@@ -362,10 +404,21 @@ class RunnerCard(CardWidget):
         open_dir.triggered.connect(lambda: self.open_dir_requested.emit(rid))
         github = Action(FIF.GITHUB, "在 GitHub 打开", self)
         github.triggered.connect(self.open_on_github)
-        auto_start = Action(FIF.POWER_BUTTON, AUTO_START_TEXT, self, checkable=True)
-        auto_start.setChecked(self.record.auto_start)
-        auto_start.triggered.connect(lambda checked: self.auto_start_toggled.emit(rid, checked))
-        menu.addActions([detail, open_dir, github, auto_start])
+        menu.addActions([detail, open_dir, github])
+        if self.record.mode is RunnerMode.SERVICE:
+            grant = Action(FIF.CERTIFICATE, "授权启停…", self)
+            grant.setToolTip("让你不经管理员授权启停这个服务（导入的服务 runner 需要）")
+            grant.triggered.connect(self.ask_grant)
+            menu.addAction(grant)
+        else:
+            # A service starts with Windows by itself.
+            auto_start = Action(FIF.POWER_BUTTON, AUTO_START_TEXT, self, checkable=True)
+            auto_start.setChecked(self.record.auto_start)
+            auto_start.triggered.connect(lambda checked: self.auto_start_toggled.emit(rid, checked))
+            convert = Action(FIF.SETTING, "转为服务…", self)
+            convert.setEnabled(not self._running and not self._busy)
+            convert.triggered.connect(self.ask_convert)
+            menu.addActions([auto_start, convert])
         if self.external:
             kill = Action(FIF.CLOSE, "结束进程", self)
             kill.triggered.connect(self.ask_kill)

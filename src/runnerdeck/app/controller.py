@@ -23,6 +23,7 @@ Chinese `message`; the controller never shows dialogs. Quiet refreshes (the poll
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import logging
 import os
@@ -38,7 +39,7 @@ from PyQt5.QtCore import QObject, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices
 
 from runnerdeck.app.workers import Task, submit
-from runnerdeck.core import account, runner_file, secrets
+from runnerdeck.core import account, diag, runner_file, secrets
 from runnerdeck.core.errors import InvalidInputError, RunnerDeckError
 from runnerdeck.core.github_client import GitHubClient
 from runnerdeck.core.manager import (
@@ -59,9 +60,18 @@ from runnerdeck.core.models import (
     ProxyApplyResult,
     RemoteStatus,
     Repo,
+    RunnerMode,
     RunnerRecord,
 )
-from runnerdeck.core.process import ExternalStop, Launch, RunnerProcess, StopResult
+from runnerdeck.core.process import (
+    EventKind,
+    ExternalStop,
+    Launch,
+    OutputStateMachine,
+    RunnerProcess,
+    StopResult,
+    parse_line,
+)
 from runnerdeck.core.redact import redact
 from runnerdeck.core.status import DisplayStatus, LocalSnapshot, RemoteSnapshot, merge_status
 from runnerdeck.core.store import ConfigStore
@@ -208,6 +218,22 @@ class _ProcessHooks:
             self._bridge.job.emit(self.record_id, job, result)
 
 
+class _ServiceLog:
+    """A service runner's console, rebuilt from its Runner log (m4-design §2.7): the
+    follower (used only by the service poll worker) and what the main thread made of it."""
+
+    def __init__(self, runner_dir: Path, max_lines: int = 2000) -> None:
+        self.follower = diag.LogFollower(runner_dir)
+        self.lines: collections.deque[str] = collections.deque(maxlen=max_lines)
+        self.machine = OutputStateMachine()
+        self.seen = False  # an event arrived since the service last started
+        self.running = False  # the SCM said running at the previous poll
+
+    def restart(self) -> None:
+        self.machine = OutputStateMachine()
+        self.seen = False
+
+
 class RunnerController(QObject):
     """Main-thread facade over RunnerManager, GitHubClient and RunnerProcess (§4)."""
 
@@ -243,6 +269,8 @@ class RunnerController(QObject):
     autostart_state_loaded = pyqtSignal(object)  # AutostartState
     # M4 (docs/m4-design.md §3, §6)
     proxy_applied = pyqtSignal(object)  # ProxyApplyResult, after a proxy change was saved
+    service_converted = pyqtSignal(object)  # RunnerRecord now in service mode
+    service_granted = pyqtSignal(str)  # record id: start / stop no longer need UAC
     runners_root_hardened = pyqtSignal(str)  # runners root path
 
     def __init__(
@@ -285,6 +313,9 @@ class RunnerController(QObject):
         self._refreshing = False
         # Live-merge inputs and outputs per record id (see the module docstring).
         self._locals: dict[str, LocalSnapshot] = {}  # last row.local
+        self._service_logs: dict[str, _ServiceLog] = {}  # service runners' Runner logs
+        self._service_polling = False
+        self._service_poll_again = False
         self._remotes: dict[str, RemoteSnapshot] = {}  # last row.remote of a remote refresh
         self._displays: dict[str, DisplayStatus] = {}  # last merged display (change detection)
 
@@ -336,20 +367,37 @@ class RunnerController(QObject):
         return self._autostart.supported
 
     def local_state(self, record_id: str) -> tuple[LocalState, str | None]:
-        """(state, current job) of our process; (STOPPED, None) without one."""
+        """(state, current job) of our process, or of a service runner (SCM + Runner log);
+        (STOPPED, None) without either."""
+        if self._is_service(record_id):
+            local = self._live_local(record_id, self._clock())
+            return local.state, local.current_job
         proc = self._processes.get(record_id)
         if proc is None:
             return LocalState.STOPPED, None
         return proc.state, proc.current_job
 
     def is_running(self, record_id: str) -> bool:
+        if self._is_service(record_id):
+            cached = self._locals.get(record_id)
+            return cached is not None and cached.running
         proc = self._processes.get(record_id)
         return proc is not None and proc.is_running()
+
+    def is_service(self, record_id: str) -> bool:
+        return self._is_service(record_id)
+
+    def _is_service(self, record_id: str) -> bool:
+        record = self._config.get(record_id)
+        return record is not None and record.mode is RunnerMode.SERVICE
 
     def is_busy(self, record_id: str) -> bool:
         return record_id in self._busy
 
     def output(self, record_id: str) -> list[str]:
+        service_log = self._service_logs.get(record_id)
+        if service_log is not None:
+            return list(service_log.lines)
         proc = self._processes.get(record_id)
         return proc.output() if proc is not None else []
 
@@ -445,11 +493,13 @@ class RunnerController(QObject):
         name: str | None = None,
         labels: Sequence[str] | None = None,
         ps_policy: bool = True,
+        service: bool = False,
     ) -> None:
         """manager.plan_add on a worker; `plan_ready(AddPlan)`.
 
         ps_policy: write PSExecutionPolicyPreference=RemoteSigned to the runner's `.env`
-        (manager.POWERSHELL_POLICY_ENV, spike §10).
+        (manager.POWERSHELL_POLICY_ENV, spike §10). service: register as a Windows service
+        (one UAC prompt in add_runner, m4-design §2).
         """
         self._submit(
             "plan_add",
@@ -459,6 +509,7 @@ class RunnerController(QObject):
             name=name,
             labels=labels,
             runner_env=POWERSHELL_POLICY_ENV if ps_policy else None,
+            mode=RunnerMode.SERVICE if service else RunnerMode.PROCESS,
             on_finished=self.plan_ready,
         )
 
@@ -483,7 +534,9 @@ class RunnerController(QObject):
     def _add_done(self, record: RunnerRecord, start_after: bool) -> None:
         self._reload_config("add")
         self.runner_added.emit(record)
-        if start_after:
+        if record.mode is RunnerMode.SERVICE:
+            self._poll_services()  # it is running already
+        elif start_after:
             self.start(record.id)
 
     # --- import / forget / auto start -------------------------------------------------------------
@@ -586,8 +639,9 @@ class RunnerController(QObject):
 
     # --- start / stop ---------------------------------------------------------------------------
 
-    def start(self, record_id: str) -> None:
-        """Create the RunnerProcess (launch=self.launch) and start it on a worker.
+    def start(self, record_id: str, *, elevate: bool = True) -> None:
+        """Create the RunnerProcess (launch=self.launch) and start it on a worker. A service
+        runner's service is started instead (elevate=False: no UAC prompt, fail instead).
 
         State changes arrive as `runner_state` from the process callbacks.
         """
@@ -598,6 +652,9 @@ class RunnerController(QObject):
             self._fail("start", f"runner “{record.name}” 已在运行")
             return
         if not self._claim("start", record):
+            return
+        if record.mode is RunnerMode.SERVICE:
+            self._control_service(record_id, start=True, elevate=elevate)
             return
         hooks = _ProcessHooks(self, record_id)
         try:
@@ -627,11 +684,18 @@ class RunnerController(QObject):
         self._release(record_id)
         self._refresh_displays([record_id])
 
-    def stop(self, record_id: str) -> None:
+    def stop(self, record_id: str, *, elevate: bool = True) -> None:
         """proc.stop() on a worker (default timeout: idle 15 s / job 90 s), then the stop mark
-        (manager.record_stop, still on the worker); `runner_stopped`."""
+        (manager.record_stop, still on the worker); `runner_stopped`. A service runner's
+        service is stopped (always graceful) instead."""
         record = self._record_for("stop", record_id)
         if record is None:
+            return
+        if record.mode is RunnerMode.SERVICE:
+            if not self.is_running(record_id):
+                self._fail("stop", f"runner “{record.name}” 没有在运行")
+            elif self._claim("stop", record):
+                self._control_service(record_id, start=False, elevate=elevate)
             return
         proc = self._processes.get(record_id)
         if proc is None or not proc.is_running():
@@ -659,14 +723,155 @@ class RunnerController(QObject):
         self._refresh_displays([record_id])
 
     def start_all(self) -> None:
+        """Every stopped runner; services only where no UAC prompt is needed."""
         for record in self._config.runners:
             if not self.is_running(record.id) and not self.is_busy(record.id):
-                self.start(record.id)
+                self.start(record.id, elevate=False)
 
     def stop_all(self) -> None:
         for record in self._config.runners:
             if self.is_running(record.id) and not self.is_busy(record.id):
-                self.stop(record.id)
+                self.stop(record.id, elevate=False)
+
+    # --- service mode (docs/m4-design.md §2.8) --------------------------------------------------
+
+    def _control_service(self, record_id: str, *, start: bool, elevate: bool) -> None:
+        """manager.start_service / stop_service on a worker (claimed by the caller); then a
+        service poll refreshes the display. `runner_stopped` is not emitted for services."""
+        op = "start" if start else "stop"
+        fn = self._manager.start_service if start else self._manager.stop_service
+        self._submit(
+            op,
+            fn,
+            record_id,
+            elevate=elevate,
+            on_finished=lambda _info: self._service_control_done(record_id),
+            on_failed=lambda _m, _e: self._service_control_done(record_id),
+        )
+
+    def _service_control_done(self, record_id: str) -> None:
+        self._release(record_id)
+        self._poll_services(force=True)
+
+    def convert_to_service(self, record_id: str) -> None:
+        """manager.convert_to_service (one UAC prompt) on a worker; `config_changed` +
+        `service_converted(record)`. failed("convert"); the config is re-read either way
+        (a failed convert can still change the GitHub runner id)."""
+        record = self._record_for("convert", record_id)
+        if record is None:
+            return
+        if self.is_running(record_id):
+            self._fail("convert", f"runner “{record.name}” 正在运行，请先停止再转为服务")
+            return
+        if not self._claim("convert", record):
+            return
+        self._submit(
+            "convert",
+            self._manager.convert_to_service,
+            record_id,
+            on_finished=lambda updated: self._converted(record_id, updated),
+            on_failed=lambda _m, _e: self._convert_failed(record_id),
+        )
+
+    def _converted(self, record_id: str, updated: RunnerRecord) -> None:
+        self._release(record_id)
+        self._reload_config("convert")
+        self.service_converted.emit(updated)
+        self._poll_services(force=True)
+
+    def _convert_failed(self, record_id: str) -> None:
+        self._release(record_id)
+        self._reload_config("convert")
+
+    def grant_service_control(self, record_id: str) -> None:
+        """manager.grant_service_control (one UAC prompt); `service_granted(id)`."""
+        record = self._record_for("grant", record_id)
+        if record is None:
+            return
+        self._submit(
+            "grant",
+            self._manager.grant_service_control,
+            record_id,
+            on_finished=lambda _r: self.service_granted.emit(record_id),
+        )
+
+    def _poll_services(self, *, force: bool = False) -> None:
+        """SCM state + new Runner-log lines of every service runner, on a worker; at most one
+        poll in flight (force: run again right after the current one)."""
+        ids = [r.id for r in self._config.runners if r.mode is RunnerMode.SERVICE]
+        if not ids:
+            return
+        if self._service_polling:
+            self._service_poll_again = self._service_poll_again or force
+            return
+        self._service_polling = True
+        followers = {rid: self._service_log(rid).follower for rid in ids}
+        self._submit(
+            "service_poll",
+            self._do_poll_services,
+            ids,
+            followers,
+            on_finished=self._services_polled,
+            on_failed=lambda _m, _e: self._services_polled(None),
+            quiet=True,
+        )
+
+    def _do_poll_services(
+        self, ids: list[str], followers: dict[str, diag.LogFollower]
+    ) -> tuple[dict[str, LocalSnapshot], dict[str, diag.FollowResult]]:  # worker
+        locals_ = self._manager.service_locals(ids)
+        logs = {rid: follower.poll() for rid, follower in followers.items()}
+        return locals_, logs
+
+    def _services_polled(
+        self, result: tuple[dict[str, LocalSnapshot], dict[str, diag.FollowResult]] | None
+    ) -> None:
+        self._service_polling = False
+        if result is not None:
+            locals_, logs = result
+            for rid, local in locals_.items():
+                if self._config.get(rid) is None:
+                    continue
+                service_log = self._service_log(rid)
+                if local.running and not service_log.running:
+                    service_log.restart()  # a fresh Listener: forget the old job state
+                service_log.running = local.running
+                self._locals[rid] = local
+            for rid, follow in logs.items():
+                if self._config.get(rid) is not None:
+                    self._feed_service_log(rid, follow)
+            self._refresh_displays(list(locals_))
+        if self._service_poll_again:
+            self._service_poll_again = False
+            self._poll_services()
+
+    def _feed_service_log(self, record_id: str, follow: diag.FollowResult) -> None:
+        """Run.cmd-equivalent events from the Runner log; a catch-up read only restores the
+        state (no line / job notifications for what happened before we looked)."""
+        service_log = self._service_log(record_id)
+        machine = service_log.machine
+        for line in follow.lines:
+            service_log.lines.append(line)
+            if not follow.catch_up:
+                self.runner_line.emit(record_id, line)
+            event = parse_line(line)
+            if event is None:
+                continue
+            service_log.seen = True
+            before = (machine.state, machine.current_job)
+            machine.feed(event)
+            if (machine.state, machine.current_job) != before and not follow.catch_up:
+                self.runner_state.emit(record_id, machine.state, machine.current_job)
+            if event.kind is EventKind.COMPLETED and event.detail and not follow.catch_up:
+                self.runner_job_finished.emit(record_id, event.detail, event.result or "")
+
+    def _service_log(self, record_id: str) -> _ServiceLog:
+        service_log = self._service_logs.get(record_id)
+        if service_log is None:
+            record = self._config.get(record_id)
+            assert record is not None, record_id
+            service_log = self._service_logs[record_id] = _ServiceLog(Path(record.path))
+        return service_log
 
     # --- remove -------------------------------------------------------------------------------
 
@@ -1040,12 +1245,21 @@ class RunnerController(QObject):
 
     def _on_remerge_timer(self) -> None:
         self._refresh_displays()
+        self._poll_services()
 
     # --- live merge (main thread) -----------------------------------------------------------------
 
     def _live_local(self, record_id: str, now: datetime) -> LocalSnapshot:
         """Cached row.local with our process's live fields on top (docs/m3-design.md §4.1)."""
         cached = self._locals.get(record_id)
+        service_log = self._service_logs.get(record_id)
+        if service_log is not None and cached is not None and self._is_service(record_id):
+            machine = service_log.machine
+            if cached.state is LocalState.IDLE and service_log.seen:
+                # SCM says running; the Runner log knows connecting / idle / busy and the job.
+                state = machine.state if machine.state is not LocalState.STOPPING else cached.state
+                return dataclasses.replace(cached, state=state, current_job=machine.current_job)
+            return cached
         proc = self._processes.get(record_id)
         if proc is None:
             if cached is not None:
@@ -1074,7 +1288,12 @@ class RunnerController(QObject):
         )
 
     def _live_display(self, record_id: str, now: datetime) -> DisplayStatus:
-        return merge_status(self._live_local(record_id, now), self._remotes.get(record_id), now=now)
+        return merge_status(
+            self._live_local(record_id, now),
+            self._remotes.get(record_id),
+            now=now,
+            service=self._is_service(record_id),
+        )
 
     def _refresh_displays(
         self, record_ids: Iterable[str] | None = None, *, now: datetime | None = None
@@ -1117,7 +1336,7 @@ class RunnerController(QObject):
         return merged
 
     def _drop_caches(self, record_id: str) -> None:
-        for cache in (self._locals, self._remotes, self._displays):
+        for cache in (self._locals, self._remotes, self._displays, self._service_logs):
             cache.pop(record_id, None)
 
     def _sync_remerge_timer(self) -> None:

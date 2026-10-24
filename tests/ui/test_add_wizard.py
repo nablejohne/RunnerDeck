@@ -96,7 +96,10 @@ def test_walks_three_steps_for_private_repo(
     )
     page.nextButton.click()
     assert fake.calls_of("plan_add") == [
-        (("octocat", "demo"), {"name": "my-runner", "labels": ["gpu", "ci"], "ps_policy": False})
+        (
+            ("octocat", "demo"),
+            {"name": "my-runner", "labels": ["gpu", "ci"], "ps_policy": False, "service": False},
+        )
     ]
     assert page.plan is fake.auto_plan
     assert page.configStep.summaryLabel.isVisibleTo(page.configStep)
@@ -214,3 +217,21 @@ def test_add_failure_with_output_shows_text(
 def test_helpers() -> None:
     assert split_labels(" gpu, , ci ,") == ["gpu", "ci"]
     assert repo_item_text(make_repo("a/b", private=False), True).endswith("公开 / 本机已有 runner")
+
+
+def test_service_option_hides_start_options_and_is_planned(
+    qtbot: QtBot, fake: FakeController
+) -> None:
+    from runnerdeck.ui.pages.add_wizard_page import ConfigStep
+
+    step = ConfigStep()
+    qtbot.addWidget(step)
+    step.show()
+    changed: list[bool] = []
+    step.changed.connect(lambda: changed.append(True))
+    assert step.startAfterBox.isVisibleTo(step) and not step.serviceHint.isVisibleTo(step)
+    step.serviceBox.setChecked(True)
+    assert changed and step.service
+    assert step.serviceHint.isVisibleTo(step)
+    assert not step.startAfterBox.isVisibleTo(step) and not step.autoStartBox.isVisibleTo(step)
+    assert not step.start_after and not step.auto_start

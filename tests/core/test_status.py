@@ -674,3 +674,19 @@ def test_snapshot_from_before_the_stop_is_not_external() -> None:
     # Fetched while our own process still ran; the stop came after it.
     loc = local(L.STOPPED, running=False, stopped_ago_s=10)
     assert merge(loc, fetched(RemoteStatus.ONLINE, ago_s=20)).state is D.STOPPED
+
+
+def test_stopped_service_online_beyond_the_lag_is_not_external() -> None:
+    from runnerdeck.core.status import DETAIL_SERVICE_ONLINE
+
+    stopped = local(LocalState.STOPPED, running=False, stopped_ago_s=600)
+    shown = merge_status(stopped, remote(RemoteStatus.ONLINE), now=NOW, service=True)
+    assert (shown.state, shown.detail) == (DisplayState.STOPPED, DETAIL_SERVICE_ONLINE)
+    unmarked = local(LocalState.STOPPED, running=False)
+    assert (
+        merge_status(unmarked, remote(RemoteStatus.ONLINE), now=NOW).state is DisplayState.EXTERNAL
+    )
+    assert (
+        merge_status(unmarked, remote(RemoteStatus.ONLINE), now=NOW, service=True).state
+        is DisplayState.STOPPED
+    )

@@ -249,6 +249,7 @@ def test_menu_actions(
         "打开目录",
         "在 GitHub 打开",
         "随 RunnerDeck 启动",
+        "转为服务…",
         "移除",
         "取消登记",
     }
@@ -499,3 +500,30 @@ def test_answer_is_dropped_when_the_record_vanished_meanwhile(
     card.request_stop()  # must not raise "wrapped C/C++ object ... has been deleted"
     assert rid not in page.cards
     assert fake_with_records.calls_of("stop") == []
+
+
+def test_service_card_menu_and_badge(
+    page: DashboardPage, fake_with_records: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qfluentwidgets import MessageBox
+
+    from runnerdeck.core.models import RunnerMode
+
+    fake = fake_with_records
+    record = fake.records[0]
+    card = page.cards[record.id]
+    assert not card.modeLabel.isVisibleTo(card)
+    monkeypatch.setattr(MessageBox, "exec", lambda self: True)
+    actions = {a.text(): a for a in card.build_menu().actions() if a.text()}
+    actions["转为服务…"].trigger()
+    assert fake.calls_of("convert_to_service") == [((record.id,), {})]
+
+    service = record.model_copy(
+        update={"mode": RunnerMode.SERVICE, "service_name": "actions.runner.o-r.x"}
+    )
+    card.set_record(service)
+    assert card.modeLabel.isVisibleTo(card)
+    actions = {a.text(): a for a in card.build_menu().actions() if a.text()}
+    assert "随 RunnerDeck 启动" not in actions and "转为服务…" not in actions
+    actions["授权启停…"].trigger()
+    assert fake.calls_of("grant_service_control") == [((record.id,), {})]

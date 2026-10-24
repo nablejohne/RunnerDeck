@@ -32,14 +32,16 @@ from qfluentwidgets import (
 )
 from qfluentwidgets import FluentIcon as FIF
 
-from runnerdeck.core.models import DiagLog, DisplayState, LocalState, RunnerRecord
+from runnerdeck.core.models import DiagLog, DisplayState, LocalState, RunnerMode, RunnerRecord
 from runnerdeck.core.status import DisplayStatus
 from runnerdeck.ui.components.log_view import LogView
 from runnerdeck.ui.components.runner_card import (
     AUTO_START_TEXT,
     RUNNING_STATES,
     ask_remove,
+    confirm_convert,
     confirm_forget,
+    confirm_grant,
     confirm_kill,
     confirm_stop,
     runners_settings_url,
@@ -123,12 +125,14 @@ class RunnerDetailPage(QWidget):
         self.labelsValue = BodyLabel("", self.content)
         self.idValue = BodyLabel("", self.content)
         self.versionValue = BodyLabel("", self.content)
+        self.modeValue = BodyLabel("", self.content)
         for value in (
             self.repoValue,
             self.pathValue,
             self.labelsValue,
             self.idValue,
             self.versionValue,
+            self.modeValue,
         ):
             value.setTextInteractionFlags(Qt.TextSelectableByMouse)
             value.setWordWrap(True)
@@ -212,6 +216,7 @@ class RunnerDetailPage(QWidget):
                 ("标签", self.labelsValue),
                 ("GitHub id", self.idValue),
                 ("runner 版本", self.versionValue),
+                ("运行方式", self.modeValue),
             )
         ):
             facts.addWidget(CaptionLabel(title, self.content), row, 0, Qt.AlignTop)
@@ -296,6 +301,13 @@ class RunnerDetailPage(QWidget):
             str(record.github_runner_id) if record.github_runner_id is not None else "未知"
         )
         self.versionValue.setText(self._controller.runner_version(record.id) or "未知")
+        service = record.mode is RunnerMode.SERVICE
+        self.modeValue.setText(
+            f"Windows 服务（{record.service_name or '服务名未知'}，NETWORK SERVICE）"
+            if service
+            else "进程（由 RunnerDeck 启动）"
+        )
+        self.autoStartSwitch.setVisible(not service)  # a service starts with Windows
         self._syncing = True
         try:
             self.autoStartSwitch.setChecked(record.auto_start)
@@ -423,6 +435,18 @@ class RunnerDetailPage(QWidget):
     def build_menu(self) -> RoundMenu:
         """More-actions menu (public so tests can trigger the actions without a popup)."""
         menu = RoundMenu(parent=self)
+        record = self._record
+        if record is not None and record.mode is RunnerMode.SERVICE:
+            grant = Action(FIF.CERTIFICATE, "授权启停…", self)
+            grant.triggered.connect(self.ask_grant)
+            menu.addAction(grant)
+            menu.addSeparator()
+        elif record is not None:
+            convert = Action(FIF.SETTING, "转为服务…", self)
+            convert.setEnabled(not self.running and not self._busy)
+            convert.triggered.connect(self.ask_convert)
+            menu.addAction(convert)
+            menu.addSeparator()
         if self.external:
             kill = Action(FIF.CLOSE, "结束进程", self)
             kill.triggered.connect(self.ask_kill)
@@ -435,6 +459,16 @@ class RunnerDetailPage(QWidget):
         forget.triggered.connect(self.ask_forget)
         menu.addActions([remove, forget])
         return menu
+
+    def ask_convert(self) -> None:
+        record = self._record
+        if record is not None and confirm_convert(record, self.window()):
+            self._controller.convert_to_service(record.id)
+
+    def ask_grant(self) -> None:
+        record = self._record
+        if record is not None and confirm_grant(record, self.window()):
+            self._controller.grant_service_control(record.id)
 
     # --- diag logs ------------------------------------------------------------------
 

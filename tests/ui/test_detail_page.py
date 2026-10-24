@@ -170,7 +170,7 @@ def test_actions_call_the_controller(
     assert "正在执行 job build" in answers[-1]
 
     menu = {a.text(): a for a in page.build_menu().actions() if a.text()}
-    assert set(menu) == {"移除", "取消登记"}
+    assert set(menu) == {"转为服务…", "移除", "取消登记"}
     assert not menu["取消登记"].isEnabled()  # running
 
     fake.set_state(record.id, LocalState.STOPPED)
@@ -305,3 +305,32 @@ def test_shows_runner_version(page: RunnerDetailPage, fake_with_records: FakeCon
     fake_with_records.versions[record.id] = "2.338.1"
     page.show_record(record.id)
     assert page.versionValue.text() == "2.338.1"
+
+
+def test_service_record_facts_and_menu(
+    page: RunnerDetailPage, fake_with_records: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qfluentwidgets import MessageBox
+
+    from runnerdeck.core.models import RunnerMode
+
+    fake = fake_with_records
+    record = fake.records[0]
+    page.show_record(record.id)
+    assert "进程" in page.modeValue.text() and page.autoStartSwitch.isVisibleTo(page)
+    monkeypatch.setattr(MessageBox, "exec", lambda self: True)
+    actions = {a.text(): a for a in page.build_menu().actions() if a.text()}
+    actions["转为服务…"].trigger()
+    assert fake.calls_of("convert_to_service") == [((record.id,), {})]
+
+    service = record.model_copy(
+        update={"mode": RunnerMode.SERVICE, "service_name": "actions.runner.o-r.x"}
+    )
+    fake.config.upsert(service)
+    fake.config_changed.emit(fake.config)
+    page.show_record(record.id)
+    assert "actions.runner.o-r.x" in page.modeValue.text()
+    assert not page.autoStartSwitch.isVisibleTo(page)
+    actions = {a.text(): a for a in page.build_menu().actions() if a.text()}
+    actions["授权启停…"].trigger()
+    assert fake.calls_of("grant_service_control") == [((record.id,), {})]

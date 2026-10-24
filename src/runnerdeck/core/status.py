@@ -67,6 +67,7 @@ DETAIL_EXTERNAL_LOCAL = (
 DETAIL_EXTERNAL_REMOTE = (
     "GitHub 显示在线，但本应用没有运行它（可能是服务或其他电脑上的同名 runner）"
 )
+DETAIL_SERVICE_ONLINE = "服务已停止，但 GitHub 仍显示在线（可能有别的进程在运行这个目录）"
 DETAIL_OFFLINE_LAG = "已优雅停止，GitHub 端还显示在线（通常 1 分钟内更新）"
 
 # Local states that can be shown as-is while the process runs and GitHub gives no signal.
@@ -142,9 +143,14 @@ def _elapsed_s(since: datetime, now: datetime) -> float:
 
 
 def merge_status(
-    local: LocalSnapshot, remote: RemoteSnapshot | None, *, now: datetime
+    local: LocalSnapshot, remote: RemoteSnapshot | None, *, now: datetime, service: bool = False
 ) -> DisplayStatus:
-    """Combine local and remote state; rules are checked strictly in the order of §9."""
+    """Combine local and remote state; rules are checked strictly in the order of §9.
+
+    service: a service-mode runner (m4-design §2.6). It is never "run by another process":
+    a stopped service that GitHub still shows online beyond the offline lag stays STOPPED
+    with a hint.
+    """
     remote_status = remote.status if remote is not None else RemoteStatus.UNKNOWN
     remote_busy = remote.busy if remote is not None else False
 
@@ -209,6 +215,8 @@ def merge_status(
                 "现在重新启动会先显示“等待旧会话过期”",
             )
     if remote_status is RemoteStatus.ONLINE:
+        if service:
+            return _status(DisplayState.STOPPED, DETAIL_SERVICE_ONLINE)
         return _status(DisplayState.EXTERNAL, DETAIL_EXTERNAL_REMOTE)
     if remote_status is RemoteStatus.OFFLINE:
         return _status(DisplayState.STOPPED)

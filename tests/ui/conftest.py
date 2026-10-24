@@ -97,6 +97,8 @@ class FakeController(QObject):
     autostart_state_loaded = pyqtSignal(object)  # AutostartState
     proxy_applied = pyqtSignal(object)  # ProxyApplyResult
     runners_root_hardened = pyqtSignal(str)  # runners root path
+    service_converted = pyqtSignal(object)  # RunnerRecord
+    service_granted = pyqtSignal(str)  # record id
 
     def __init__(self, config: AppConfig | None = None, *, logged_in: bool = True) -> None:
         super().__init__()
@@ -178,8 +180,11 @@ class FakeController(QObject):
         name: str | None = None,
         labels: list[str] | None = None,
         ps_policy: bool = True,
+        service: bool = False,
     ) -> None:
-        self._record("plan_add", owner, repo, name=name, labels=labels, ps_policy=ps_policy)
+        self._record(
+            "plan_add", owner, repo, name=name, labels=labels, ps_policy=ps_policy, service=service
+        )
         if self.auto_plan is not None:
             self.plan_ready.emit(self.auto_plan)
 
@@ -194,11 +199,11 @@ class FakeController(QObject):
             self.runner_added.emit(self.auto_added)
             self.config_changed.emit(self.config)
 
-    def start(self, record_id: str) -> None:
-        self._record("start", record_id)
+    def start(self, record_id: str, *, elevate: bool = True) -> None:
+        self._record("start", record_id, **({} if elevate else {"elevate": False}))
 
-    def stop(self, record_id: str) -> None:
-        self._record("stop", record_id)
+    def stop(self, record_id: str, *, elevate: bool = True) -> None:
+        self._record("stop", record_id, **({} if elevate else {"elevate": False}))
 
     def start_all(self) -> None:
         self._record("start_all")
@@ -266,6 +271,16 @@ class FakeController(QObject):
 
     def runner_version(self, record_id: str) -> str | None:
         return self.versions.get(record_id)
+
+    def is_service(self, record_id: str) -> bool:
+        record = self.config.get(record_id)
+        return record is not None and record.mode == "service"
+
+    def convert_to_service(self, record_id: str) -> None:
+        self._record("convert_to_service", record_id)
+
+    def grant_service_control(self, record_id: str) -> None:
+        self._record("grant_service_control", record_id)
 
     def set_launch_on_login(self, enabled: bool) -> None:
         self._record("set_launch_on_login", enabled)
