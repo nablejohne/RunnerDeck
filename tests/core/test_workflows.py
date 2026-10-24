@@ -146,7 +146,7 @@ def test_parse_version(value: str, parsed: Any) -> None:
 
 
 def test_compare() -> None:
-    release = {"tag_name": "v1.0.1", "html_url": "https://github.com/x/releases/tag/v1.0.1"}
+    release = {"tag_name": "v1.0.1", "html_url": f"{update_check.RELEASES_URL}/tag/v1.0.1"}
     newer = update_check.compare("1.0.0", release)
     assert (newer.latest, newer.newer, newer.url) == ("1.0.1", True, release["html_url"])
     assert not update_check.compare("1.0.1", release).newer
@@ -162,3 +162,12 @@ def test_partly_dynamic_runs_on_keeps_the_static_labels() -> None:
     assert workflows.match(target, ["self-hosted", "Windows"]).kind is MatchKind.UNKNOWN
     linux = workflows.match(target, ["self-hosted", "Linux"])
     assert (linux.kind, linux.missing) == (MatchKind.MISSING, ("Windows",))
+
+
+def test_compare_only_links_to_our_release_page() -> None:
+    evil = update_check.compare(
+        "1.0.0", {"tag_name": "v2.0.0", "html_url": "https://evil.example/x"}
+    )
+    assert evil.url == update_check.RELEASES_URL
+    ours = "https://github.com/nablejohne/RunnerDeck/releases/tag/v2.0.0"
+    assert update_check.compare("1.0.0", {"tag_name": "v2.0.0", "html_url": ours}).url == ours

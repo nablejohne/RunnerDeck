@@ -41,7 +41,7 @@ from PyQt5.QtGui import QDesktopServices
 from runnerdeck import __version__
 from runnerdeck.app.workers import Task, submit
 from runnerdeck.core import account, diag, runner_file, secrets, update_check
-from runnerdeck.core.errors import InvalidInputError, RunnerDeckError
+from runnerdeck.core.errors import ElevationRequiredError, InvalidInputError, RunnerDeckError
 from runnerdeck.core.github_client import GitHubClient
 from runnerdeck.core.manager import (
     POWERSHELL_POLICY_ENV,
@@ -91,6 +91,8 @@ DIAG_DIR = "_diag"
 INSIGHTS_TTL = timedelta(minutes=10)
 RESUME_TIMEOUT = timedelta(seconds=120)  # a job is cancelled first (spike §10: ~15 s)
 RESUME_POLL_MS = 500
+NEEDS_GRANT_SUMMARY_MS = 300
+NEEDS_GRANT = "这些服务 runner 启停需要管理员授权，已跳过（可在菜单里“授权启停…”）："
 AUTOSTART_SKIPPED = "runner 目录下已有其他进程在运行，未自动启动："
 AUTOSTART_UNSUPPORTED = "开机自启只支持 Windows"
 
@@ -325,6 +327,7 @@ class RunnerController(QObject):
         self._service_logs: dict[str, _ServiceLog] = {}  # service runners' Runner logs
         self._insights: dict[str, RepoInsights] = {}  # load_repo_insights cache
         self._session_stopped: list[str] = []  # signalled by the last emergency_stop_all
+        self._needs_grant: list[str] = []  # services start / stop all skipped (no rights)
         self._resume_pending: dict[str, datetime] = {}  # id -> give up after
         self._resume_timer = QTimer(self)
         self._resume_timer.setInterval(RESUME_POLL_MS)
@@ -757,14 +760,33 @@ class RunnerController(QObject):
         service poll refreshes the display. `runner_stopped` is not emitted for services."""
         op = "start" if start else "stop"
         fn = self._manager.start_service if start else self._manager.stop_service
+
+        def failed(message: str, exc: BaseException) -> None:
+            self._service_control_done(record_id)
+            if not elevate and isinstance(exc, ElevationRequiredError):
+                self._note_needs_grant(op, record_id)  # one summary for start / stop all
+            else:
+                self._fail(op, message, exc)
+
         self._submit(
             op,
             fn,
             record_id,
             elevate=elevate,
             on_finished=lambda _info: self._service_control_done(record_id),
-            on_failed=lambda _m, _e: self._service_control_done(record_id),
+            on_failed=failed,
+            quiet=True,
         )
+
+    def _note_needs_grant(self, op: str, record_id: str) -> None:
+        if not self._needs_grant:
+            QTimer.singleShot(NEEDS_GRANT_SUMMARY_MS, lambda: self._report_needs_grant(op))
+        self._needs_grant.append(self._name_of(record_id))
+
+    def _report_needs_grant(self, op: str) -> None:
+        names, self._needs_grant = self._needs_grant, []
+        if names:
+            self._fail(op, NEEDS_GRANT + "、".join(names))
 
     def _service_control_done(self, record_id: str) -> None:
         self._release(record_id)

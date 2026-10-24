@@ -105,8 +105,9 @@ try {
             Write-Host 'Inno Setup (ISCC.exe) not found: skipping the installer'
         } else {
             $script = Join-Path $repoRoot 'packaging\RunnerDeck.iss'
+            $fileVersion = ($version -split '[^0-9.]')[0].Trim('.')  # 1.0.0rc1 -> 1.0.0
             Invoke-Native "iscc $script" {
-                & $iscc /Q "/DAppVersion=$version" "/DSourceDir=$bundleDir" "/DOutputDir=$distDir" $script
+                & $iscc /Q "/DAppVersion=$version" "/DFileVersion=$fileVersion" "/DSourceDir=$bundleDir" "/DOutputDir=$distDir" $script
             } | Out-Null
             $setupPath = Join-Path $distDir "RunnerDeck-$version-setup.exe"
             if (-not (Test-Path -LiteralPath $setupPath)) {

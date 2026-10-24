@@ -298,4 +298,15 @@ def run_elevated(op: str, payload: dict, *, timeout_s: float = 300) -> ElevatedR
 - release.yml：`SHA256SUMS.txt`（Git Bash 的 sha256sum）、`actions/attest-build-provenance@v4`（zip + setup.exe），三个文件一起上传。
 - test_main 的 `FakeApp` 要有 `installNativeEventFilter`（只在 Windows 上走到，macOS 本地发现不了）。
 
-（第 7 步起继续填写）
+**第 7 步（独立评审，1 个 reviewer，审完全部 M4 改动）**：没有高危；修了 13 条中的 12 条（第一轮 4 条 + token 脱敏，第二轮 8 条）。
+- 提权进程：拒绝 UNC 路径；授权只给用户账号 SID（S-1-5-21-… / S-1-12-1-…）；`remove_service` 的服务名必须与目录里的 `.service` 一致；请求文件超过 10 分钟作废；第二个注销 token 也登记脱敏。
+- 提权超时（`ElevationTimeoutError`）：添加时按“可能已注册”回滚。
+- 移除服务 runner：提权进程拒绝执行（没碰任何东西）时，什么都不删并报错（原来会走 API 删除并删目录，服务却还在，reviewer 复现）；服务是否还在由本进程查 SCM。`local_only` 移除服务记录时提示 `sc delete`。
+- `start_service`：到 RUNNING 后再观察 3 s（`SERVICE_SETTLE_S`），Listener 启动即退出时报错（reviewer 复现）。
+- CI build job 用打包出的 `runnerdeck-cli.exe elevated` 跑一个未知操作，确认 CLI exe 也带上了 pywin32（UAC 拉起的是它）。
+- “全部启动 / 全部停止”里需要授权的服务 runner 汇总成一条提示。
+- `LogFollower` 换新日志文件前先读完旧文件（服务重启时不丢最后一个 job 的结果）。
+- 检查更新只打开本仓库的发布页链接；安装包的 `VersionInfoVersion` 用去掉预发布后缀的数字版本。
+- 未改（已知、可接受）：结果文件写在用户可写目录、提权的 exe 在用户可写目录——与手动以管理员身份运行 config.cmd 的信任前提相同，README 已说明；提权超时后如果服务已装上，非管理员回滚删不掉服务，错误信息提示到“服务”里检查。
+
+（第 8 步起继续填写）

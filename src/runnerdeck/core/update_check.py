@@ -24,7 +24,9 @@ def compare(current: str, release: Mapping[str, Any] | None) -> UpdateInfo:
     if release is None:
         return UpdateInfo(current=current)
     tag = str(release.get("tag_name") or "")
-    url = str(release.get("html_url") or RELEASES_URL)
+    url = str(release.get("html_url") or "")
+    if not url.startswith(RELEASES_URL + "/"):  # only ever open our own release page
+        url = RELEASES_URL
     latest, mine = parse_version(tag), parse_version(current)
     if latest is None:
         return UpdateInfo(current=current, error=f"无法识别最新版本号：{tag!r}")

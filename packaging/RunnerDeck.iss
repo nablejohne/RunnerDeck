@@ -13,6 +13,10 @@
 #ifndef OutputDir
   #define OutputDir "..\dist"
 #endif
+#ifndef FileVersion
+  ; VersionInfoVersion must be numeric: build.ps1 passes x.y.z without a pre-release suffix
+  #define FileVersion AppVersion
+#endif
 
 [Setup]
 ; Never change AppId: upgrades and the uninstall entry are keyed on it.
@@ -24,7 +28,7 @@ AppPublisher=nablejohne
 AppPublisherURL=https://github.com/nablejohne/RunnerDeck
 AppSupportURL=https://github.com/nablejohne/RunnerDeck/issues
 AppUpdatesURL=https://github.com/nablejohne/RunnerDeck/releases
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#FileVersion}
 PrivilegesRequired=lowest
 DefaultDirName={userpf}\RunnerDeck
 UsePreviousAppDir=yes

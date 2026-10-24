@@ -365,6 +365,7 @@ _registration_happened = installer.registration_happened
 # (op, payload) -> ElevatedResult; core/elevate.Elevator by default (one UAC prompt per call).
 ElevatorFn = Callable[[str, Mapping[str, Any]], ElevatedResult]
 SERVICE_START_TIMEOUT_S = 30.0
+SERVICE_SETTLE_S = 3.0  # keep watching a just started service for an early exit
 SERVICE_STOP_TIMEOUT_S = 120.0  # a job is cancelled first: 5.4 s measured (spike-notes §12)
 
 
@@ -1032,6 +1033,11 @@ class RunnerManager:
                 "没有在 GitHub 上注销；如果 runner 还在，请到 "
                 f"{record.repo_url}/settings/actions/runners 手动删除"
             )
+            name = self._service_name_of(record) if record.mode is RunnerMode.SERVICE else None
+            if name is not None and self._service_still_exists(name, True):
+                warnings.append(
+                    f"Windows 服务 {name} 没有删除，请以管理员身份运行：sc delete {name}"
+                )
         elif record.mode is RunnerMode.SERVICE and self._service_name_of(record) is not None:
             remote, runner_id = self._remove_service_remote(
                 record, runner_dir, runner_id, child_env, warnings, report
@@ -1129,8 +1135,12 @@ class RunnerManager:
                 payload["remove_token"] = token.token.get_secret_value()
             report(Step.UNCONFIGURE, "等待管理员授权（UAC），然后注销 runner 并删除服务")
             result = self._elevator("remove_service", payload)
+            if not result.ok and not result.registered:
+                # The helper refused before touching anything (expired request, a name that
+                # does not match .service, ...): keep the directory, record and service.
+                raise ServiceError(_elevated_failure(result, "移除服务失败，没有做任何改动"))
             warnings.extend(result.warnings)
-            if result.service_exists:
+            if self._service_still_exists(name, result.service_exists):
                 warnings.append(f"服务 {name} 没能删除，请以管理员身份运行：sc delete {name}")
             if result.ok and not result.registered:
                 return RemoteRemoval.UNCONFIGURED, runner_id
@@ -1138,6 +1148,15 @@ class RunnerManager:
                 warnings.append(f"config.cmd remove 失败，已改用 GitHub API 删除：{result.error}")
             report(Step.API_DELETE, "通过 GitHub API 删除 runner")
             return self._delete_remote(client, record, runner_id)
+
+    def _service_still_exists(self, name: str | None, helper_says: bool) -> bool:
+        """Ask the SCM ourselves; the helper's answer only when the SCM cannot tell."""
+        if name is None:
+            return helper_says
+        state = self._services.query(name).state
+        if state is service.ServiceState.UNKNOWN:
+            return helper_says
+        return state is not service.ServiceState.MISSING
 
     @classmethod
     def _delete_remote(
@@ -1641,6 +1660,19 @@ class RunnerManager:
             (service.ServiceState.RUNNING, service.ServiceState.STOPPED),
             timeout_s=SERVICE_START_TIMEOUT_S,
         )
+        if info.state is service.ServiceState.RUNNING:
+            # A Listener that cannot start (e.g. it cannot list a parent directory) stops the
+            # service a second or two after RUNNING (spike-notes §12): watch a little longer.
+            info = service.wait_for(
+                self._services,
+                name,
+                (service.ServiceState.STOPPED,),
+                timeout_s=SERVICE_SETTLE_S,
+            )
+            if info.state is service.ServiceState.STOP_PENDING:
+                info = service.wait_for(
+                    self._services, name, (service.ServiceState.STOPPED,), timeout_s=10
+                )
         if info.state is service.ServiceState.STOPPED:
             reason = diag.last_terminal_error(Path(record.path)) or f"退出码 {info.exit_code}"
             raise ServiceError(f"服务 {name} 启动后退出：{reason}")

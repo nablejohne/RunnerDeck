@@ -1882,3 +1882,24 @@ def test_resume_after_cancelled_logoff(make_controller: Any, qtbot: Any) -> None
         _wait_idle(qtbot, h, record.id)
         assert h.controller.is_running(record.id)
     assert not h.controller._resume_timer.isActive()
+
+
+def test_start_all_summarises_services_that_need_a_grant(
+    make_controller: Any, qtbot: Any, tmp_path: Path
+) -> None:
+    from runnerdeck.core.errors import ElevationRequiredError
+
+    a = _service_record(tmp_path / "a")
+    b = _service_record(tmp_path / "b").model_copy(update={"id": "b" * 32, "name": "box-b"})
+    h = make_controller(records=[a, b])
+    for record in (a, b):
+        h.manager.service_states[record.id] = _scm(False)
+    h.manager.errors["start_service"] = ElevationRequiredError("需要管理员权限")
+    _poll(qtbot, h)
+    failures = Spy(h.controller.failed)
+    h.controller.start_all()
+    qtbot.waitUntil(lambda: len(failures.calls) >= 1, timeout=WAIT_MS)
+    qtbot.wait(400)
+    assert len(failures.calls) == 1
+    op, message = failures.calls[0][:2]
+    assert op == "start" and "box-demo" in message and "box-b" in message

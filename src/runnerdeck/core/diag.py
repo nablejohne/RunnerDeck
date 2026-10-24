@@ -208,9 +208,19 @@ class LogFollower:
         if path is None:
             return FollowResult()
         catch_up = False
+        drained: tuple[str, ...] = ()
         if path != self._path:
+            if self._path is not None and not self._first:
+                # The service restarted: finish the old file first (its last job result).
+                drained = self._read_new(self._path, catch_up=False)
             catch_up = self._first
             self._path, self._offset = path, 0
+        lines = self._read_new(path, catch_up=catch_up)
+        self._first = False
+        return FollowResult(drained + lines, catch_up)
+
+    def _read_new(self, path: Path, *, catch_up: bool) -> tuple[str, ...]:
+        """Complete new console lines of `path` from self._offset (moved past them)."""
         try:
             with path.open("rb") as f:
                 size = f.seek(0, os.SEEK_END)
@@ -222,11 +232,10 @@ class LogFollower:
                 data = f.read(size - self._offset)
         except OSError as e:
             log.debug("cannot read %s: %s", path, e)
-            return FollowResult()
-        self._first = False
+            return ()
         end = data.rfind(b"\n")
         if end < 0:
-            return FollowResult(catch_up=catch_up)
+            return ()
         skip_partial = catch_up and self._offset > 0
         self._offset += end + 1
         chunk = data[: end + 1]
@@ -246,4 +255,4 @@ class LogFollower:
                 self.last_error = text
             else:
                 lines.append(text)
-        return FollowResult(tuple(lines), catch_up)
+        return tuple(lines)

@@ -191,6 +191,7 @@ def svc(env: Env, monkeypatch: pytest.MonkeyPatch) -> SvcEnv:  # noqa: F811 - im
     # pytest's tmp_path is under the profile on Windows (AppData\\Local\\Temp), which service
     # mode refuses; test_plan_service_under_the_profile_is_refused checks the real rule.
     monkeypatch.setattr(manager_mod, "_under_profile", lambda _path: False)
+    monkeypatch.setattr(manager_mod, "SERVICE_SETTLE_S", 0.0)  # no real waiting in tests
     return SvcEnv(env)
 
 
@@ -643,3 +644,40 @@ def test_add_service_timeout_rolls_back_as_registered(svc: SvcEnv) -> None:
         svc.add()
     assert svc.remote_ids() == []  # rolled back as "may be registered"
     assert not (svc.env.root / REPO).exists()
+
+
+def test_remove_service_runner_refused_by_the_helper_changes_nothing(
+    svc: SvcEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = svc.add()
+    monkeypatch.setattr(elevated, "MAX_REQUEST_AGE_S", 0.0)  # a UAC prompt left open too long
+    with pytest.raises(ServiceError, match="没有做任何改动"):
+        svc.manager.remove_runner(record.id)
+    assert Path(record.path).is_dir() and svc.env.config().runners == [record]
+    assert svc.services.query(service_name()).state is ServiceState.RUNNING
+    assert svc.remote_ids() == [AGENT_ID]
+
+
+def test_start_service_that_quits_right_after_running(svc: SvcEnv) -> None:
+    record = svc.add()
+    svc.manager.stop_service(record.id)
+    queries = {"n": 0}
+    original_query = svc.services.query
+
+    def query(name: str) -> ServiceInfo:
+        info = original_query(name)
+        if info.state is ServiceState.RUNNING:
+            queries["n"] += 1
+            if queries["n"] > 1:  # RUNNING once, then the Listener gives up
+                return ServiceInfo(name, ServiceState.STOPPED, exit_code=1)
+        return info
+
+    svc.services.query = query  # type: ignore[method-assign]
+    with pytest.raises(ServiceError, match="启动后退出"):
+        svc.manager.start_service(record.id)
+
+
+def test_local_only_remove_names_the_service(svc: SvcEnv) -> None:
+    record = svc.add()
+    result = svc.manager.remove_runner(record.id, local_only=True)
+    assert any("sc delete" in w and service_name() in w for w in result.warnings)

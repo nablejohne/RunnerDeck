@@ -292,3 +292,16 @@ def test_log_follower_catch_up_starts_mid_file(tmp_path: Path) -> None:
 
 def test_log_follower_without_logs(tmp_path: Path) -> None:
     assert diag.LogFollower(tmp_path).poll() == diag.FollowResult()
+
+
+def test_log_follower_finishes_the_old_file_before_switching(tmp_path: Path) -> None:
+    first = write_log(tmp_path, "Runner_1.log", LISTEN, RUNNING, mtime=1_000)
+    follower = diag.LogFollower(tmp_path)
+    follower.poll()
+    with first.open("a", encoding="utf-8") as f:
+        f.write(DONE + "\n")
+    os.utime(first, (1_000, 1_000))
+    write_log(tmp_path, "Runner_2.log", LISTEN, mtime=2_000)  # restarted between two polls
+    result = follower.poll()
+    assert result.lines[0].endswith("completed with result: Succeeded")
+    assert result.lines[-1].endswith("Listening for Jobs") and not result.catch_up

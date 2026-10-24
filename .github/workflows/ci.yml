@@ -72,6 +72,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "runnerdeck-cli.exe --version exited $LASTEXITCODE" }
           if ($out -notlike "*$expected*") { throw "runnerdeck-cli.exe --version did not print $expected" }
 
+          # runnerdeck-cli.exe elevated (what the UAC prompt starts) must import pywin32 and
+          # answer an unknown operation with a result file.
+          $req = Join-Path $env:RUNNER_TEMP 'elevated-smoke.json'
+          Set-Content -LiteralPath $req -Value '{"version": 1, "op": "nope"}' -Encoding utf8NoBOM
+          & (Join-Path $dist 'runnerdeck-cli.exe') elevated $req
+          Write-Host "runnerdeck-cli elevated (unknown op) -> exit $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 1) { throw "runnerdeck-cli.exe elevated exited $LASTEXITCODE, expected 1" }
+          $res = Join-Path $env:RUNNER_TEMP 'elevated-smoke.result.json'
+          if (-not (Select-String -LiteralPath $res -Pattern 'nope' -Quiet)) { throw "no result file from runnerdeck-cli.exe elevated" }
+          if (Test-Path -LiteralPath $req) { throw "runnerdeck-cli.exe elevated did not delete its request" }
+
           # runnerdeck-helper.exe without arguments: usage on stderr, exit code 2.
           $p = Start-Process -FilePath (Join-Path $dist 'runnerdeck-helper.exe') -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput helper-stdout.txt -RedirectStandardError helper-stderr.txt
