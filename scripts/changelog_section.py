@@ -68,7 +68,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not body:
         print(f'错误：{path.name} 的 "## [{version}]" 段落是空的', file=sys.stderr)
         return 1
-    print(body)
+    # Release notes are UTF-8 whatever the console code page is (cp1252 on the Windows runner
+    # cannot encode the Chinese UI texts quoted in the changelog).
+    sys.stdout.buffer.write((body + "\n").encode("utf-8"))
+    sys.stdout.flush()
     return 0
 
 

@@ -122,3 +122,10 @@ def test_repo_changelog_has_a_section_for_the_project_version() -> None:
     version = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
     assert "## [Unreleased]" in text
     assert extract_section(text, version if version != "0.0.0" else "Unreleased")
+
+
+def test_main_writes_utf8_bytes(tmp_path: Path, capfdbinary: pytest.CaptureFixture[bytes]) -> None:
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text("## [1.0.0] - 2026-10-24\n\n- 托盘图标\n", encoding="utf-8")
+    assert main(["1.0.0", str(changelog)]) == 0
+    assert "托盘图标".encode() in capfdbinary.readouterr().out
