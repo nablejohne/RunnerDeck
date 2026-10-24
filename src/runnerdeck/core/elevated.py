@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import Callable, Mapping
@@ -25,7 +26,11 @@ log = logging.getLogger(__name__)
 # A freshly installed service whose Listener cannot start quits within a second or two
 # (spike-notes §12); watch it this long before reporting success.
 STAYS_RUNNING_S = 10.0
-_SID_RE = re.compile(r"^S-1-\d+(?:-\d+)+$")
+# A request is written right before the UAC prompt; an old one was not meant for this prompt.
+MAX_REQUEST_AGE_S = 600.0
+# Only user accounts get start / stop rights: local / domain (S-1-5-21-...) or Entra ID
+# (S-1-12-1-...), never a group such as Everyone or Authenticated Users.
+_SID_RE = re.compile(r"^S-1-(?:5-21|12-1)(?:-\d+){4,}$")
 
 
 class _Context:
@@ -54,6 +59,7 @@ def main(
     request = Path(request_path)
     result_path = request.with_name(request.stem + RESULT_SUFFIX)
     try:
+        age_s = time.time() - os.stat(request).st_mtime
         text = request.read_text(encoding="utf-8")
     except OSError as e:
         log.error("cannot read elevated request %s: %s", request, e)
@@ -68,7 +74,9 @@ def main(
         data = json.loads(text)
         if not isinstance(data, dict) or data.get("version") != REQUEST_VERSION:
             raise InvalidInputError("管理员操作的请求格式不对")
-        for key in ("token", "remove_token"):
+        if not -60 < age_s < MAX_REQUEST_AGE_S:
+            raise InvalidInputError("管理员操作的请求已过期，请重新操作")
+        for key in ("token", "remove_token", "second_remove_token"):
             if isinstance(data.get(key), str):
                 register_secret(data[key])
         op = data.get("op")
@@ -101,9 +109,10 @@ def _str(data: Mapping[str, Any], key: str) -> str:
 
 
 def _runner_dir(data: Mapping[str, Any], *, must_exist: bool = True) -> Path:
-    path = Path(_str(data, "runner_dir"))
-    if not path.is_absolute():
-        raise InvalidInputError(f"runner 目录必须是绝对路径：{path}")
+    raw = _str(data, "runner_dir")
+    path = Path(raw)
+    if not path.is_absolute() or raw.startswith(("\\\\", "//")):
+        raise InvalidInputError(f"runner 目录必须是本机的绝对路径：{raw}")
     if must_exist and not runner_file.looks_like_runner_dir(path):
         raise InvalidInputError(f"{path} 不是 runner 目录（缺少 config.cmd 或 run.cmd）")
     return path
@@ -310,6 +319,9 @@ def _op_remove_service(ctx: _Context, data: Mapping[str, Any]) -> ElevatedResult
     unconfigured directory only gets its service deleted (the caller DELETEs via the API)."""
     name = service.check_service_name(_str(data, "service_name"))
     runner_dir = _runner_dir(data, must_exist=False)
+    recorded = service.read_service_name(runner_dir)
+    if recorded is not None and recorded != name:
+        raise InvalidInputError(f"{runner_dir} 的服务是 {recorded}，不是 {name}")
     if runner_file.looks_like_runner_dir(runner_dir) and runner_file.is_configured(runner_dir):
         try:
             removed = installer.unconfigure(

@@ -95,6 +95,10 @@ class ElevationRequiredError(ServiceError):
     """The service manager refused access: the operation needs administrator rights."""
 
 
+class ElevationTimeoutError(ServiceError):
+    """The elevated helper did not finish in time; it may still be running (state unknown)."""
+
+
 class ElevationCancelledError(RunnerDeckError):
     """The user answered "No" in the UAC prompt (nothing was changed)."""
 

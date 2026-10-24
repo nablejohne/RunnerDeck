@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from runnerdeck.core import paths
-from runnerdeck.core.errors import ElevationCancelledError, ServiceError
+from runnerdeck.core.errors import ElevationCancelledError, ElevationTimeoutError, ServiceError
 
 log = logging.getLogger(__name__)
 
@@ -228,7 +228,10 @@ def shell_execute_runas(executable: str, parameters: str, timeout_s: float) -> i
     try:
         wait_ms = min(int(timeout_s * 1000), infinite_cap_ms)
         if kernel32.WaitForSingleObject(info.hProcess, wait_ms) != wait_object_0:
-            raise ServiceError(f"管理员操作 {int(timeout_s)} 秒内没有完成")
+            raise ElevationTimeoutError(
+                f"管理员操作 {int(timeout_s)} 秒内没有完成，可能仍在进行；"
+                "请稍后在“服务”里检查是否留下了 actions.runner.* 服务"
+            )
         code = wintypes.DWORD()
         kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
         return int(code.value)

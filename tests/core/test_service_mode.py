@@ -552,3 +552,94 @@ def test_default_launcher_runs_in_process_when_elevated(monkeypatch: pytest.Monk
     monkeypatch.setattr(elevate, "shell_execute_runas", lambda *a: pytest.fail("prompted"))
     assert elevate.default_launcher("x.exe", r'elevated "C:\a b\r.json"', 5) == 0
     assert seen == [r"C:\a b\r.json"]
+
+
+# --- review fixes: the helper's input checks, timeouts --------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("request_", "message"),
+    [
+        ({"version": 1, "op": "install_service", "runner_dir": "\\\\server\\share\\r"}, "本机"),
+        ({"version": 1, "op": "install_service", "runner_dir": "//server/share/r"}, "本机"),
+        (
+            {
+                "version": 1,
+                "op": "grant_control",
+                "service_name": service_name(),
+                "grant_sid": "S-1-1-0",
+            },
+            "SID",
+        ),
+        (
+            {
+                "version": 1,
+                "op": "grant_control",
+                "service_name": service_name(),
+                "grant_sid": "S-1-5-11",
+            },
+            "SID",
+        ),
+    ],
+)
+def test_helper_rejects_remote_dirs_and_group_sids(
+    tmp_path: Path, request_: Any, message: str
+) -> None:
+    code, result = run_helper(tmp_path, request_)
+    assert code == 1 and message in (result.error or "")
+
+
+def test_helper_rejects_an_old_request(tmp_path: Path) -> None:
+    import os
+    import time
+
+    path = tmp_path / "req.json"
+    path.write_text(json.dumps({"version": 1, "op": "grant_control"}), "utf-8")
+    old = time.time() - 3600
+    os.utime(path, (old, old))
+    assert elevated.main(str(path), services=FakeServices()) == 1
+    result = ElevatedResult.from_json((tmp_path / ("req" + RESULT_SUFFIX)).read_text("utf-8"))
+    assert "过期" in (result.error or "")
+
+
+def test_helper_remove_checks_the_service_name(tmp_path: Path) -> None:
+    runner_dir = make_runner_dir(tmp_path / "r")
+    (runner_dir / ".service").write_text(service_name("other"), encoding="utf-8")
+    request = {
+        "version": 1, "op": "remove_service", "service_name": service_name(),
+        "runner_dir": str(runner_dir), "remove_token": "FAKEREMOVETOKEN000000000002",
+    }  # fmt: skip
+    code, result = run_helper(tmp_path, request)
+    assert code == 1 and "不是" in (result.error or "")
+
+
+def test_add_service_timeout_rolls_back_as_registered(svc: SvcEnv) -> None:
+    from runnerdeck.core.errors import ElevationTimeoutError
+
+    def slow(_exe: str, _params: str, _timeout: float) -> int:
+        svc.cmd(  # the helper got as far as registering before we gave up on it
+            [
+                *[
+                    "cmd.exe",
+                    "/c",
+                    "config.cmd",
+                    "--unattended",
+                    "--url",
+                    f"https://github.com/{OWNER}/{REPO}",
+                ],
+                "--token",
+                "FAKEREGTOKEN0000000000000001",
+                "--name",
+                DEFAULT_NAME,
+                "--work",
+                "_work",
+            ],
+            cwd=svc.env.root / REPO,
+        )
+        raise ElevationTimeoutError("管理员操作 300 秒内没有完成")
+
+    svc.manager._elevator = Elevator(launcher=slow, directory=svc.env.tmp / "elevate")
+    with pytest.raises(ElevationTimeoutError):
+        svc.add()
+    assert svc.remote_ids() == []  # rolled back as "may be registered"
+    assert not (svc.env.root / REPO).exists()

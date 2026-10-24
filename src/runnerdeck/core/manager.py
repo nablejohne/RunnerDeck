@@ -52,6 +52,7 @@ from runnerdeck.core import (
 from runnerdeck.core.elevate import ElevatedResult, Elevator
 from runnerdeck.core.errors import (
     ElevationRequiredError,
+    ElevationTimeoutError,
     GitHubError,
     InstallError,
     InvalidInputError,
@@ -737,6 +738,10 @@ class RunnerManager:
                     result = self._install_service(client, plan, secret, child_env, report)
                 except ServiceInstallError as e:
                     registered, agent_id = e.result.registered, e.result.agent_id
+                    raise
+                except ElevationTimeoutError:
+                    # The helper may still be registering: roll back as if it had.
+                    registered = True
                     raise
                 registered, service_name = True, result.service_name
             else:
