@@ -55,6 +55,7 @@ from runnerdeck.core.models import (
     AppConfig,
     Discovery,
     LocalState,
+    ProxyApplyResult,
     RemoteRunner,
     RemoteStatus,
     RunnerRecord,
@@ -105,6 +106,9 @@ _DOWNLOAD_UNKNOWN_STEP = 10 * _MB  # progress granularity when the size is unkno
 POWERSHELL_POLICY_ENV: Mapping[str, str] = MappingProxyType(
     {"PSExecutionPolicyPreference": "RemoteSigned"}
 )
+# `.env` keys RunnerDeck manages for settings.proxy (m4-design §3): a service-mode runner does
+# not inherit our environment, and NETWORK SERVICE has no system proxy of its own.
+PROXY_ENV_KEYS: tuple[str, ...] = ("https_proxy", "http_proxy")
 
 
 class Step(StrEnum):
@@ -580,6 +584,7 @@ class RunnerManager:
             with closing(self._client_factory()) as client:
                 zip_path = self._prepare_package(client, plan, report)
                 report(Step.EXTRACT, f"解压到 {plan.target_dir}")
+                self._ensure_runners_root(plan.target_dir.parent)
                 installer.extract_runner(zip_path, plan.target_dir)
                 record = self._register_extracted(client, plan, report, child_env, auto_start)
             try:
@@ -592,6 +597,39 @@ class RunnerManager:
         )
         log.info("added runner %s for %s at %s", record.name, record.full_name, record.path)
         return record
+
+    @staticmethod
+    def _ensure_runners_root(root: Path) -> None:
+        """Create a missing runners root; a root RunnerDeck creates itself is hardened
+        (installer.harden_root_dir, m4-design §6). An existing root is never touched here."""
+        if root.exists():
+            return
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise InstallError(f"无法创建 runner 根目录 {root}：{e.strerror or e}") from e
+        if installer.root_hardening_refusal(root) is None:
+            installer.harden_root_dir(root)  # never raises; a failure is only a warning
+
+    def harden_runners_root(self) -> Path:
+        """Give the configured runners root harden_root_dir's DACL (settings page button).
+
+        InvalidInputError when the root must not be changed (drive root, profile, system
+        directory) or off Windows; InstallError when icacls failed (details in the log).
+        """
+        root = self._runners_root(self._store.load())
+        if not winproc.IS_WINDOWS:
+            raise InvalidInputError("只有 Windows 支持加固目录权限")
+        reason = installer.root_hardening_refusal(root)
+        if reason is not None:
+            raise InvalidInputError(reason)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise InstallError(f"无法创建 runner 根目录 {root}：{e.strerror or e}") from e
+        if not installer.harden_root_dir(root):
+            raise InstallError(f"加固 {root} 的权限失败，详见应用日志")
+        return root
 
     def _prepare_package(self, client: GitHubClient, plan: AddPlan, report: ProgressFn) -> Path:
         report(Step.RELEASE, f"查询 runner 版本（{plan.version or '最新版'}）")
@@ -640,10 +678,12 @@ class RunnerManager:
                 raise
             registered = True
 
+            env_updates = dict(plan.runner_env) | dict(child_env or {})
             if plan.runner_env:
-                keys = ", ".join(k for k, _ in plan.runner_env)
+                keys = ", ".join(env_updates)
                 report(Step.ENV, f"写入 runner 环境变量（.env：{keys}）")
-                installer.write_env_file(runner_dir, dict(plan.runner_env))
+            if env_updates:  # the proxy alone has no wizard step: written silently
+                installer.write_env_file(runner_dir, env_updates)
 
             report(Step.VERIFY, "读取 .runner")
             file_info = runner_file.read_runner_file(runner_dir)
@@ -1383,6 +1423,60 @@ class RunnerManager:
             last_error=proc.last_error,
         )
 
+    @staticmethod
+    def _sync_proxy_env(record: RunnerRecord, proxy: str | None) -> None:
+        """Before a start: put settings.proxy into `.env` where a managed key is missing
+        (runners added before M4, imported ones). Values already there are left alone:
+        apply_proxy migrates ours, the others are the user's. Best effort, never raises."""
+        wanted = _proxy_env(proxy)
+        if not wanted:
+            return
+        runner_dir = Path(record.path)
+        try:
+            current = installer.read_env_values(runner_dir)
+            missing = {k: v for k, v in wanted.items() if k.casefold() not in current}
+            if missing:
+                installer.write_env_file(runner_dir, missing)
+        except RunnerDeckError as e:
+            log.warning("could not write the proxy into %s/.env: %s", runner_dir, e)
+
+    def apply_proxy(self, old: str | None, new: str | None) -> ProxyApplyResult:
+        """settings.proxy changed from `old` to `new`: rewrite each runner's managed `.env`
+        keys that are missing or still hold `old` (deleted when `new` is empty). A key with
+        any other value is the user's own and is left alone (reported in `custom`)."""
+        before, after = _proxy_env(old) or {}, _proxy_env(new) or {}
+        updated: list[str] = []
+        custom: list[str] = []
+        failed: list[tuple[str, str]] = []
+        for record in self._store.load().runners:
+            runner_dir = Path(record.path)
+            if not runner_dir.is_dir():
+                continue
+            try:
+                current = installer.read_env_values(runner_dir)
+                changes: dict[str, str | None] = {}
+                kept = False
+                for key in PROXY_ENV_KEYS:
+                    value = current.get(key.casefold())
+                    target = after.get(key)
+                    if value == target:
+                        continue
+                    if value is None or value == before.get(key):
+                        changes[key] = target
+                    else:
+                        kept = True
+                if changes:
+                    installer.write_env_file(runner_dir, changes)
+                    updated.append(record.name)
+                if kept:
+                    custom.append(record.name)
+            except RunnerDeckError as e:
+                failed.append((record.name, str(e)))
+        log.info(
+            "proxy applied: %d updated, %d custom, %d failed", *map(len, (updated, custom, failed))
+        )
+        return ProxyApplyResult(tuple(updated), tuple(custom), tuple(failed))
+
     def process_for(
         self,
         record: RunnerRecord,
@@ -1402,6 +1496,7 @@ class RunnerManager:
         console (the GUI), see process.Launch.
         """
         proxy = self._store.load().settings.proxy
+        self._sync_proxy_env(record, proxy)
         return RunnerProcess(
             Path(record.path),
             env=_proxy_env(proxy),

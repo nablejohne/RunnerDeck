@@ -777,6 +777,54 @@ def test_save_settings(make_controller: Any, qtbot: Any) -> None:
     assert h.controller.config.settings.default_labels == ["gpu"]
 
 
+def test_save_settings_applies_a_changed_proxy(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller(account="octo")
+    settings = h.controller.config.settings.model_copy(update={"proxy": "http://new:1"})
+    with qtbot.waitSignal(h.controller.proxy_applied, timeout=WAIT_MS) as blocker:
+        h.controller.save_settings(settings)
+    (result,) = blocker.args
+    assert result.updated == ("r1",)
+    assert ("apply_proxy", {"old": None, "new": "http://new:1"}) in h.manager.calls
+
+
+def test_save_settings_without_proxy_change_does_not_apply(
+    make_controller: Any, qtbot: Any
+) -> None:
+    h = make_controller(account="octo")
+    settings = h.controller.config.settings.model_copy(update={"default_labels": ["x"]})
+    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
+        h.controller.save_settings(settings)
+    assert all(name != "apply_proxy" for name, _ in h.manager.calls)
+
+
+def test_harden_runners_root(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller()
+    with qtbot.waitSignal(h.controller.runners_root_hardened, timeout=WAIT_MS) as blocker:
+        h.controller.harden_runners_root()
+    assert blocker.args == [h.store.load().settings.runners_root]
+
+
+def test_harden_runners_root_failure(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller()
+    h.manager.errors["harden_runners_root"] = InvalidInputError("是系统目录")
+    op, message, _ = _wait_failed(qtbot, h, h.controller.harden_runners_root)
+    assert (op, message) == ("harden_root", "是系统目录")
+
+
+def test_runner_version(make_controller: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from runnerdeck.core import runner_file
+
+    record = record_model()
+    h = make_controller(records=[record])
+    seen: list[Path] = []
+    monkeypatch.setattr(
+        runner_file, "read_runner_version", lambda d, **_k: seen.append(d) or "2.338.1"
+    )
+    assert h.controller.runner_version(record.id) == "2.338.1"
+    assert seen == [Path(record.path)]
+    assert h.controller.runner_version("nope") is None
+
+
 def test_save_settings_failure(
     make_controller: Any, qtbot: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

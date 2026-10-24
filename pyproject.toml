@@ -12,6 +12,8 @@ dependencies = [
     "pydantic>=2.9",
     "pyqt-fluent-widgets>=1.7",
     "pyqt5>=5.15.10,<5.16",
+    "pywin32>=308; sys_platform == 'win32'",
+    "pyyaml>=6",
     "truststore>=0.10",
 ]
 

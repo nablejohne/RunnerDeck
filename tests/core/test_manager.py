@@ -27,7 +27,7 @@ import psutil
 import pytest
 from pydantic import SecretStr
 
-from runnerdeck.core import installer
+from runnerdeck.core import installer, winproc
 from runnerdeck.core import manager as manager_mod
 from runnerdeck.core.errors import (
     AuthError,
@@ -2453,3 +2453,156 @@ def test_kill_stray_refuses_recorded_and_service_dirs(env: Env) -> None:
     with pytest.raises(InvalidInputError, match="Windows 服务"):
         env.manager.kill_stray(svc)
     assert env.stopped == []
+
+
+# --- M4: proxy in .env, runners root ACL (docs/m4-design.md §3, §6) ---------------------------
+
+
+def env_file(runner_dir: Path) -> str:
+    return (runner_dir / ".env").read_text(encoding="utf-8")
+
+
+def test_add_runner_writes_the_proxy_into_env(env: Env) -> None:
+    set_proxy(env, "127.0.0.1:7890")
+    plan = env.manager.plan_add(OWNER, REPO, runner_env={"PSExecutionPolicyPreference": "X"})
+    progress, report = collect()
+    env.manager.add_runner(plan, progress=report)
+    assert env_file(plan.target_dir).splitlines() == [
+        "PSExecutionPolicyPreference=X",
+        "https_proxy=http://127.0.0.1:7890",
+        "http_proxy=http://127.0.0.1:7890",
+    ]
+    env_texts = [text for step, text in progress if step == Step.ENV]
+    assert len(env_texts) == 1 and "https_proxy" in env_texts[0]
+    assert "7890" not in env_texts[0]  # keys only: a proxy URL can carry credentials
+
+
+def test_add_runner_proxy_only_is_written_without_an_env_step(env: Env) -> None:
+    set_proxy(env, "http://proxy:8080")
+    plan = env.manager.plan_add(OWNER, REPO)
+    progress, report = collect()
+    env.manager.add_runner(plan, progress=report)
+    assert "https_proxy=http://proxy:8080" in env_file(plan.target_dir)
+    assert Step.ENV not in steps_of(progress)
+
+
+def test_add_runner_without_proxy_or_env_writes_no_env_file(env: Env) -> None:
+    plan = env.manager.plan_add(OWNER, REPO)
+    env.manager.add_runner(plan)
+    assert not (plan.target_dir / ".env").exists()
+
+
+def test_add_runner_hardens_a_root_it_creates(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    hardened: list[Path] = []
+    monkeypatch.setattr(installer, "harden_root_dir", lambda p, **_k: hardened.append(p) or True)
+    plan = env.manager.plan_add(OWNER, REPO)
+    assert not env.root.exists()
+    env.manager.add_runner(plan)
+    assert hardened == [env.root]
+    # an existing root is left alone
+    plan2 = env.manager.plan_add(OWNER, REPO, name="second")
+    env.manager.add_runner(plan2)
+    assert hardened == [env.root]
+
+
+def test_add_runner_does_not_harden_a_refused_root(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hardened: list[Path] = []
+    monkeypatch.setattr(installer, "harden_root_dir", lambda p, **_k: hardened.append(p) or True)
+    monkeypatch.setattr(installer, "root_hardening_refusal", lambda _p: "系统目录")
+    env.manager.add_runner(env.manager.plan_add(OWNER, REPO))
+    assert hardened == []
+
+
+def test_process_for_adds_missing_proxy_keys_only(env: Env) -> None:
+    set_proxy(env, "http://new:1")
+    runner_dir = make_runner_dir(env.root / "p")
+    (runner_dir / ".env").write_text("HTTPS_PROXY=http://mine:9\n", encoding="utf-8")
+    record = env.seed(path=str(runner_dir))
+    env.manager.process_for(record)
+    assert env_file(runner_dir).splitlines() == [
+        "HTTPS_PROXY=http://mine:9",
+        "http_proxy=http://new:1",
+    ]
+
+
+def test_process_for_without_proxy_leaves_env_alone(env: Env) -> None:
+    record = env.seed(path=str(make_runner_dir(env.root / "p")))
+    env.manager.process_for(record)
+    assert not (Path(record.path) / ".env").exists()
+
+
+def test_process_for_survives_an_unwritable_env(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    set_proxy(env, "http://new:1")
+    record = env.seed(path=str(make_runner_dir(env.root / "p")))
+
+    def broken(*_a: Any, **_k: Any) -> None:
+        raise InstallError("无法写入 .env")
+
+    monkeypatch.setattr(installer, "write_env_file", broken)
+    assert env.manager.process_for(record) is not None
+
+
+def test_apply_proxy(env: Env) -> None:
+    def runner(name: str, env_text: str | None) -> Path:
+        runner_dir = make_runner_dir(env.root / name)
+        if env_text is not None:
+            (runner_dir / ".env").write_text(env_text, encoding="utf-8")
+        env.seed(name=name, path=str(runner_dir))
+        return runner_dir
+
+    ours = runner("ours", "A=1\nhttps_proxy=http://old:1\nhttp_proxy=http://old:1\n")
+    bare = runner("bare", None)
+    mine = runner("mine", "https_proxy=http://custom:3\n")
+    same = runner("same", "https_proxy=http://new:2\nhttp_proxy=http://new:2\n")
+    env.seed(name="gone", path=str(env.root / "gone"))
+    broken = runner("broken", None)
+    (broken / ".env").write_bytes(b"\xff\xfe\x00")
+
+    result = env.manager.apply_proxy("old:1", "http://new:2")
+
+    assert env_file(ours).splitlines() == [
+        "A=1",
+        "https_proxy=http://new:2",
+        "http_proxy=http://new:2",
+    ]
+    assert env_file(bare).splitlines() == ["https_proxy=http://new:2", "http_proxy=http://new:2"]
+    assert env_file(mine).splitlines() == ["https_proxy=http://custom:3", "http_proxy=http://new:2"]
+    assert result.updated == ("ours", "bare", "mine")
+    assert result.custom == ("mine",)
+    assert [name for name, _ in result.failed] == ["broken"]
+    assert "same" not in result.updated
+    assert env_file(same).count("new:2") == 2
+
+
+def test_apply_proxy_cleared_removes_our_keys_only(env: Env) -> None:
+    ours = make_runner_dir(env.root / "ours")
+    (ours / ".env").write_text(
+        "https_proxy=http://old:1\nhttp_proxy=http://mine:9\n", encoding="utf-8"
+    )
+    env.seed(name="ours", path=str(ours))
+    result = env.manager.apply_proxy("http://old:1", None)
+    assert env_file(ours).splitlines() == ["http_proxy=http://mine:9"]
+    assert result.updated == ("ours",) and result.custom == ("ours",)
+
+
+def test_harden_runners_root(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(winproc, "IS_WINDOWS", False)
+    with pytest.raises(InvalidInputError, match="Windows"):
+        env.manager.harden_runners_root()
+
+    monkeypatch.setattr(winproc, "IS_WINDOWS", True)
+    monkeypatch.setattr(installer, "root_hardening_refusal", lambda _p: "是系统目录")
+    with pytest.raises(InvalidInputError, match="是系统目录"):
+        env.manager.harden_runners_root()
+
+    monkeypatch.setattr(installer, "root_hardening_refusal", lambda _p: None)
+    monkeypatch.setattr(installer, "harden_root_dir", lambda _p, **_k: False)
+    with pytest.raises(InstallError, match="详见应用日志"):
+        env.manager.harden_runners_root()
+
+    hardened: list[Path] = []
+    monkeypatch.setattr(installer, "harden_root_dir", lambda p, **_k: hardened.append(p) or True)
+    assert env.manager.harden_runners_root() == env.root
+    assert hardened == [env.root] and env.root.is_dir()

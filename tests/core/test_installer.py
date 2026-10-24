@@ -928,6 +928,80 @@ def test_harden_runner_dir_failure_only_warns(
     assert logged in logged_warnings[0]
 
 
+def test_harden_root_dir_adds_list_only_access_for_authenticated_users(
+    tmp_path: Path, fake_windows: None
+) -> None:
+    run = ScriptedRun((0, WHOAMI_OUT), (0, b""), (0, b""))
+    assert installer.harden_root_dir(tmp_path, run=run) is True
+    assert run.calls[2][0] == [
+        _system32("icacls.exe"), str(tmp_path), "/inheritance:r", "/grant:r",
+        f"*{USER_SID}:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F",
+        "*S-1-5-11:(RX)", "/q",
+    ]  # fmt: skip
+
+
+def test_harden_root_dir_failure_names_the_root(
+    tmp_path: Path, fake_windows: None, logged_warnings: list[str]
+) -> None:
+    run = ScriptedRun((0, WHOAMI_OUT), (5, b"Access is denied.\r\n"))
+    assert installer.harden_root_dir(tmp_path, run=run) is False
+    assert logged_warnings and "not restricting runners root ACL" in logged_warnings[0]
+
+
+def test_harden_root_dir_is_a_noop_off_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(winproc, "IS_WINDOWS", False)
+    run = ScriptedRun()
+    assert installer.harden_root_dir(tmp_path, run=run) is False
+    assert run.calls == []
+
+
+@pytest.mark.parametrize(
+    ("candidate", "refused"),
+    [
+        ("runners", False),
+        ("home/me/runners", False),
+        ("home/me", True),  # the profile itself
+        ("home", True),  # contains the profile
+        ("sys/win", True),
+        ("sys/win/Temp/runners", True),
+        ("data/RunnerDeck", True),
+        ("sys", True),  # contains SystemRoot
+    ],
+)
+def test_root_hardening_refusal(tmp_path: Path, candidate: str, refused: bool) -> None:
+    environ = {
+        "USERPROFILE": str(tmp_path / "home/me"),
+        "SystemRoot": str(tmp_path / "sys/win"),
+        "ProgramData": str(tmp_path / "data"),
+    }
+    reason = installer.root_hardening_refusal(tmp_path / candidate, environ=environ)
+    assert (reason is not None) is refused, reason
+
+
+def test_root_hardening_refusal_drive_root_and_relative() -> None:
+    assert "整个磁盘" in (installer.root_hardening_refusal(Path(Path.cwd().anchor)) or "")
+    assert "绝对路径" in (installer.root_hardening_refusal(Path("runners")) or "")
+
+
+# --- read_env_values -----------------------------------------------------------------------
+
+
+def test_read_env_values(tmp_path: Path) -> None:
+    assert installer.read_env_values(tmp_path) == {}
+    (tmp_path / ".env").write_bytes(
+        "\ufeffHTTPS_PROXY=http://a:1\r\nnot a pair\r\nhttps_proxy=http://b:2\r\nX=\r\n".encode()
+    )
+    assert installer.read_env_values(tmp_path) == {"https_proxy": "http://a:1", "x": ""}
+
+
+def test_read_env_values_unreadable(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_bytes(b"\xff\xfe\x00bad")
+    with pytest.raises(InstallError, match="无法读取"):
+        installer.read_env_values(tmp_path)
+
+
 # --- write_env_file ----------------------------------------------------------------------------
 
 

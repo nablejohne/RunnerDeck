@@ -37,7 +37,7 @@ from qfluentwidgets import FluentIcon as FIF
 from runnerdeck import __version__
 from runnerdeck.core import paths
 from runnerdeck.core.account import TOKEN_KIND_LABELS, format_expiry
-from runnerdeck.core.models import AppSettings, AutostartState
+from runnerdeck.core.models import AppSettings, AutostartState, ProxyApplyResult
 from runnerdeck.ui.components.login_dialog import LoginDialog
 from runnerdeck.ui.theme import THEME_LABELS
 
@@ -54,6 +54,11 @@ NOTIFY_OPTIONS: tuple[tuple[str, str], ...] = (
     ("all", "全部"),
     ("failed", "仅失败"),
     ("off", "关闭"),
+)
+HARDEN_ROOT_TEXT = "只允许管理员、SYSTEM 和你修改根目录；其他用户只能看到目录名"
+HARDEN_ROOT_CONFIRM = (
+    "将改写这个目录的权限：管理员、SYSTEM 和你完全控制（子目录继承），其他用户只能列出目录名，"
+    "不能在里面新建或修改文件。已有的 runner 目录各有自己的权限，不受影响。"
 )
 LAUNCH_TEXT = "登录 Windows 后自动在托盘启动 RunnerDeck（并拉起设为随 RunnerDeck 启动的 runner）"
 LAUNCH_ON_TEXT = "已开启：登录 Windows 后自动在托盘启动 RunnerDeck"
@@ -229,6 +234,13 @@ class SettingsPage(ScrollArea):
         self.rootCard = PushSettingCard(
             "选择目录", FIF.FOLDER, "runner 根目录", "", self.runnerGroup
         )
+        self.hardenRootCard = PushSettingCard(
+            "加固权限",
+            FIF.CERTIFICATE,
+            "根目录权限",
+            HARDEN_ROOT_TEXT,
+            self.runnerGroup,
+        )
         self.labelsCard = LineEditSettingCard(
             FIF.TAG,
             "默认标签",
@@ -239,7 +251,7 @@ class SettingsPage(ScrollArea):
         self.proxyCard = LineEditSettingCard(
             FIF.GLOBE,
             "代理",
-            "访问 GitHub 和下载 runner 时使用；留空则不设置",
+            "访问 GitHub、下载 runner 时使用，并写入每个 runner 的 .env；留空则不设置",
             "http://127.0.0.1:7890",
             self.runnerGroup,
         )
@@ -251,6 +263,7 @@ class SettingsPage(ScrollArea):
             self.runnerGroup,
         )
         self.runnerGroup.addSettingCard(self.rootCard)
+        self.runnerGroup.addSettingCard(self.hardenRootCard)
         self.runnerGroup.addSettingCard(self.labelsCard)
         self.runnerGroup.addSettingCard(self.proxyCard)
         self.runnerGroup.addSettingCard(self.pollCard)
@@ -316,6 +329,7 @@ class SettingsPage(ScrollArea):
         self.accountCard.clicked.connect(self.change_pat)
         self.logoutCard.clicked.connect(self.ask_logout)
         self.rootCard.clicked.connect(self.choose_root)
+        self.hardenRootCard.clicked.connect(self.ask_harden_root)
         self.labelsCard.committed.connect(self._on_labels_committed)
         self.proxyCard.committed.connect(self._on_proxy_committed)
         self.pollCard.selected.connect(lambda value: self._save(poll_interval_s=value))
@@ -335,6 +349,8 @@ class SettingsPage(ScrollArea):
         controller.logged_in.connect(self._on_logged_in)
         controller.logged_out.connect(self._on_logged_out)
         controller.autostart_state_loaded.connect(self._on_autostart_state_loaded)
+        controller.proxy_applied.connect(self._on_proxy_applied)
+        controller.runners_root_hardened.connect(self._on_root_hardened)
         controller.failed.connect(self._on_failed)
 
         self.refresh()
@@ -478,6 +494,43 @@ class SettingsPage(ScrollArea):
     def set_root(self, root: str) -> None:
         if root != self.settings.runners_root:
             self._save(runners_root=root)
+
+    def ask_harden_root(self) -> None:
+        box = MessageBox(
+            "加固根目录权限",
+            f"{self.settings.runners_root}\n\n{HARDEN_ROOT_CONFIRM}",
+            self.window(),
+        )
+        box.yesButton.setText("加固")
+        box.cancelButton.setText("取消")
+        if box.exec():
+            self._controller.harden_runners_root()
+
+    def _on_root_hardened(self, root: str) -> None:
+        InfoBar.success(
+            "已加固", f"{root} 现在只有管理员、SYSTEM 和你可以修改", parent=self,
+            position=InfoBarPosition.TOP, duration=5000,
+        )  # fmt: skip
+
+    def _on_proxy_applied(self, result: ProxyApplyResult) -> None:
+        if result.updated:
+            InfoBar.success(
+                "代理已写入 runner",
+                f"已更新 {len(result.updated)} 个 runner 的 .env；正在运行的 runner 重启后生效",
+                parent=self, position=InfoBarPosition.TOP, duration=6000,
+            )  # fmt: skip
+        if result.custom:
+            InfoBar.warning(
+                "保留了自定义代理",
+                f"{'、'.join(result.custom)} 的 .env 里有你自己写的代理，没有改动",
+                parent=self, position=InfoBarPosition.TOP, duration=8000,
+            )  # fmt: skip
+        if result.failed:
+            InfoBar.error(
+                "写入代理失败",
+                "；".join(f"{name}：{reason}" for name, reason in result.failed),
+                parent=self, position=InfoBarPosition.TOP, duration=10000,
+            )  # fmt: skip
 
     def _on_labels_committed(self, text: str) -> None:
         labels = [part.strip() for part in text.split(",") if part.strip()]

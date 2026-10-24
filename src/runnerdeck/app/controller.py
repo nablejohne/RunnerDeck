@@ -38,7 +38,7 @@ from PyQt5.QtCore import QObject, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices
 
 from runnerdeck.app.workers import Task, submit
-from runnerdeck.core import account, secrets
+from runnerdeck.core import account, runner_file, secrets
 from runnerdeck.core.errors import InvalidInputError, RunnerDeckError
 from runnerdeck.core.github_client import GitHubClient
 from runnerdeck.core.manager import (
@@ -56,6 +56,7 @@ from runnerdeck.core.models import (
     DiagLog,
     GitHubUser,
     LocalState,
+    ProxyApplyResult,
     RemoteStatus,
     Repo,
     RunnerRecord,
@@ -240,6 +241,9 @@ class RunnerController(QObject):
     diag_logs_loaded = pyqtSignal(str, object)  # record id, list[DiagLog]
     diag_text_loaded = pyqtSignal(str, str, str)  # record id, path, text
     autostart_state_loaded = pyqtSignal(object)  # AutostartState
+    # M4 (docs/m4-design.md §3, §6)
+    proxy_applied = pyqtSignal(object)  # ProxyApplyResult, after a proxy change was saved
+    runners_root_hardened = pyqtSignal(str)  # runners root path
 
     def __init__(
         self,
@@ -919,8 +923,11 @@ class RunnerController(QObject):
             on_finished=self._settings_saved,
         )
 
-    def _do_save_settings(self, changes: dict[str, Any]) -> AutostartState | None:  # worker
+    def _do_save_settings(
+        self, changes: dict[str, Any]
+    ) -> tuple[AutostartState | None, ProxyApplyResult | None]:  # worker
         config = self._store.load()
+        old_proxy = config.settings.proxy
         state: AutostartState | None = None
         wanted = changes.get("launch_on_login")
         if (
@@ -931,12 +938,36 @@ class RunnerController(QObject):
             state = self._autostart.enable() if wanted else self._autostart.disable()
         config.settings = config.settings.model_copy(update=changes)
         self._store.save(config)
-        return state
+        applied = None
+        if "proxy" in changes and changes["proxy"] != old_proxy:
+            # Into every runner's .env (m4-design §3); running ones pick it up on restart.
+            applied = self._manager.apply_proxy(old_proxy, changes["proxy"])
+        return state, applied
 
-    def _settings_saved(self, state: AutostartState | None) -> None:
+    def _settings_saved(
+        self, result: tuple[AutostartState | None, ProxyApplyResult | None]
+    ) -> None:
+        state, applied = result
         if state is not None:
             self.autostart_state_loaded.emit(state)
         self._reload_config("settings")
+        if applied is not None:
+            self.proxy_applied.emit(applied)
+
+    def harden_runners_root(self) -> None:
+        """Restrict the runners root's ACL on a worker (manager.harden_runners_root);
+        `runners_root_hardened(path)`; failed("harden_root")."""
+        self._submit(
+            "harden_root",
+            self._manager.harden_runners_root,
+            on_finished=lambda root: self.runners_root_hardened.emit(str(root)),
+        )
+
+    def runner_version(self, record_id: str) -> str | None:
+        """The runner version installed in the record's directory (cached by the exe's
+        mtime, so cheap enough for the main thread), or None if unknown."""
+        record = self._config.get(record_id)
+        return None if record is None else runner_file.read_runner_version(Path(record.path))
 
     def open_dir(self, record_id: str) -> None:
         """Open the runner directory in the file manager (main thread, no signal on success)."""

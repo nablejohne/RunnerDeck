@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import QFileDialog
 from pytestqt.qtbot import QtBot
 from qfluentwidgets import MessageBox
 
-from runnerdeck.core.models import AppConfig, AppSettings, AutostartState
+from runnerdeck.core.models import AppConfig, AppSettings, AutostartState, ProxyApplyResult
 from runnerdeck.ui.components.login_dialog import LoginDialog
 from runnerdeck.ui.pages.settings_page import (
     LAUNCH_DISABLED_TEXT,
@@ -307,3 +307,37 @@ def test_switch_cards_use_chinese_labels(page: SettingsPage) -> None:
     assert page.startMinimizedCard.switchButton.getText() == "关"
     page.startMinimizedCard.switchButton.setChecked(True)
     assert page.startMinimizedCard.switchButton.getText() == "开"
+
+
+def test_harden_root_asks_first(
+    page: SettingsPage, fake: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(MessageBox, "exec", lambda self: False)
+    page.hardenRootCard.clicked.emit()
+    assert not fake.calls_of("harden_runners_root")
+    monkeypatch.setattr(MessageBox, "exec", lambda self: True)
+    page.hardenRootCard.clicked.emit()
+    assert fake.calls_of("harden_runners_root") == [((), {})]
+
+
+def test_root_hardened_and_proxy_applied_show_info_bars(
+    page: SettingsPage, fake: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from runnerdeck.ui.pages import settings_page
+
+    shown: list[tuple[str, str, str]] = []
+    for kind in ("success", "warning", "error"):
+        monkeypatch.setattr(
+            settings_page.InfoBar,
+            kind,
+            lambda title, content, *a, _k=kind, **kw: shown.append((_k, title, content)),
+        )
+    fake.runners_root_hardened.emit("D:\\runners")
+    fake.proxy_applied.emit(
+        ProxyApplyResult(updated=("a", "b"), custom=("b",), failed=(("c", "无法写入"),))
+    )
+    fake.proxy_applied.emit(ProxyApplyResult())
+    kinds = [k for k, _, _ in shown]
+    assert kinds == ["success", "success", "warning", "error"]
+    assert "D:\\runners" in shown[0][2]
+    assert "2 个" in shown[1][2] and "b" in shown[2][2] and "c：无法写入" in shown[3][2]

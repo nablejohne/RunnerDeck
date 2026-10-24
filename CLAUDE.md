@@ -4,7 +4,7 @@ Windows 托盘应用：管理多个仓库级 GitHub Actions self-hosted runner�
 
 ## 技术栈
 - Python 3.11, PyQt5 5.15, PyQt-Fluent-Widgets (import qfluentwidgets)
-- httpx, pydantic v2, keyring, psutil；M4 起 pywin32
+- httpx, pydantic v2, keyring, psutil, pywin32（只在 Windows）, PyYAML
 - uv 管理依赖，ruff 格式化与检查，pytest + respx 测试
 
 ## 常用命令

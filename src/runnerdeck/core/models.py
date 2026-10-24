@@ -332,6 +332,16 @@ class AutostartState:
 
 
 @dataclass(frozen=True)
+class ProxyApplyResult:
+    """Outcome of apply_proxy: runner names whose `.env` was rewritten, whose `.env` holds a
+    proxy the user set themselves (left alone), and (name, reason) for failures."""
+
+    updated: tuple[str, ...] = ()
+    custom: tuple[str, ...] = ()
+    failed: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
 class StrayRunner:
     """Runner processes under runners_root whose directory has no record."""
 

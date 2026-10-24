@@ -37,6 +37,7 @@ from runnerdeck.core.models import (
     Discovery,
     GitHubUser,
     LocalState,
+    ProxyApplyResult,
     RemoteStatus,
     Repo,
     RunnerRecord,
@@ -481,6 +482,14 @@ class FakeManager:
         config.upsert(updated)
         self.store.save(config)
         return updated
+
+    def apply_proxy(self, old: str | None, new: str | None) -> ProxyApplyResult:
+        self._call("apply_proxy", old=old, new=new)
+        return ProxyApplyResult(updated=("r1",))
+
+    def harden_runners_root(self) -> Path:
+        self._call("harden_runners_root")
+        return Path(self.store.load().settings.runners_root)
 
     def forget_runner(self, record_id: str) -> RunnerRecord:
         self._call("forget_runner", record_id=record_id)

@@ -39,6 +39,12 @@ job fails.
   while the window is hidden.
 - Settings: launch on login, start minimised to the tray, close to the tray, job
   notifications, theme (system / light / dark), poll interval.
+- The proxy from the settings page is also written to each runner's `.env` (`https_proxy`,
+  `http_proxy`), so a runner uses it however it is started. Changing it rewrites the values
+  RunnerDeck wrote and leaves a proxy you set yourself alone; running runners pick it up on
+  their next start.
+- "加固权限" on the settings page restricts the runner root to Administrators, SYSTEM and you
+  (other users can only list it). A root RunnerDeck creates itself gets this automatically.
 
 ### Changed
 - Starting RunnerDeck a second time brings the running window to the front instead of

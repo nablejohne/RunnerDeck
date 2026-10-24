@@ -1,4 +1,5 @@
-"""Reading a runner directory: `.runner`, configured/runner-dir checks, scanning a root.
+"""Reading a runner directory: `.runner`, configured/runner-dir checks, scanning a root,
+the installed runner version.
 
 Never opens `.credentials*` (CLAUDE.md 安全): existence is checked with stat() only.
 `config.cmd remove` deletes `.runner` (spike §3), so read it before unconfiguring.
@@ -8,6 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
+import threading
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -20,6 +25,7 @@ log = logging.getLogger(__name__)
 
 RUNNER_FILE = ".runner"
 CREDENTIALS_FILE = ".credentials"
+LISTENER_EXE = Path("bin") / "Runner.Listener.exe"
 GITHUB_HOST = "github.com"
 # Two-segment URLs that are not repos: enterprise runners are configured with
 # https://github.com/enterprises/{slug}; /orgs/{org} is the org page.
@@ -138,3 +144,52 @@ def scan_runner_dirs(root: Path) -> list[Path]:
             found.append(child)
     found.sort(key=lambda p: (p.name.casefold(), p.name))
     return found
+
+
+# --- installed runner version --------------------------------------------------------------
+
+# (major, minor, build, revision) of a PE file's fixed FileVersion, or None if it has none.
+FileVersionReader = Callable[[Path], "tuple[int, int, int, int] | None"]
+
+_version_cache: dict[str, tuple[int, str | None]] = {}  # path -> (mtime_ns, version)
+_version_lock = threading.Lock()
+
+
+def pe_file_version(path: Path) -> tuple[int, int, int, int] | None:
+    """The fixed FileVersion of a Windows executable (pywin32). None off Windows."""
+    if sys.platform != "win32":
+        return None
+    import win32api  # pywin32, Windows only
+
+    try:
+        info = win32api.GetFileVersionInfo(str(path), "\\")
+    except Exception as e:  # pywintypes.error: no version resource, unreadable, ...
+        log.warning("no file version in %s: %s", path, e)
+        return None
+    ms, ls = info["FileVersionMS"], info["FileVersionLS"]
+    return ms >> 16, ms & 0xFFFF, ls >> 16, ls & 0xFFFF
+
+
+def read_runner_version(
+    runner_dir: Path, *, reader: FileVersionReader = pe_file_version
+) -> str | None:
+    """The runner version installed in `runner_dir` ("2.338.1"), or None if unknown.
+
+    Read from bin\\Runner.Listener.exe's FileVersion ("2.338.1.0", spike-notes §12; no child
+    process) and cached until the file's mtime changes (a self-update replaces it).
+    """
+    exe = runner_dir / LISTENER_EXE
+    try:
+        mtime = os.stat(exe).st_mtime_ns
+    except OSError:
+        return None
+    key = os.path.normcase(str(exe))
+    with _version_lock:
+        cached = _version_cache.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    parts = reader(exe)
+    version = ".".join(str(n) for n in parts[:3]) if parts else None
+    with _version_lock:
+        _version_cache[key] = (mtime, version)
+    return version

@@ -84,6 +84,7 @@ def test_shows_record_facts_and_display(
     assert page.pathValue.text() == record.path
     assert page.labelsValue.text() == labels_text([]) == "（无自定义标签）"
     assert page.idValue.text() == "42"
+    assert page.versionValue.text() == "未知"
     assert page.badge.text() == LABELS[DisplayState.STALLED]
     assert page.detailLabel.text() == "网络"
     assert page.startButton.isVisibleTo(page) and not page.stopButton.isVisibleTo(page)
@@ -297,3 +298,10 @@ def test_helpers(tmp_path: Path) -> None:
     text = diag_item_text(_log(tmp_path, "Worker_1.log", "worker", 10))
     assert text.startswith("Worker_1.log · Worker · 2026-10-01") and text.endswith("10 B")
     assert labels_text(["gpu", "ci"]) == "gpu, ci"
+
+
+def test_shows_runner_version(page: RunnerDetailPage, fake_with_records: FakeController) -> None:
+    record = fake_with_records.records[0]
+    fake_with_records.versions[record.id] = "2.338.1"
+    page.show_record(record.id)
+    assert page.versionValue.text() == "2.338.1"

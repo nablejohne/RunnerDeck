@@ -95,6 +95,8 @@ class FakeController(QObject):
     diag_logs_loaded = pyqtSignal(str, object)  # record id, list[DiagLog]
     diag_text_loaded = pyqtSignal(str, str, str)  # record id, path, text
     autostart_state_loaded = pyqtSignal(object)  # AutostartState
+    proxy_applied = pyqtSignal(object)  # ProxyApplyResult
+    runners_root_hardened = pyqtSignal(str)  # runners root path
 
     def __init__(self, config: AppConfig | None = None, *, logged_in: bool = True) -> None:
         super().__init__()
@@ -113,6 +115,7 @@ class FakeController(QObject):
         self.remote_busy_ids: set[str] = set()
         self.autostart_supported = True
         self.emergency_count = 0
+        self.versions: dict[str, str] = {}
 
     # --- read-only -----------------------------------------------------------------
 
@@ -255,6 +258,14 @@ class FakeController(QObject):
 
     def load_autostart_state(self) -> None:
         self._record("load_autostart_state")
+
+    # M4 (docs/m4-design.md)
+
+    def harden_runners_root(self) -> None:
+        self._record("harden_runners_root")
+
+    def runner_version(self, record_id: str) -> str | None:
+        return self.versions.get(record_id)
 
     def set_launch_on_login(self, enabled: bool) -> None:
         self._record("set_launch_on_login", enabled)

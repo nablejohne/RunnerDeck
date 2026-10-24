@@ -21,6 +21,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from PyQt5.QtCore import QLockFile, QObject, pyqtSignal
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
@@ -36,6 +37,10 @@ RETRY_INTERVAL_S = 0.1
 DISCONNECT_WAIT_MS = 500
 MAX_MESSAGE_BYTES = 4096  # messages are single short words; anything longer is dropped
 ASFW_ANY = -1  # AllowSetForegroundWindow: (DWORD)-1 = any process may take the foreground
+# Held while the GUI runs; packaging/RunnerDeck.iss names it in AppMutex, so setup and the
+# uninstaller ask the user to quit RunnerDeck first (m4-design §9).
+APP_MUTEX_NAME = "RunnerDeckAppMutex"
+_SYNCHRONIZE = 0x00100000
 
 log = logging.getLogger(__name__)
 
@@ -261,3 +266,62 @@ class SingleInstance(QObject):
             self._lock.unlock()
             self._lock = None
         self._primary = False
+
+
+class AppMutex:
+    """A named Windows mutex held for the GUI's lifetime (no-op elsewhere).
+
+    Only signals "RunnerDeck is running" to the installer; single-instance activation is the
+    lock file + local server above.
+    """
+
+    def __init__(self, name: str = APP_MUTEX_NAME) -> None:
+        self.name = name
+        self._handle: int | None = None
+
+    def acquire(self) -> bool:
+        if sys.platform != "win32":
+            return False
+        kernel32 = _kernel32()
+        handle = kernel32.CreateMutexW(None, False, self.name)
+        if not handle:
+            log.warning("CreateMutexW(%s) failed: %s", self.name, _last_error())
+            return False
+        self._handle = handle
+        return True
+
+    def release(self) -> None:
+        if self._handle is not None:
+            _kernel32().CloseHandle(self._handle)
+            self._handle = None
+
+
+def app_mutex_exists(name: str = APP_MUTEX_NAME) -> bool:
+    """Some process holds the named mutex (what Inno Setup's AppMutex check does)."""
+    if sys.platform != "win32":
+        return False
+    kernel32 = _kernel32()
+    handle = kernel32.OpenMutexW(_SYNCHRONIZE, False, name)
+    if not handle:
+        return False
+    kernel32.CloseHandle(handle)
+    return True
+
+
+def _kernel32() -> Any:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.OpenMutexW.restype = wintypes.HANDLE
+    kernel32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return kernel32
+
+
+def _last_error() -> int:
+    import ctypes
+
+    return ctypes.get_last_error()  # type: ignore[attr-defined]

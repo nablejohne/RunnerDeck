@@ -122,7 +122,14 @@ class RunnerDetailPage(QWidget):
         self.pathValue = BodyLabel("", self.content)
         self.labelsValue = BodyLabel("", self.content)
         self.idValue = BodyLabel("", self.content)
-        for value in (self.repoValue, self.pathValue, self.labelsValue, self.idValue):
+        self.versionValue = BodyLabel("", self.content)
+        for value in (
+            self.repoValue,
+            self.pathValue,
+            self.labelsValue,
+            self.idValue,
+            self.versionValue,
+        ):
             value.setTextInteractionFlags(Qt.TextSelectableByMouse)
             value.setWordWrap(True)
 
@@ -204,6 +211,7 @@ class RunnerDetailPage(QWidget):
                 ("目录", self.pathValue),
                 ("标签", self.labelsValue),
                 ("GitHub id", self.idValue),
+                ("runner 版本", self.versionValue),
             )
         ):
             facts.addWidget(CaptionLabel(title, self.content), row, 0, Qt.AlignTop)
@@ -287,6 +295,7 @@ class RunnerDetailPage(QWidget):
         self.idValue.setText(
             str(record.github_runner_id) if record.github_runner_id is not None else "未知"
         )
+        self.versionValue.setText(self._controller.runner_version(record.id) or "未知")
         self._syncing = True
         try:
             self.autoStartSwitch.setChecked(record.auto_start)

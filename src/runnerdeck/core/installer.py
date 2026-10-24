@@ -62,6 +62,7 @@ _ACL_TIMEOUT_S = 30.0
 # (SIDs, not names: group names are localized, e.g. on zh-CN Windows).
 _SYSTEM_SID = "S-1-5-18"
 _ADMINISTRATORS_SID = "S-1-5-32-544"
+_AUTHENTICATED_USERS_SID = "S-1-5-11"
 _SID_RE = re.compile(r"^S-1-\d+(?:-\d+)+$")
 # `whoami /user /fo csv /nh` prints `"<domain>\<user>","<SID>"`.
 _WHOAMI_SID_RE = re.compile(rb'"(S-1-\d+(?:-\d+)+)"\s*$')
@@ -371,16 +372,34 @@ def harden_runner_dir(path: Path, *, run: RunFn = run_command) -> bool:
     and have them run as us. Never raises: a failure is logged as a warning and False is
     returned (the runner still works, only without the tighter ACL).
     """
+    return _harden_dir(path, run=run, target="runner dir")
+
+
+def harden_root_dir(path: Path, *, run: RunFn = run_command) -> bool:
+    """Windows: the runners root gets harden_runner_dir's DACL plus "Authenticated Users: read
+    & list" on the root itself only (not inherited).
+
+    A service-mode Listener (NETWORK SERVICE) refuses to start unless it can list every parent
+    directory of its runner directory (spike-notes §12). Other users can see the runner
+    directory names but cannot create, rename or change anything in the root. Runner
+    directories below keep their own protected DACLs. Never raises (see harden_runner_dir).
+    """
+    return _harden_dir(
+        path, run=run, target="runners root", extra=(f"*{_AUTHENTICATED_USERS_SID}:(RX)",)
+    )
+
+
+def _harden_dir(path: Path, *, run: RunFn, target: str, extra: tuple[str, ...] = ()) -> bool:
     if not winproc.IS_WINDOWS:
         return False
-    sid = _current_user_sid(run)
+    sid = _current_user_sid(run, target=target)
     if sid is None:
         return False
     icacls = _system32_exe("icacls.exe")
     commands = [
         # Drop explicit ACEs a pre-existing directory may carry, leaving only inherited ones...
         [icacls, str(path), "/reset", "/q"],
-        # ...then remove those as well and grant exactly our three principals.
+        # ...then remove those as well and grant exactly our principals.
         [
             icacls,
             str(path),
@@ -389,19 +408,48 @@ def harden_runner_dir(path: Path, *, run: RunFn = run_command) -> bool:
             f"*{sid}:(OI)(CI)F",
             f"*{_SYSTEM_SID}:(OI)(CI)F",
             f"*{_ADMINISTRATORS_SID}:(OI)(CI)F",
+            *extra,
             "/q",
         ],
     ]
     for args in commands:
-        if _run_acl_tool(args, run=run, what=f"icacls on {path}") is None:
+        if _run_acl_tool(args, run=run, what=f"icacls on {path}", target=target) is None:
             return False
-    log.info("restricted ACL of %s to the current user, SYSTEM and Administrators", path)
+    log.info("restricted ACL of %s %s to the current user, SYSTEM and Administrators", target, path)
     return True
 
 
-def _current_user_sid(run: RunFn) -> str | None:
+def root_hardening_refusal(path: Path, *, environ: Mapping[str, str] = os.environ) -> str | None:
+    """Why harden_root_dir must not touch `path` (Chinese), or None if it may.
+
+    The runners root can be any directory the user picked: a drive root, the profile or a
+    system directory would lose the ACL everything inside relies on.
+    """
+    if not path.is_absolute():
+        return f"不是绝对路径：{path}"
+    if path.parent == path:
+        return f"{path} 是整个磁盘的根目录，不能改它的权限；请换一个专用的子目录"
+    home = Path(environ.get("USERPROFILE") or Path.home())
+    system = [
+        Path(environ[var])
+        for var in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData")
+        if environ.get(var)
+    ]
+    for other in (home, *system):
+        if winproc.is_under(other, path):  # path is that directory or contains it
+            return f"{path} 是（或包含）用户主目录或系统目录，不能改它的权限"
+    for other in system:
+        if winproc.is_under(path, other):
+            return f"{path} 在系统目录 {other} 里，不能改它的权限"
+    return None
+
+
+def _current_user_sid(run: RunFn, *, target: str = "runner dir") -> str | None:
     out = _run_acl_tool(
-        [_system32_exe("whoami.exe"), "/user", "/fo", "csv", "/nh"], run=run, what="whoami"
+        [_system32_exe("whoami.exe"), "/user", "/fo", "csv", "/nh"],
+        run=run,
+        what="whoami",
+        target=target,
     )
     if out is None:
         return None
@@ -409,11 +457,13 @@ def _current_user_sid(run: RunFn) -> str | None:
         match = _WHOAMI_SID_RE.search(raw)
         if match and _SID_RE.fullmatch(sid := match.group(1).decode("ascii")):
             return sid
-    log.warning("not restricting runner dir ACL: no SID in whoami output %r", out[-200:])
+    log.warning("not restricting %s ACL: no SID in whoami output %r", target, out[-200:])
     return None
 
 
-def _run_acl_tool(args: list[str], *, run: RunFn, what: str) -> bytes | None:
+def _run_acl_tool(
+    args: list[str], *, run: RunFn, what: str, target: str = "runner dir"
+) -> bytes | None:
     """Run whoami / icacls; stdout on exit code 0, otherwise log a warning and return None."""
     try:
         proc = run(
@@ -426,11 +476,12 @@ def _run_acl_tool(args: list[str], *, run: RunFn, what: str) -> bytes | None:
             env=winproc.child_environment(),
         )
     except Exception as e:  # OSError, TimeoutExpired, ...: hardening must never abort
-        log.warning("not restricting runner dir ACL: %s failed: %s", what, redact(str(e)))
+        log.warning("not restricting %s ACL: %s failed: %s", target, what, redact(str(e)))
         return None
     if proc.returncode != 0:
         log.warning(
-            "not restricting runner dir ACL: %s exited with %s: %s",
+            "not restricting %s ACL: %s exited with %s: %s",
+            target,
             what,
             proc.returncode,
             _decode_output(proc.stdout),
@@ -478,6 +529,24 @@ def validate_env_updates(updates: Mapping[str, str | None]) -> dict[str, str | N
         if value is not None and ("\n" in value or "\r" in value):
             raise InvalidInputError(f"环境变量 {key} 的值不能包含换行")
     return dict(updates)
+
+
+def read_env_values(runner_dir: Path) -> dict[str, str]:
+    """`<runner_dir>/.env` as {casefolded key: value} (first occurrence wins, like
+    write_env_file). Missing file -> {}; unreadable -> InstallError."""
+    path = runner_dir / ENV_FILE
+    try:
+        text = path.read_bytes().decode("utf-8-sig")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as e:
+        raise InstallError(f"无法读取 {path}：{e}") from e
+    values: dict[str, str] = {}
+    for line in _LINE_SPLIT_RE.split(text):
+        key, sep, value = line.partition("=")
+        if sep and key:
+            values.setdefault(key.casefold(), value)
+    return values
 
 
 def write_env_file(runner_dir: Path, updates: Mapping[str, str | None]) -> None:

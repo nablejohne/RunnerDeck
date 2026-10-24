@@ -311,6 +311,10 @@ def _run_app(app: Any, *, autostart: bool, factories: _Factories) -> int:
             _show_already_running()
         return EXIT_OK
 
+    from runnerdeck.app.single_instance import AppMutex
+
+    mutex = AppMutex()
+    mutex.acquire()  # lets setup / the uninstaller see that RunnerDeck is running
     poller: Any = None
     try:
         controller = factories.controller()
@@ -340,6 +344,7 @@ def _run_app(app: Any, *, autostart: bool, factories: _Factories) -> int:
     finally:
         if poller is not None:
             poller.stop()
+        mutex.release()
         instance.release()
 
 
@@ -369,6 +374,28 @@ def _smoke_pages(window: Any) -> list[Any]:
     return pages
 
 
+def _smoke_windows_modules() -> None:
+    """pywin32 and PyYAML made it into the bundle and work (m4-design §9)."""
+    from pathlib import Path
+
+    import win32service  # noqa: F401 - imported to prove the bundle has it (service mode)
+    import yaml
+
+    from runnerdeck.app.single_instance import APP_MUTEX_NAME, AppMutex, app_mutex_exists
+    from runnerdeck.core import runner_file
+
+    if runner_file.pe_file_version(Path(sys.executable)) is None:
+        raise RuntimeError("pywin32: no file version for the running executable")
+    if yaml.safe_load("runs-on: [self-hosted]") != {"runs-on": ["self-hosted"]}:
+        raise RuntimeError("PyYAML: unexpected parse result")
+    mutex = AppMutex(f"{APP_MUTEX_NAME}-smoke-{os.getpid()}")
+    try:
+        if not mutex.acquire() or not app_mutex_exists(mutex.name):
+            raise RuntimeError("named mutex: CreateMutexW / OpenMutexW failed")
+    finally:
+        mutex.release()
+
+
 def _smoke_test(factories: _Factories) -> int:
     """Create everything offscreen under a throwaway RUNNERDECK_HOME; never calls exec()."""
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -390,6 +417,8 @@ def _smoke_test(factories: _Factories) -> int:
         instance = factories.instance()
         if not instance.acquire():
             raise RuntimeError("single instance: could not acquire the lock in a fresh home")
+        if sys.platform == "win32":
+            _smoke_windows_modules()
         controller = factories.controller()
         window = factories.window(controller)
         window.show()

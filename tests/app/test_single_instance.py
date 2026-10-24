@@ -9,6 +9,7 @@ under a temporary RUNNERDECK_HOME, so the server names never collide with a real
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -294,3 +295,20 @@ def test_allow_set_foreground_window_calls_user32() -> None:
     # The return value depends on whether this process may set the foreground (often not on
     # CI); the call itself must not raise.
     assert isinstance(single_instance._allow_set_foreground_window(), bool)
+
+
+def test_app_mutex(monkeypatch: pytest.MonkeyPatch) -> None:
+    from runnerdeck.app import single_instance as si
+
+    if sys.platform != "win32":
+        mutex = si.AppMutex()
+        assert mutex.acquire() is False
+        mutex.release()
+        assert si.app_mutex_exists() is False
+        return
+    mutex = si.AppMutex(f"RunnerDeckTestMutex-{os.getpid()}")
+    assert not si.app_mutex_exists(mutex.name)
+    assert mutex.acquire()
+    assert si.app_mutex_exists(mutex.name)
+    mutex.release()
+    assert not si.app_mutex_exists(mutex.name)

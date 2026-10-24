@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from runnerdeck.core import runner_file
 from runnerdeck.core.errors import InvalidInputError, RunnerDeckError, RunnerFileError
 from runnerdeck.core.runner_file import (
     CREDENTIALS_FILE,
@@ -344,3 +345,60 @@ def test_scan_runner_dirs_skips_child_it_cannot_stat(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "is_dir", is_dir)
     assert scan_runner_dirs(tmp_path) == [tmp_path / "good"]
+
+
+# --- read_runner_version -------------------------------------------------------------------
+
+
+def _listener(runner_dir: Path) -> Path:
+    exe = runner_dir / "bin" / "Runner.Listener.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(b"MZ")
+    return exe
+
+
+def test_read_runner_version_uses_the_listener_file_version(tmp_path: Path) -> None:
+    exe = _listener(tmp_path)
+    seen: list[Path] = []
+
+    def reader(path: Path) -> tuple[int, int, int, int]:
+        seen.append(path)
+        return 2, 338, 1, 0
+
+    assert runner_file.read_runner_version(tmp_path, reader=reader) == "2.338.1"
+    assert seen == [exe]
+
+
+def test_read_runner_version_is_cached_until_the_exe_changes(tmp_path: Path) -> None:
+    exe = _listener(tmp_path)
+    versions = iter([(2, 338, 1, 0), (2, 339, 0, 0)])
+    calls: list[Path] = []
+
+    def reader(path: Path) -> tuple[int, int, int, int]:
+        calls.append(path)
+        return next(versions)
+
+    assert runner_file.read_runner_version(tmp_path, reader=reader) == "2.338.1"
+    assert runner_file.read_runner_version(tmp_path, reader=reader) == "2.338.1"
+    assert len(calls) == 1
+    st = os.stat(exe)
+    os.utime(exe, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))  # self-update
+    assert runner_file.read_runner_version(tmp_path, reader=reader) == "2.339.0"
+    assert len(calls) == 2
+
+
+def test_read_runner_version_unknown(tmp_path: Path) -> None:
+    assert runner_file.read_runner_version(tmp_path, reader=lambda _p: (1, 0, 0, 0)) is None
+    _listener(tmp_path)
+    assert runner_file.read_runner_version(tmp_path, reader=lambda _p: None) is None
+
+
+def test_pe_file_version_off_windows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner_file.sys, "platform", "darwin")
+    assert runner_file.pe_file_version(_listener(tmp_path)) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows version resources")
+def test_pe_file_version_of_a_real_exe() -> None:
+    parts = runner_file.pe_file_version(Path(sys.executable))
+    assert parts is not None and parts[0] == 3
