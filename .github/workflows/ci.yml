@@ -82,6 +82,7 @@ jobs:
           $res = Join-Path $env:RUNNER_TEMP 'elevated-smoke.result.json'
           if (-not (Select-String -LiteralPath $res -Pattern 'nope' -Quiet)) { throw "no result file from runnerdeck-cli.exe elevated" }
           if (Test-Path -LiteralPath $req) { throw "runnerdeck-cli.exe elevated did not delete its request" }
+          $global:LASTEXITCODE = 0  # the expected 1 above must not become this step's exit code
 
           # runnerdeck-helper.exe without arguments: usage on stderr, exit code 2.
           $p = Start-Process -FilePath (Join-Path $dist 'runnerdeck-helper.exe') -NoNewWindow -Wait -PassThru `

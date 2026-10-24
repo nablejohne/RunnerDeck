@@ -5,11 +5,20 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
-M3: RunnerDeck can be left running all day. It lives in the tray, starts with Windows if
-asked to, starts your runners itself, keeps their GitHub status current and tells you when a
-job fails.
+## [1.0.0] - 2026-10-24
+
+First stable release. RunnerDeck can now be left running all day: it lives in the tray,
+starts with Windows if asked to, starts your runners itself, keeps their GitHub status current
+and tells you when a job fails. Runners can also run as Windows services that do not need
+RunnerDeck or a signed-in user. Install it per user with `RunnerDeck-1.0.0-setup.exe` (no
+administrator rights) or unzip `RunnerDeck-1.0.0-win-x64.zip`; check either file against
+`SHA256SUMS.txt` or with `gh attestation verify <file> -R nablejohne/RunnerDeck`.
 
 ### Added
+- Per-user installer (`RunnerDeck-<version>-setup.exe`, Inno Setup, English / Simplified
+  Chinese) into `%LOCALAPPDATA%\Programs\RunnerDeck`; uninstalling keeps your settings,
+  runner directories and PAT, and removes the launch-on-login entry only if it points to the
+  installed copy. Each release also carries `SHA256SUMS.txt` and build provenance attestations.
 - Tray icon with a status dot (grey: all stopped, green: online, blue: running a job, red:
   something needs attention) and a menu: open the window, start / stop all, start or stop
   each runner, quit. A left click opens the window.
