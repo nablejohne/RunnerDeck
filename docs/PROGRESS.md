@@ -7,10 +7,25 @@
 - [x] M0 技术验证 + 工程地基（spike 脚本、stdout 样本、停止方式结论、pyproject/ruff/pytest、ci.yml 首次跑绿）
 - [x] M1 core 层 + CLI（架构守卫、覆盖率门槛）
 - [x] M2 UI 最小可用 + 打包 + release.yml → v0.1.0（2026-10-24 发布，预发布）
-- [ ] M3 日常可用（托盘、自启、Poller、导入）→ v0.2.0（进行中：代码完成，待 CI / 真机验收）
-- [ ] M4 增强与发布（服务模式、Inno Setup、来源证明）→ v1.0.0
+- [x] M3 日常可用（托盘、自启、Poller、导入）：验收全部通过；不单独发 v0.2.0，随 v1.0.0 一起发布
+- [ ] M4 增强与发布（服务模式、Inno Setup、来源证明）→ v1.0.0（进行中）
 
-## M3：进行中（2026-10-24 起）
+## M4：进行中（2026-10-24 起）
+
+契约 `docs/m4-design.md`（§13 记 spike 与实现后的修订）。用户决策：服务模式完整支持（UAC 只提权单条命令；安装时给当前用户授启停权限；服务账号只用 NETWORK SERVICE）；安装包按用户安装到 `%LOCALAPPDATA%\Programs\RunnerDeck`；顺序实现 + 最后 1 个独立 reviewer；M3 不单独发版。
+
+- [x] 计划与契约（用户已确认）
+- [ ] 0 真机 spike S1–S11（`ssh XM`）→ spike-notes §12
+- [ ] 1 依赖与小项：pywin32 / PyYAML、互斥量、runner 版本、根目录加固、代理写进 `.env`
+- [ ] 2 服务 core（service / elevate / elevated、installer、manager、CLI）
+- [ ] 3 服务 app / ui
+- [ ] 4 Workflow 扫描、最近运行、检查更新
+- [ ] 5 取消注销后恢复
+- [ ] 6 打包与发布：Inno Setup、CI 安装冒烟、SHA256SUMS、来源证明
+- [ ] 7 独立评审（1 个 reviewer）
+- [ ] 8 CI 绿 → 真机 pytest → 桌面验收 → 发布 v1.0.0 → 回流评估
+
+## M3：已完成（2026-10-24，随 v1.0.0 发布）
 
 契约 `docs/m3-design.md`（§10 记实现后的修订）。实现方式：地基（本会话）→ 4 车道并行工作流 → 整合 → 一个独立 reviewer 评审（用户因成本取消了多 agent 评审工作流）。
 
@@ -23,8 +38,15 @@
 - [x] 独立评审（1 个 reviewer）9 条 → 修 8 条（卡片在确认框期间被重建删除、残留进程误判会杀自己的 runner、状态窗口按快照时间算、ERROR 让位 EXTERNAL、无窗口时的 MessageBox 崩溃、设置过期副本覆盖、登录框叠模态、停止记录读后删）；取消注销后不自动恢复留 M4；全量 2300 passed、smoke 0
 - [x] CI（windows-latest，0f8df5e）绿：lint、test 2329 passed（core 覆盖率 98%）、build 打包并冒烟三个 exe。前两轮失败都在测试侧：同线程命名管道写不出（改成真实第二进程发送）、离屏下 qframelesswindow 的 GetWindowPlacement 报 1400（`ui/compat.tolerate_offscreen_window_handles`）、import/forget 测试与随后的 discover() 竞态
 - [x] XM：真机 pytest 2328 passed；`_diag` 运行中可读（列表元数据改用 `os.stat`，否则正在写的日志显示 0 B）；CLI 强杀后 `status` 显示“GitHub 会话未过期”并倒数（spike-notes §11）
-- [ ] 桌面验收（m3-design §9 七项）
-- [ ] 发布 v0.2.0
+- [x] **桌面验收（2026-10-24，XM 桌面，CI 产物 2a38faa `RunnerDeck-0.1.0-win-x64.zip`，sha256 142114e9…54b3c7，解压在 `D:\tmp\RunnerDeck-m3`）**：七项全部通过
+  1. 托盘：颜色随状态变（灰 / 绿 / 蓝）、菜单启停、左键打开、关窗到托盘、托盘“退出”优雅停止；再次双击 exe 激活已有窗口
+  2. 开机自启：打开开关、两个 sandbox runner 勾“随 RunnerDeck 启动”→ 重启后不做操作，托盘出现、两个 runner 自动在线（API 确认 online、idle）
+  3. 导入 `D:\tmp\actions-runner`（注册在私有仓库 `nablejohne/QFluent`，id 21；PAT 先补上 QFluent 的仓库权限）→ 由 RunnerDeck 启动、在线 → 停止 → 取消登记；目录和 `.runner` 原样，GitHub 上 id 21 仍注册（API 确认）。QFluent 没有跑在这台 runner 上的 workflow，所以这一项没跑 job，job 路径由第 4 项的 sandbox 覆盖
+  4. 通知（sandbox `spike.yml`，从开发机 `gh workflow run` 触发）：默认“仅失败”下成功 job（run 40066952230）不弹、失败 job（run 40067026244，`fail=true`）弹“失败”；改成“全部”后成功 job（run 40067112668）弹“成功”；执行中托盘变蓝、卡片显示“运行中：spike”
+  5. 详情页：实时输出、诊断日志（大小非 0）、刷新、打开 `_diag` 目录、返回
+  6. 接管：CLI 另开终端 `start` → 界面显示“被其他进程运行”+“接管”→ 接管后先“等待旧会话过期”再恢复空闲
+  7. 注销：runner 运行中注销不被阻挡，重新登录后由开机自启恢复（用户反馈无问题；取消注销后不自动恢复仍是已知限制，留 M4）
+- 发布：用户决定不单独发 v0.2.0，M3 的改动随 v1.0.0 一起发（CHANGELOG `[Unreleased]` 并入 1.0.0）
 
 ## M2：已完成（2026-10-24，v0.1.0 预发布）
 
