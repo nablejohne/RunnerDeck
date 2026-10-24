@@ -45,6 +45,8 @@ from pydantic import ValidationError
 from runnerdeck import __version__
 from runnerdeck.core import (
     account,
+    elevate,
+    elevated,
     logs,
     paths,
     process,
@@ -75,6 +77,7 @@ from runnerdeck.core.models import (
     GitHubUser,
     LocalState,
     RemoteStatus,
+    RunnerMode,
     RunnerRecord,
     normalize_labels,
     parse_full_name,
@@ -277,18 +280,23 @@ def build_parser(console: Console) -> argparse.ArgumentParser:
     p.add_argument("--labels", help="自定义标签，逗号分隔（默认取设置里的 default_labels）")
     p.add_argument("--root", help="runner 目录的上级目录（默认取设置里的 runners_root）")
     p.add_argument("--version", dest="runner_version", help="runner 版本，例如 2.338.0（默认最新）")
+    p.add_argument(
+        "--service",
+        action="store_true",
+        help="以 Windows 服务运行（NETWORK SERVICE 账号，开机即运行；需要一次管理员授权）",
+    )
     p.add_argument("-y", "--yes", action="store_true", help="不询问，直接确认")
 
     command("list", "列出本机登记的 runner", _cmd_list)
     command("status", "显示每个 runner 的本地 + GitHub 合并状态", _cmd_status)
 
-    p = command("start", "前台运行 runner，按 Ctrl+C 停止全部", _cmd_start)
+    p = command("start", "前台运行 runner，按 Ctrl+C 停止全部（服务模式的只启动服务）", _cmd_start)
     p.add_argument(
         "keys", nargs="*", metavar="key", help="runner 的 id、id 前缀、名称或 owner/repo"
     )
     p.add_argument("--all", action="store_true", help="启动所有登记的 runner")
 
-    p = command("stop", "从另一个终端结束 runner（强制结束）", _cmd_stop)
+    p = command("stop", "从另一个终端结束 runner（强制结束；服务模式的优雅停止服务）", _cmd_stop)
     p.add_argument(
         "keys", nargs="+", metavar="key", help="runner 的 id、id 前缀、名称或 owner/repo"
     )
@@ -313,6 +321,24 @@ def build_parser(console: Console) -> argparse.ArgumentParser:
     p.add_argument("-y", "--yes", action="store_true", help="不询问，直接确认")
 
     command("scan", "列出 runners_root 下还没登记的 runner 目录", _cmd_scan)
+
+    p = command(
+        "to-service",
+        "把进程模式的 runner 重新注册为 Windows 服务（需要一次管理员授权）",
+        _cmd_to_service,
+    )
+    p.add_argument("key", help="runner 的 id、id 前缀、名称或 owner/repo")
+    p.add_argument("-y", "--yes", action="store_true", help="不询问，直接确认")
+
+    p = command(
+        "grant-service", "允许当前用户不经管理员授权启停这个服务（需要一次管理员授权）", _cmd_grant
+    )
+    p.add_argument("key", help="runner 的 id、id 前缀、名称或 owner/repo")
+
+    # Hidden (no help=): what the UAC prompt starts, see core/elevate.py.
+    p = sub.add_parser(elevate.ELEVATED_SUBCOMMAND)
+    p.add_argument("request")
+    p.set_defaults(handler=_cmd_elevated)
 
     p = command("settings", "查看或修改设置", _cmd_settings_show)
     settings_sub = p.add_subparsers(dest="settings_command", metavar="<操作>", parser_class=make)
@@ -571,8 +597,15 @@ def _cmd_add(ctx: _Context, args: argparse.Namespace) -> int:
     owner, repo = _parse_repo_target(ctx, args.repo)
     labels = None if args.labels is None else args.labels.split(",")
     console.print(f"查询仓库 {owner}/{repo} …")
+    mode = RunnerMode.SERVICE if args.service else RunnerMode.PROCESS
     plan = ctx.manager.plan_add(
-        owner, repo, name=args.name, labels=labels, root=args.root, version=args.runner_version
+        owner,
+        repo,
+        name=args.name,
+        labels=labels,
+        root=args.root,
+        version=args.runner_version,
+        mode=mode,
     )
     _print_plan(console, plan)
     for warning in plan.warnings:
@@ -587,7 +620,10 @@ def _cmd_add(ctx: _Context, args: argparse.Namespace) -> int:
         f"完成：runner {record.name} 已注册到 {record.full_name}"
         f"（GitHub id {record.github_runner_id}，本地 id {record.id[:8]}）"
     )
-    console.print(f"前台运行它：{PROG} start {key}")
+    if record.mode is RunnerMode.SERVICE:
+        console.print(f"服务 {record.service_name} 已安装并在运行；停止它：{PROG} stop {key}")
+    else:
+        console.print(f"前台运行它：{PROG} start {key}")
     return EXIT_OK
 
 
@@ -749,6 +785,9 @@ def _cmd_stop(ctx: _Context, args: argparse.Namespace) -> int:
     forced = False
     for record in records:
         name = record.name
+        if record.mode is RunnerMode.SERVICE:
+            code = max(code, _service_action(ctx, record, start=False))
+            continue
         try:
             outcome = ctx.deps.stop_external(Path(record.path))
         except (psutil.Error, OSError, RunnerDeckError) as e:
@@ -1122,7 +1161,62 @@ def _cmd_start(ctx: _Context, args: argparse.Namespace) -> int:
         records = _unique([resolve_runner(config, key) for key in args.keys])
     else:
         raise UsageError("请指定要启动的 runner，或使用 --all")
-    return _Supervisor(ctx, records, config).run()
+    code = EXIT_OK
+    for record in [r for r in records if r.mode is RunnerMode.SERVICE]:
+        code = max(code, _service_action(ctx, record, start=True))
+    records = [r for r in records if r.mode is not RunnerMode.SERVICE]
+    if not records:
+        return code
+    return max(code, _Supervisor(ctx, records, config).run())
+
+
+# --- service mode -------------------------------------------------------------------------
+
+
+def _service_action(ctx: _Context, record: RunnerRecord, *, start: bool) -> int:
+    console = ctx.console
+    verb = "启动" if start else "停止"
+    console.print(f"正在{verb}服务 {record.service_name or record.name} …")
+    try:
+        if start:
+            info = ctx.manager.start_service(record.id)
+        else:
+            info = ctx.manager.stop_service(record.id)
+    except RunnerDeckError as e:
+        console.error(f"错误：{verb} runner {record.name} 失败：{e}")
+        return EXIT_ERROR
+    console.print(f"runner {record.name}：服务{verb}完成（{info.state}）")
+    return EXIT_OK
+
+
+def _cmd_to_service(ctx: _Context, args: argparse.Namespace) -> int:
+    console = ctx.console
+    record = resolve_runner(ctx.config(), args.key)
+    console.print(
+        f"将把 runner {record.name}（{record.full_name}）重新注册为 Windows 服务："
+        "会弹出一次管理员授权；GitHub 上的 runner id 会变；服务以 NETWORK SERVICE 运行，"
+        "看不到你的用户目录和用户级 PATH"
+    )
+    if not args.yes and not ctx.confirm("确认转为服务？输入 y 继续，其他任意输入取消："):
+        console.print("已取消，没有做任何改动")
+        return EXIT_ERROR
+    updated = ctx.manager.convert_to_service(record.id)
+    console.print(
+        f"完成：runner {updated.name} 已作为服务 {updated.service_name} 运行"
+        f"（GitHub id {updated.github_runner_id}）"
+    )
+    return EXIT_OK
+
+
+def _cmd_grant(ctx: _Context, args: argparse.Namespace) -> int:
+    record = resolve_runner(ctx.config(), args.key)
+    ctx.manager.grant_service_control(record.id)
+    ctx.console.print(f"完成：之后启停 runner {record.name} 的服务不再需要管理员授权")
+    return EXIT_OK
+
+
+def _cmd_elevated(ctx: _Context, args: argparse.Namespace) -> int:
+    return elevated.main(args.request)
 
 
 # --- settings -----------------------------------------------------------------------------

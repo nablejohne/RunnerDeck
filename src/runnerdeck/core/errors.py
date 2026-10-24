@@ -87,6 +87,18 @@ class ProcessError(RunnerDeckError):
     """Starting or stopping run.cmd failed, or the runner is already running elsewhere."""
 
 
+class ServiceError(RunnerDeckError):
+    """A service-mode runner's Windows service could not be queried, started or stopped."""
+
+
+class ElevationRequiredError(ServiceError):
+    """The service manager refused access: the operation needs administrator rights."""
+
+
+class ElevationCancelledError(RunnerDeckError):
+    """The user answered "No" in the UAC prompt (nothing was changed)."""
+
+
 # --- local state --------------------------------------------------------------
 
 

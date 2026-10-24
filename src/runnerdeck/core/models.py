@@ -99,7 +99,7 @@ def default_runner_name(hostname: str, repo: str) -> str:
 
 class RunnerMode(StrEnum):
     PROCESS = "process"
-    SERVICE = "service"  # M4
+    SERVICE = "service"  # Windows service (m4-design §2), config.cmd --runasservice
 
 
 class Scope(StrEnum):
@@ -117,6 +117,7 @@ class RunnerRecord(BaseModel):
     labels: list[str] = Field(default_factory=list)
     path: str
     mode: RunnerMode = RunnerMode.PROCESS
+    service_name: str | None = None  # service mode: from `.service`; kept to clean up a lost dir
     github_runner_id: int | None = None
     auto_start: bool = False
     created_at: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC))

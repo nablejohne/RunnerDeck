@@ -14,6 +14,10 @@ BANNED_IN_CORE = ("PyQt5", "qfluentwidgets", "runnerdeck.app", "runnerdeck.ui")
 CMD_SCRIPT_OWNERS = {"installer.py", "process.py", "winproc.py", "console_helper.py"}
 # Only github_client talks HTTP.
 HTTP_OWNERS = {"github_client.py"}
+# Service mode (docs/m4-design.md §10): the SCM only through service.py, the UAC prompt only
+# from elevate.py.
+SCM_OWNERS = {"service.py"}
+SHELL_EXECUTE_OWNERS = {"elevate.py"}
 
 
 def _imports(path: Path) -> list[str]:
@@ -47,6 +51,10 @@ BANNED_IN_UI = (
     "runnerdeck.core.autostart",
     "runnerdeck.core.stop_marks",
     "runnerdeck.core.diag",
+    # M4 service mode: SCM, UAC, the elevated helper
+    "runnerdeck.core.service",
+    "runnerdeck.core.elevate",
+    "runnerdeck.core.elevated",
     "httpx",
     "subprocess",
     "winreg",
@@ -93,6 +101,32 @@ def test_only_github_client_imports_httpx(path: Path) -> None:
     assert not [n for n in _imports(path) if n == "httpx" or n.startswith("httpx.")], (
         f"{path.name} imports httpx; GitHub calls must go through github_client.py"
     )
+
+
+@pytest.mark.parametrize("path", CORE_FILES, ids=lambda p: p.name)
+def test_only_service_uses_the_service_control_manager(path: Path) -> None:
+    if path.name in SCM_OWNERS:
+        return
+    banned = ("win32service", "win32security", "win32serviceutil")
+    assert not [n for n in _imports(path) if n.split(".")[0] in banned], (
+        f"{path.name} imports the service / security API; use core/service.py"
+    )
+
+
+@pytest.mark.parametrize("path", CORE_FILES, ids=lambda p: p.name)
+def test_only_elevate_starts_elevated_processes(path: Path) -> None:
+    if path.name in SHELL_EXECUTE_OWNERS:
+        return
+    text = path.read_text(encoding="utf-8")
+    assert "ShellExecute" not in text and '"runas"' not in text, (
+        f"{path.name} elevates a process; use core/elevate.py"
+    )
+
+
+def test_elevated_reaches_config_cmd_only_through_installer() -> None:
+    text = (CORE / "elevated.py").read_text(encoding="utf-8")
+    assert "subprocess" not in text and 'config.cmd"' not in text
+    assert "installer.configure" in text and "installer.unconfigure" in text
 
 
 def test_console_helper_is_stdlib_only() -> None:

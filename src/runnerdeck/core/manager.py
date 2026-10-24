@@ -35,11 +35,14 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import psutil
 
-from runnerdeck.core import installer, process, release, runner_file, winproc
+from runnerdeck.core import diag, installer, process, release, runner_file, service, winproc
+from runnerdeck.core.elevate import ElevatedResult, Elevator
 from runnerdeck.core.errors import (
+    ElevationRequiredError,
     GitHubError,
     InstallError,
     InvalidInputError,
@@ -48,6 +51,7 @@ from runnerdeck.core.errors import (
     RunnerDeckError,
     RunnerFileError,
     RunnerNotFoundError,
+    ServiceError,
 )
 from runnerdeck.core.github_client import GitHubClient
 from runnerdeck.core.installer import RunFn
@@ -58,6 +62,7 @@ from runnerdeck.core.models import (
     ProxyApplyResult,
     RemoteRunner,
     RemoteStatus,
+    RunnerMode,
     RunnerRecord,
     StrayRunner,
     default_runner_name,
@@ -172,6 +177,7 @@ class AddPlan:
     warnings: Chinese texts the caller must show before add_runner.
     runner_env: KEY=VALUE pairs written to the runner's `.env` after registration (e.g.
     POWERSHELL_POLICY_ENV); empty means the file is left alone.
+    mode: SERVICE registers with `--runasservice` through one UAC prompt (m4-design §2.5).
     """
 
     owner: str
@@ -186,6 +192,7 @@ class AddPlan:
     same_repo_runners: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     runner_env: tuple[tuple[str, str], ...] = ()
+    mode: RunnerMode = RunnerMode.PROCESS
 
     @property
     def full_name(self) -> str:
@@ -342,18 +349,55 @@ def _custom_labels(labels: Sequence[str]) -> list[str]:
     return normalize_labels(kept)
 
 
-def _registration_happened(runner_dir: Path, error: BaseException) -> bool:
-    """After a failed configure: did GitHub get a runner anyway?
+_registration_happened = installer.registration_happened
 
-    `.runner` written, or config.cmd printed a registration marker before failing.
-    """
+# (op, payload) -> ElevatedResult; core/elevate.Elevator by default (one UAC prompt per call).
+ElevatorFn = Callable[[str, Mapping[str, Any]], ElevatedResult]
+SERVICE_START_TIMEOUT_S = 30.0
+SERVICE_STOP_TIMEOUT_S = 120.0  # a job is cancelled first: 5.4 s measured (spike-notes §12)
+
+
+class ServiceInstallError(InstallError):
+    """The elevated install / convert failed; `result` says what is left behind."""
+
+    def __init__(self, message: str, result: ElevatedResult) -> None:
+        super().__init__(message, output=result.output)
+        self.result = result
+
+
+def _elevated_failure(result: ElevatedResult, what: str) -> str:
+    parts = [f"{what}：{result.error or '未知错误'}", *result.warnings]
+    return "；".join(parts)
+
+
+def _under_profile(path: Path) -> bool:
+    profile = os.environ.get("USERPROFILE")
+    homes = [Path.home(), *([Path(profile)] if profile else [])]
+    return any(winproc.is_under(path, home) for home in homes)
+
+
+_SERVICE_LOCAL = {
+    service.ServiceState.RUNNING: LocalState.IDLE,
+    service.ServiceState.START_PENDING: LocalState.STARTING,
+    service.ServiceState.STOP_PENDING: LocalState.STOPPING,
+    service.ServiceState.STOPPED: LocalState.STOPPED,
+    service.ServiceState.PAUSED: LocalState.STOPPED,
+}
+
+
+def _process_started(pid: int) -> datetime | None:
     try:
-        if (runner_dir / runner_file.RUNNER_FILE).is_file():
-            return True
-    except OSError:
-        pass
-    output = error.output if isinstance(error, InstallError) else ""
-    return any(m in line for m in installer.REGISTERED_MARKERS for line in output.splitlines())
+        import psutil
+
+        return datetime.fromtimestamp(psutil.Process(pid).create_time(), UTC)
+    except Exception:  # gone, access denied, not installed: "now" is good enough
+        return None
+
+
+_SERVICE_UNDER_PROFILE = (
+    "服务以 NETWORK SERVICE 运行，读不了你的用户目录，runner 放在 {path} 下无法以服务运行；"
+    "请换一个不在用户目录里的 runner 根目录（例如 D:\\runners）"
+)
 
 
 def _download_reporter(report: ProgressFn, version: str) -> Callable[[int, int | None], None]:
@@ -453,6 +497,9 @@ class RunnerManager:
         stop_marks: StopMarks | None = None,
         scan_processes: ProcessScanner | None = None,
         stop_external: ExternalStopper = process.stop_external,
+        services: service.ServiceOps | None = None,
+        elevator: ElevatorFn | None = None,
+        user_sid: Callable[[], str | None] = service.current_user_sid,
     ) -> None:
         """find_processes: runner processes of one directory (remove_runner's running check).
         scan_processes: all runner processes in one pass, grouped by directory for statuses()
@@ -462,6 +509,8 @@ class RunnerManager:
         stop_marks: cross-process stop records (default StopMarks() under the local app dir).
         stop_external: hard kill of processes not owned by a RunnerProcess (kill_external,
         kill_stray); default process.stop_external.
+        services / elevator / user_sid: service-mode runners (m4-design §2): the service
+        control manager, the UAC helper, the SID granted start / stop rights at install.
         """
         self._store = store
         self._client_factory = client_factory
@@ -475,6 +524,9 @@ class RunnerManager:
         self._scan_processes = scan_processes
         self._stop_marks = stop_marks if stop_marks is not None else StopMarks()
         self._stop_external = stop_external
+        self._services = services if services is not None else service.default_ops()
+        self._elevator = elevator if elevator is not None else Elevator()
+        self._user_sid = user_sid
         self._clock = clock
         self._config_lock = threading.RLock()
         self._install_lock = threading.Lock()
@@ -498,6 +550,7 @@ class RunnerManager:
         root: str | os.PathLike[str] | None = None,
         version: str | None = None,
         runner_env: Mapping[str, str] | None = None,
+        mode: RunnerMode = RunnerMode.PROCESS,
     ) -> AddPlan:
         """Read-only preparation of add_runner.
 
@@ -532,6 +585,8 @@ class RunnerManager:
         same_repo = tuple(r.name for r in config.runners if _same_repo(r, owner, repo))
         root_dir = Path(os.path.abspath(os.path.expanduser(root or config.settings.runners_root)))
         target = _pick_target_dir(root_dir, repo, {_path_key(r.path) for r in config.runners})
+        if mode is RunnerMode.SERVICE and _under_profile(target):
+            raise InvalidInputError(_SERVICE_UNDER_PROFILE.format(path=target.parent))
 
         plan = AddPlan(
             owner=owner,
@@ -545,6 +600,7 @@ class RunnerManager:
             remote_conflict=remote_conflict,
             same_repo_runners=same_repo,
             runner_env=env_pairs,
+            mode=mode,
         )
         warnings: list[str] = []
         if not plan.private:
@@ -662,28 +718,34 @@ class RunnerManager:
             token = client.create_registration_token(plan.owner, plan.repo)
             secret = token.token.get_secret_value()
             register_secret(secret)
-            report(Step.CONFIGURE, "注册 runner（config.cmd，最长约 2 分钟）")
-            try:
-                installer.configure(
-                    runner_dir,
-                    url=plan.repo_url,
-                    token=secret,
-                    name=plan.name,
-                    labels=plan.labels,
-                    run=self._installer_run,
-                    env=child_env,
-                )
-            except BaseException as e:
-                registered = _registration_happened(runner_dir, e)
-                raise
-            registered = True
-
             env_updates = dict(plan.runner_env) | dict(child_env or {})
-            if plan.runner_env:
-                keys = ", ".join(env_updates)
-                report(Step.ENV, f"写入 runner 环境变量（.env：{keys}）")
-            if env_updates:  # the proxy alone has no wizard step: written silently
-                installer.write_env_file(runner_dir, env_updates)
+            service_name: str | None = None
+            if plan.mode is RunnerMode.SERVICE:
+                # Before config.cmd: the service starts right away (spike-notes §12).
+                self._write_add_env(runner_dir, plan, env_updates, report)
+                try:
+                    result = self._install_service(client, plan, secret, child_env, report)
+                except ServiceInstallError as e:
+                    registered, agent_id = e.result.registered, e.result.agent_id
+                    raise
+                registered, service_name = True, result.service_name
+            else:
+                report(Step.CONFIGURE, "注册 runner（config.cmd，最长约 2 分钟）")
+                try:
+                    installer.configure(
+                        runner_dir,
+                        url=plan.repo_url,
+                        token=secret,
+                        name=plan.name,
+                        labels=plan.labels,
+                        run=self._installer_run,
+                        env=child_env,
+                    )
+                except BaseException as e:
+                    registered = _registration_happened(runner_dir, e)
+                    raise
+                registered = True
+                self._write_add_env(runner_dir, plan, env_updates, report)
 
             report(Step.VERIFY, "读取 .runner")
             file_info = runner_file.read_runner_file(runner_dir)
@@ -699,8 +761,11 @@ class RunnerManager:
                 name=plan.name,
                 labels=list(plan.labels),
                 path=str(runner_dir),
+                mode=plan.mode,
+                service_name=service_name,
                 github_runner_id=agent_id,
-                auto_start=auto_start,
+                # A service starts with Windows on its own (delayed auto start).
+                auto_start=auto_start and plan.mode is RunnerMode.PROCESS,
             )
             record_id = record.id
             report(Step.SAVE, "保存 runner 记录")
@@ -726,6 +791,47 @@ class RunnerManager:
             if problems:
                 log.error("rollback of %s incomplete: %s", plan.full_name, problems)
             raise
+
+    @staticmethod
+    def _write_add_env(
+        runner_dir: Path, plan: AddPlan, env_updates: Mapping[str, str], report: ProgressFn
+    ) -> None:
+        if plan.runner_env:
+            report(Step.ENV, f"写入 runner 环境变量（.env：{', '.join(env_updates)}）")
+        if env_updates:  # the proxy alone has no wizard step: written silently
+            installer.write_env_file(runner_dir, dict(env_updates))
+
+    def _install_service(
+        self,
+        client: GitHubClient,
+        plan: AddPlan,
+        token: str,
+        child_env: Mapping[str, str] | None,
+        report: ProgressFn,
+    ) -> ElevatedResult:
+        """config.cmd --runasservice in the elevated helper (one UAC prompt). It undoes a
+        failed install itself (the remove token); ServiceInstallError says what is left."""
+        remove = client.create_remove_token(plan.owner, plan.repo).token.get_secret_value()
+        register_secret(remove)
+        report(Step.CONFIGURE, "等待管理员授权（UAC），然后注册 runner 并安装服务")
+        result = self._elevator(
+            "install_service",
+            {
+                "runner_dir": str(plan.target_dir),
+                "url": plan.repo_url,
+                "token": token,
+                "name": plan.name,
+                "labels": list(plan.labels),
+                "env": dict(child_env) if child_env else None,
+                "remove_token": remove,
+                "grant_sid": self._user_sid(),
+            },
+        )
+        if not result.ok:
+            raise ServiceInstallError(_elevated_failure(result, "安装服务失败"), result)
+        for warning in result.warnings:
+            log.warning("install_service: %s", warning)
+        return result
 
     def _rollback_add(
         self,
@@ -877,7 +983,8 @@ class RunnerManager:
         runner_dir = Path(record.path)
 
         report(Step.CHECK, f"检查 runner {record.name} 是否在运行")
-        pids = self._runner_pids(runner_dir)
+        # A service runner may run: config.cmd remove stops and deletes the service itself.
+        pids = [] if record.mode is RunnerMode.SERVICE else self._runner_pids(runner_dir)
         if pids:
             raise ProcessError(
                 f"runner “{record.name}” 正在运行（PID {', '.join(map(str, pids))}），"
@@ -909,6 +1016,10 @@ class RunnerManager:
             warnings.append(
                 "没有在 GitHub 上注销；如果 runner 还在，请到 "
                 f"{record.repo_url}/settings/actions/runners 手动删除"
+            )
+        elif record.mode is RunnerMode.SERVICE and self._service_name_of(record) is not None:
+            remote, runner_id = self._remove_service_remote(
+                record, runner_dir, runner_id, child_env, warnings, report
             )
         else:
             remote, runner_id = self._remove_remote(
@@ -978,6 +1089,40 @@ class RunnerManager:
                 report(Step.API_DELETE, "通过 GitHub API 删除 runner")
                 remote, runner_id = self._delete_remote(client, record, runner_id)
         return remote, runner_id
+
+    def _remove_service_remote(
+        self,
+        record: RunnerRecord,
+        runner_dir: Path,
+        runner_id: int | None,
+        child_env: Mapping[str, str] | None,
+        warnings: list[str],
+        report: ProgressFn,
+    ) -> tuple[RemoteRemoval, int | None]:
+        """GitHub + service half of removing a service runner: config.cmd remove in the
+        elevated helper (it stops and deletes the service), else the API DELETE. A cancelled
+        UAC prompt raises ElevationCancelledError before anything changed."""
+        name = self._service_name_of(record)
+        with closing(self._client_factory()) as client:
+            payload: dict[str, Any] = {
+                "runner_dir": str(runner_dir),
+                "service_name": name,
+                "env": dict(child_env) if child_env else None,
+            }
+            if runner_file.is_configured(runner_dir):
+                token = client.create_remove_token(record.owner, record.repo)
+                payload["remove_token"] = token.token.get_secret_value()
+            report(Step.UNCONFIGURE, "等待管理员授权（UAC），然后注销 runner 并删除服务")
+            result = self._elevator("remove_service", payload)
+            warnings.extend(result.warnings)
+            if result.service_exists:
+                warnings.append(f"服务 {name} 没能删除，请以管理员身份运行：sc delete {name}")
+            if result.ok and not result.registered:
+                return RemoteRemoval.UNCONFIGURED, runner_id
+            if not result.ok:
+                warnings.append(f"config.cmd remove 失败，已改用 GitHub API 删除：{result.error}")
+            report(Step.API_DELETE, "通过 GitHub API 删除 runner")
+            return self._delete_remote(client, record, runner_id)
 
     @classmethod
     def _delete_remote(
@@ -1111,14 +1256,17 @@ class RunnerManager:
                 self._store.save(config)
                 log.info("runner %s moved: %s -> %s", record.name, record.path, runner_dir)
                 return moved
+            service_name = service.read_service_name(runner_dir)
             record = RunnerRecord(
                 owner=owner,
                 repo=repo,
                 name=info.agent_name,
                 labels=_custom_labels(remote.labels),
                 path=str(runner_dir),
+                mode=RunnerMode.SERVICE if service_name else RunnerMode.PROCESS,
+                service_name=service_name,
                 github_runner_id=remote.id,
-                auto_start=auto_start,
+                auto_start=auto_start and service_name is None,
             )
             config.upsert(record)
             self._store.save(config)
@@ -1385,6 +1533,8 @@ class RunnerManager:
         stop record otherwise (app restarted, CLI `stop` from another terminal), the newer
         of the two when both exist. A running process ignores stop records."""
         runner_dir = Path(record.path)
+        if record.mode is RunnerMode.SERVICE:
+            return self._service_snapshot(record, now)
         if proc is not None and proc.is_running():
             return LocalSnapshot(
                 state=proc.state,
@@ -1421,6 +1571,170 @@ class RunnerManager:
             stopped_at=stopped_at,
             current_job=proc.current_job,
             last_error=proc.last_error,
+        )
+
+    # --- service mode (docs/m4-design.md §2.5) ------------------------------------------
+
+    def _service_name_of(self, record: RunnerRecord) -> str | None:
+        return record.service_name or service.read_service_name(Path(record.path))
+
+    def _require_service(self, record_id: str) -> tuple[RunnerRecord, str]:
+        record = self._require_record(self._store.load(), record_id)
+        if record.mode is not RunnerMode.SERVICE:
+            raise InvalidInputError(f"runner “{record.name}” 不是服务模式")
+        name = self._service_name_of(record)
+        if name is None:
+            raise ServiceError(f"找不到 runner “{record.name}” 的服务名（{record.path}\\.service）")
+        return record, name
+
+    def service_info(self, record_id: str) -> service.ServiceInfo:
+        _record, name = self._require_service(record_id)
+        return self._services.query(name)
+
+    def start_service(self, record_id: str, *, elevate: bool = True) -> service.ServiceInfo:
+        """Start a service runner and wait up to 30 s for RUNNING (the proxy is synced into
+        `.env` first). Without granted rights: one UAC prompt (elevate=True) or
+        ElevationRequiredError. A service that quits right away -> ServiceError with the
+        Listener's last error (spike-notes §12)."""
+        record, name = self._require_service(record_id)
+        self._sync_proxy_env(record, self._store.load().settings.proxy)
+        self._control_service(name, "start", elevate=elevate)
+        info = service.wait_for(
+            self._services,
+            name,
+            (service.ServiceState.RUNNING, service.ServiceState.STOPPED),
+            timeout_s=SERVICE_START_TIMEOUT_S,
+        )
+        if info.state is service.ServiceState.STOPPED:
+            reason = diag.last_terminal_error(Path(record.path)) or f"退出码 {info.exit_code}"
+            raise ServiceError(f"服务 {name} 启动后退出：{reason}")
+        return info
+
+    def stop_service(self, record_id: str, *, elevate: bool = True) -> service.ServiceInfo:
+        """Stop a service runner and wait up to 120 s for STOPPED (a running job is cancelled
+        first). Always graceful: the stop record says so (status rule for GitHub's lag)."""
+        record, name = self._require_service(record_id)
+        self._control_service(name, "stop", elevate=elevate)
+        info = service.wait_for(
+            self._services,
+            name,
+            (service.ServiceState.STOPPED,),
+            timeout_s=SERVICE_STOP_TIMEOUT_S,
+        )
+        if info.state is service.ServiceState.STOPPED:
+            self.record_stop(record.path, forced=False)
+        return info
+
+    def _control_service(self, name: str, action: str, *, elevate: bool) -> None:
+        try:
+            if action == "start":
+                self._services.start(name)
+            else:
+                self._services.stop(name)
+        except ElevationRequiredError:
+            if not elevate:
+                raise
+            result = self._elevator("control_service", {"service_name": name, "action": action})
+            if not result.ok:
+                raise ServiceError(_elevated_failure(result, f"{action} 服务失败")) from None
+
+    def grant_service_control(self, record_id: str) -> None:
+        """Let the current user start / stop the service without UAC (one prompt now)."""
+        _record, name = self._require_service(record_id)
+        sid = self._user_sid()
+        if sid is None:
+            raise InvalidInputError("只有 Windows 支持服务模式")
+        result = self._elevator("grant_control", {"service_name": name, "grant_sid": sid})
+        if not result.ok:
+            raise ServiceError(_elevated_failure(result, "授权失败"))
+
+    def convert_to_service(self, record_id: str) -> RunnerRecord:
+        """Register a stopped process-mode runner again as a service (one UAC prompt).
+
+        config.cmd refuses to configure a configured directory, so the helper unregisters it
+        and registers it with --runasservice: the GitHub runner id changes (spike-notes §12).
+        If the service install fails the helper registers it again in process mode; the
+        record then keeps process mode with the new id and ServiceInstallError is raised.
+        """
+        config = self._store.load()
+        record = self._require_record(config, record_id)
+        if record.mode is RunnerMode.SERVICE:
+            raise InvalidInputError(f"runner “{record.name}” 已经是服务模式")
+        runner_dir = Path(record.path)
+        if not runner_file.is_configured(runner_dir):
+            raise InvalidInputError(f"{runner_dir} 没有注册（缺少 .runner 或 .credentials）")
+        if _under_profile(runner_dir):
+            raise InvalidInputError(_SERVICE_UNDER_PROFILE.format(path=runner_dir.parent))
+        pids = self._runner_pids(runner_dir)
+        if pids:
+            raise ProcessError(f"runner “{record.name}” 正在运行，请先停止再转为服务")
+        child_env = _proxy_env(config.settings.proxy)
+        self._sync_proxy_env(record, config.settings.proxy)
+        with closing(self._client_factory()) as client:
+            tokens = [
+                client.create_remove_token(record.owner, record.repo).token.get_secret_value(),
+                client.create_registration_token(
+                    record.owner, record.repo
+                ).token.get_secret_value(),
+                client.create_remove_token(record.owner, record.repo).token.get_secret_value(),
+            ]
+        for token in tokens:
+            register_secret(token)
+        result = self._elevator(
+            "convert_to_service",
+            {
+                "runner_dir": str(runner_dir),
+                "url": record.repo_url,
+                "token": tokens[1],
+                "name": record.name,
+                "labels": list(record.labels),
+                "env": dict(child_env) if child_env else None,
+                "remove_token": tokens[0],
+                "second_remove_token": tokens[2],
+                "grant_sid": self._user_sid(),
+            },
+        )
+        if result.ok:
+            updated = self._update_record(
+                record_id,
+                mode=RunnerMode.SERVICE,
+                service_name=result.service_name,
+                github_runner_id=result.agent_id,
+                auto_start=False,
+            )
+            log.info("converted %s to service %s", record.name, result.service_name)
+            return updated
+        if result.registered and result.agent_id is not None:
+            self._update_record(record_id, github_runner_id=result.agent_id)
+        raise ServiceInstallError(_elevated_failure(result, "转为服务失败"), result)
+
+    def _service_snapshot(self, record: RunnerRecord, now: datetime) -> LocalSnapshot:
+        """Local view of a service runner from the service control manager. Busy / job come
+        from GitHub here; the GUI adds them from the Runner log (diag.LogFollower)."""
+        runner_dir = Path(record.path)
+        name = self._service_name_of(record)
+        info = (
+            self._services.query(name)
+            if name
+            else service.ServiceInfo("", service.ServiceState.MISSING)
+        )
+        state, error = _SERVICE_LOCAL.get(info.state, LocalState.ERROR), None
+        if info.state is service.ServiceState.STOPPED and info.exit_code:
+            state = LocalState.ERROR
+            error = diag.last_terminal_error(runner_dir) or f"服务已退出（退出码 {info.exit_code}）"
+        elif info.state is service.ServiceState.MISSING:
+            error = f"服务 {name or '（未知）'} 不存在（可能已被删除），请移除后重新添加"
+        elif info.state is service.ServiceState.UNKNOWN:
+            error = f"无法查询服务状态：{info.detail or '未知原因'}"
+        since = _process_started(info.pid) if info.pid else None
+        mark = self._stop_marks.get(runner_dir, now=now)
+        return LocalSnapshot(
+            state=state,
+            running=state in (LocalState.STARTING, LocalState.IDLE, LocalState.STOPPING),
+            external=False,
+            state_since=since or now,
+            stopped_at=None if mark is None else mark.stopped_at,
+            last_error=error,
         )
 
     @staticmethod
@@ -1495,6 +1809,8 @@ class RunnerManager:
         background threads (see RunnerProcess). launch: Launch.HELPER for a caller without a
         console (the GUI), see process.Launch.
         """
+        if record.mode is RunnerMode.SERVICE:
+            raise InvalidInputError(f"runner “{record.name}” 以 Windows 服务运行，请用启动服务")
         proxy = self._store.load().settings.proxy
         self._sync_proxy_env(record, proxy)
         return RunnerProcess(

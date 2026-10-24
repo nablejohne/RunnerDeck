@@ -16,8 +16,8 @@
 
 - [x] 计划与契约（用户已确认）
 - [x] 0 真机 spike S1–S11（`ssh XM`，2026-10-24）→ spike-notes §12：服务装完即启动、SCM 停止是优雅的（空闲 1 s / job 中 5.4 s Canceled）、授权后非管理员可启停、stdout 原样进 Runner 日志的 `WRITE LINE:`、`.env` 代理生效、转服务 = 注销后重装；**新坑**：Listener 要能列出每一级上级目录，根目录加固须留 `Authenticated Users:(RX)`
-- [ ] 1 依赖与小项：pywin32 / PyYAML、互斥量、runner 版本、根目录加固、代理写进 `.env`
-- [ ] 2 服务 core（service / elevate / elevated、installer、manager、CLI）
+- [x] 1 依赖与小项：pywin32 / PyYAML、互斥量、runner 版本、根目录加固、代理写进 `.env`（954a263、f3f1fcf，CI 绿）
+- [x] 2 服务 core（service / elevate / elevated、installer、manager、CLI）：XM 提权 SSH 下 CLI 全流程通过（添加→job→停/启→转服务→移除，无残留），真机 pytest 2486 passed；修订见 m4-design §13
 - [ ] 3 服务 app / ui
 - [ ] 4 Workflow 扫描、最近运行、检查更新
 - [ ] 5 取消注销后恢复

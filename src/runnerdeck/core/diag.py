@@ -12,6 +12,8 @@ from __future__ import annotations
 import codecs
 import logging
 import os
+import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -126,3 +128,122 @@ def read_tail(path: Path, *, max_bytes: int = MAX_TAIL_BYTES) -> str:
     if truncated:
         text = f"…（只显示最后 {_size_text(max_bytes)}）\n{text}"
     return redact(text)
+
+
+# --- service-mode runners: the Runner log carries the stdout (m4-design §2.7) ------------
+
+# [2026-10-24 06:08:11Z INFO Terminal] WRITE LINE: 2026-10-24 06:08:11Z: Running job: spike
+# [2026-10-24 06:04:42Z ERR  Terminal] WRITE ERROR: An error occurred: ...
+_TERMINAL_RE = re.compile(r"^\[[^\]]*\sTerminal\] WRITE (LINE|ERROR): ?(.*)$")
+_FOLLOW_INITIAL_BYTES = 64 * 1024
+
+
+def terminal_line(raw: str) -> tuple[bool, str] | None:
+    """(is_error, text) for a Runner log line the Listener wrote to its console, else None."""
+    match = _TERMINAL_RE.match(raw.rstrip("\r\n"))
+    if match is None:
+        return None
+    return match.group(1) == "ERROR", match.group(2)
+
+
+def newest_runner_log(runner_dir: Path) -> Path | None:
+    """The `_diag/Runner_*.log` modified last (each Listener start opens a new one)."""
+    newest: tuple[int, Path] | None = None
+    try:
+        with os.scandir(Path(runner_dir) / DIAG_DIR) as it:
+            for entry in it:
+                if not (_kind(entry.name) == "runner" and entry.name.endswith(LOG_SUFFIX)):
+                    continue
+                try:
+                    mtime = os.stat(entry.path).st_mtime_ns  # live value, spike-notes §11
+                except OSError:
+                    continue
+                if newest is None or mtime > newest[0]:
+                    newest = (mtime, Path(entry.path))
+    except OSError:
+        return None
+    return None if newest is None else newest[1]
+
+
+def last_terminal_error(runner_dir: Path, *, max_bytes: int = _FOLLOW_INITIAL_BYTES) -> str | None:
+    """The last `WRITE ERROR:` text in the newest Runner log (why a service quit), redacted."""
+    path = newest_runner_log(runner_dir)
+    if path is None:
+        return None
+    try:
+        text = read_tail(path, max_bytes=max_bytes)
+    except RunnerDeckError:
+        return None
+    errors = [line[1] for raw in text.splitlines() if (line := terminal_line(raw)) and line[0]]
+    return errors[-1] if errors else None
+
+
+@dataclass(frozen=True)
+class FollowResult:
+    """lines: console lines appended since the previous poll. catch_up: they come from the
+    first read of a file that was already being written (state recovery: do not notify)."""
+
+    lines: tuple[str, ...] = ()
+    catch_up: bool = False
+
+
+class LogFollower:
+    """Follows the newest Runner log of a service-mode runner (not thread-safe).
+
+    The first poll starts at most 64 KB before the end of the current file; a new file (the
+    service restarted) is read from its start. Only complete lines are consumed. last_error is
+    the newest `WRITE ERROR:` text seen. Texts are redacted.
+    """
+
+    def __init__(self, runner_dir: Path, *, initial_bytes: int = _FOLLOW_INITIAL_BYTES) -> None:
+        self.runner_dir = Path(runner_dir)
+        self.last_error: str | None = None
+        self._initial_bytes = initial_bytes
+        self._path: Path | None = None
+        self._offset = 0
+        self._first = True
+
+    def poll(self) -> FollowResult:
+        path = newest_runner_log(self.runner_dir)
+        if path is None:
+            return FollowResult()
+        catch_up = False
+        if path != self._path:
+            catch_up = self._first
+            self._path, self._offset = path, 0
+        try:
+            with path.open("rb") as f:
+                size = f.seek(0, os.SEEK_END)
+                if catch_up:
+                    self._offset = max(0, size - self._initial_bytes)
+                elif size < self._offset:  # truncated / replaced under the same name
+                    self._offset = 0
+                f.seek(self._offset)
+                data = f.read(size - self._offset)
+        except OSError as e:
+            log.debug("cannot read %s: %s", path, e)
+            return FollowResult()
+        self._first = False
+        end = data.rfind(b"\n")
+        if end < 0:
+            return FollowResult(catch_up=catch_up)
+        skip_partial = catch_up and self._offset > 0
+        self._offset += end + 1
+        chunk = data[: end + 1]
+        if chunk.startswith(codecs.BOM_UTF8):
+            chunk = chunk[len(codecs.BOM_UTF8) :]
+        raws = chunk.decode("utf-8", errors="replace").splitlines()
+        if skip_partial and raws:
+            raws = raws[1:]  # started in the middle of a line
+        lines: list[str] = []
+        for raw in raws:
+            parsed = terminal_line(raw)
+            if parsed is None:
+                continue
+            is_error, text = parsed
+            text = redact(text)
+            if is_error:
+                self.last_error = text
+            else:
+                lines.append(text)
+        return FollowResult(tuple(lines), catch_up)

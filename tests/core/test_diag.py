@@ -217,3 +217,78 @@ def test_windows_read_while_open_for_writing_by_another_process(tmp_path: Path) 
     finally:
         child.kill()
         child.wait(10)
+
+
+# --- service-mode Runner log (docs/m4-design.md §2.7) --------------------------------------
+
+LISTEN = "[2026-10-24 06:07:11Z INFO Terminal] WRITE LINE: 2026-10-24 06:07:11Z: Listening for Jobs"
+RUNNING = (
+    "[2026-10-24 06:08:11Z INFO Terminal] WRITE LINE: 2026-10-24 06:08:11Z: Running job: spike"
+)
+DONE = (
+    "[2026-10-24 06:08:35Z INFO Terminal] WRITE LINE: "
+    "2026-10-24 06:08:35Z: Job spike completed with result: Succeeded"
+)
+DENIED = (
+    "[2026-10-24 06:04:42Z ERR  Terminal] WRITE ERROR: An error occurred: Permission to read "
+    "the directory contents is required for 'D:\\tmp\\m4spike\\XM-svc1' and each directory up "
+    "the hierarchy. Access to the path 'D:\\tmp\\m4spike' is denied."
+)
+OTHER = "[2026-10-24 06:07:11Z INFO JobDispatcher] Set runner/worker IPC timeout to 30 seconds."
+
+
+def test_terminal_line() -> None:
+    assert diag.terminal_line(LISTEN) == (False, "2026-10-24 06:07:11Z: Listening for Jobs")
+    assert diag.terminal_line(DENIED + "\r\n")[0] is True  # type: ignore[index]
+    assert diag.terminal_line("[2026-10-24 06:07:08Z INFO Terminal] WRITE LINE: ") == (False, "")
+    assert diag.terminal_line(OTHER) is None
+
+
+def write_log(runner_dir: Path, name: str, *lines: str, mtime: int | None = None) -> Path:
+    path = runner_dir / "_diag" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_last_terminal_error_uses_the_newest_runner_log(tmp_path: Path) -> None:
+    assert diag.last_terminal_error(tmp_path) is None
+    write_log(tmp_path, "Runner_20261024-060441-utc.log", OTHER, DENIED, mtime=1_000)
+    write_log(tmp_path, "Worker_20261024-060812-utc.log", DENIED, mtime=3_000)
+    assert "Permission to read" in (diag.last_terminal_error(tmp_path) or "")
+    write_log(tmp_path, "Runner_20261024-060601-utc.log", LISTEN, mtime=2_000)
+    assert diag.last_terminal_error(tmp_path) is None
+
+
+def test_log_follower_catches_up_then_follows(tmp_path: Path) -> None:
+    first = write_log(tmp_path, "Runner_1.log", OTHER, LISTEN, RUNNING, mtime=1_000)
+    follower = diag.LogFollower(tmp_path)
+    result = follower.poll()
+    assert result.catch_up and result.lines[-1].endswith("Running job: spike")
+    assert follower.poll() == diag.FollowResult()
+    with first.open("a", encoding="utf-8") as f:
+        f.write(DONE + "\n[2026-10-24 06:09:08Z INFO Terminal] WRITE LI")  # partial last line
+    result = follower.poll()
+    assert not result.catch_up
+    assert result.lines == ("2026-10-24 06:08:35Z: Job spike completed with result: Succeeded",)
+    with first.open("a", encoding="utf-8") as f:
+        f.write("NE: Exiting...\n")
+    assert follower.poll().lines == ("Exiting...",)
+    # the service restarted: a new file is read from its start, not as a catch-up
+    write_log(tmp_path, "Runner_2.log", DENIED, LISTEN, mtime=int(os.stat(first).st_mtime) + 10)
+    result = follower.poll()
+    assert not result.catch_up and result.lines == ("2026-10-24 06:07:11Z: Listening for Jobs",)
+    assert follower.last_error is not None and "Permission to read" in follower.last_error
+
+
+def test_log_follower_catch_up_starts_mid_file(tmp_path: Path) -> None:
+    write_log(tmp_path, "Runner_1.log", *([OTHER] * 50), LISTEN)
+    follower = diag.LogFollower(tmp_path, initial_bytes=200)
+    result = follower.poll()
+    assert result.catch_up and result.lines == ("2026-10-24 06:07:11Z: Listening for Jobs",)
+
+
+def test_log_follower_without_logs(tmp_path: Path) -> None:
+    assert diag.LogFollower(tmp_path).poll() == diag.FollowResult()

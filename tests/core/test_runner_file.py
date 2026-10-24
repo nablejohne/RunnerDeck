@@ -399,6 +399,10 @@ def test_pe_file_version_off_windows(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows version resources")
-def test_pe_file_version_of_a_real_exe() -> None:
-    parts = runner_file.pe_file_version(Path(sys.executable))
-    assert parts is not None and parts[0] == 3
+def test_pe_file_version_of_a_real_dll() -> None:
+    import win32api
+
+    # The Python DLL: a uv venv's python.exe is uv's launcher with its own version resource.
+    dll = Path(win32api.GetModuleFileName(sys.dllhandle))  # type: ignore[attr-defined]
+    parts = runner_file.pe_file_version(dll)
+    assert parts is not None and parts[:2] == sys.version_info[:2]

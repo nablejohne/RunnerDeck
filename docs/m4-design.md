@@ -254,4 +254,21 @@ def run_elevated(op: str, payload: dict, *, timeout_s: float = 300) -> ElevatedR
 - 转服务确认是“注销 → `--runasservice`”，`.env` 保留、id 变（§2.5 原文成立）。
 - 非管理员跑 `--runasservice` 的报错没测到（SSH 里拿不到能起子进程的受限令牌）；产品不会这样调用。
 
-（实现后继续填写）
+**第 1 步（954a263、f3f1fcf）**
+- `ProxyApplyResult` 放在 `models.py`（ui 要用它的字段，不能 import manager）。只有代理时 `.env` 静默写入，不上报 `Step.ENV`（向导里没有这一行）。
+- 根目录加固的拒绝规则：盘符根；等于或包含用户主目录 / SystemRoot / ProgramFiles / ProgramData；位于系统目录之下。
+- `--smoke-test` 读 Python DLL 的文件版本（PyInstaller 打的 exe 没有版本资源）。
+
+**第 2 步（服务 core）**
+- 没有新增 `Step.ELEVATE`：提权复用 `Step.CONFIGURE` / `Step.UNCONFIGURE`，文案写“等待管理员授权（UAC），然后…”。向导不用改。
+- 已经是管理员的进程（管理员终端、XM 的 SSH 会话）不弹 UAC：`elevate.default_launcher` 在本进程里直接跑 `elevated.main`。桌面上的普通进程才走 `ShellExecuteExW`（D1 验证）。
+- `install_service` 的请求里带一个注销 token：安装失败时（config.cmd 失败、没有 `.service`、服务 10 s 内退出）由提权进程自己 `config.cmd remove`，同一次 UAC 里撤销干净。观察时间从 15 s 改成 10 s。
+- `convert_to_service` 带两个注销 token（先注销进程模式、失败时撤销服务安装）；装服务失败后用同一个注册 token 按进程模式重新注册，记录保留进程模式并更新 id。
+- `ElevatedResult`：`ok / output / error / service_name / agent_id / registered`（之后可能仍有 GitHub 注册，调用方据此走 API DELETE）`/ service_exists / warnings`。
+- manager：`service_info`、`start_service`（等 RUNNING 30 s，启动后退出 -> ServiceError + Listener 的错误原文）、`stop_service`（等 STOPPED 120 s，写优雅停止记录）、`grant_service_control`、`convert_to_service`；`process_for` 拒绝服务记录；`import_runner` 认 `.service`；移除服务 runner 不查进程（config.cmd remove 自己停服务）。
+- `diag.LogFollower.poll() -> FollowResult(lines, catch_up)`；`diag.last_terminal_error`。
+- CLI：`add --service`、`to-service <key> [-y]`、`grant-service <key>`；`start` / `stop` 对服务记录走 SCM。
+- 测试：Windows 上 pytest 的 `tmp_path` 在用户目录下，服务模式的测试夹具屏蔽“用户目录下拒绝”这条检查（有专门的用例测它）。
+- XM（提权 SSH，独立 `RUNNERDECK_HOME`）：CLI `add --service`（新建根目录自动加固、代理先写 `.env`）→ 跑 job 成功 → `stop` / `start` → 进程 runner `to-service` → 两个 `remove`，服务、本地组、目录、GitHub 注册都没有残留；真机全量 pytest 2486 passed。
+
+（第 3 步起继续填写）

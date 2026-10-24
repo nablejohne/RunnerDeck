@@ -2325,3 +2325,98 @@ def test_windows_second_ctrl_c_cuts_the_graceful_wait_short(h: Harness) -> None:
     while psutil.pid_exists(pid) and time.monotonic() < deadline:
         time.sleep(0.1)
     assert not psutil.pid_exists(pid)
+
+
+# --- service mode (docs/m4-design.md §2.9) -------------------------------------------------
+
+
+class ServiceStub:
+    """Manager stand-in for the service commands: records calls."""
+
+    def __init__(self, h: Harness) -> None:
+        self.h = h
+        self.calls: list[tuple[str, Any]] = []
+        self.procs: dict[str, Any] = {}  # Harness.release() looks here
+
+    def plan_add(self, owner: str, repo: str, **kw: Any) -> Any:
+        from runnerdeck.core.manager import AddPlan
+
+        self.calls.append(("plan_add", kw))
+        return AddPlan(owner, repo, DEFAULT_NAME, (), self.h.root / repo, private=True)
+
+    def add_runner(self, plan: Any, **_kw: Any) -> RunnerRecord:
+        from runnerdeck.core.models import RunnerMode
+
+        return self.h.seed(mode=RunnerMode.SERVICE, service_name="actions.runner.octo-demo.x")
+
+    def start_service(self, record_id: str) -> Any:
+        self.calls.append(("start_service", record_id))
+        return SimpleNamespace(state="running")
+
+    def stop_service(self, record_id: str) -> Any:
+        self.calls.append(("stop_service", record_id))
+        return SimpleNamespace(state="stopped")
+
+    def convert_to_service(self, record_id: str) -> RunnerRecord:
+        self.calls.append(("convert_to_service", record_id))
+        record = self.h.config().get(record_id)
+        assert record is not None
+        return record.model_copy(update={"service_name": "actions.runner.octo-demo.x"})
+
+    def grant_service_control(self, record_id: str) -> None:
+        self.calls.append(("grant_service_control", record_id))
+
+
+def test_add_service(h: Harness) -> None:
+    from runnerdeck.core.models import RunnerMode
+
+    h.login()
+    stub = ServiceStub(h)
+    h.start_manager = stub  # type: ignore[assignment]
+    result = h.run("add", f"{OWNER}/{REPO}", "--service", "-y")
+    assert result.code == 0, result.err
+    assert stub.calls[0][1]["mode"] is RunnerMode.SERVICE
+    assert "已安装并在运行" in result.out
+
+
+def test_start_and_stop_service_records(h: Harness) -> None:
+    from runnerdeck.core.models import RunnerMode
+
+    h.login()
+    record = h.seed(mode=RunnerMode.SERVICE, service_name="actions.runner.octo-demo.x")
+    stub = ServiceStub(h)
+    h.start_manager = stub  # type: ignore[assignment]
+    assert h.run("start", record.name).code == 0
+    assert h.run("stop", record.name).code == 0
+    assert stub.calls == [("start_service", record.id), ("stop_service", record.id)]
+    assert h.stopped == []  # never the hard kill used for process runners
+
+
+def test_to_service_asks_first(h: Harness) -> None:
+    h.login()
+    record = h.seed()
+    stub = ServiceStub(h)
+    h.start_manager = stub  # type: ignore[assignment]
+    h.answers.append("n")
+    assert h.run("to-service", record.name).code == 1
+    assert stub.calls == []
+    result = h.run("to-service", record.name, "-y")
+    assert result.code == 0 and stub.calls == [("convert_to_service", record.id)]
+    assert "actions.runner.octo-demo.x" in result.out
+
+
+def test_grant_service(h: Harness) -> None:
+    h.login()
+    record = h.seed()
+    stub = ServiceStub(h)
+    h.start_manager = stub  # type: ignore[assignment]
+    assert h.run("grant-service", record.name).code == 0
+    assert stub.calls == [("grant_service_control", record.id)]
+
+
+def test_elevated_is_hidden_and_dispatches(h: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(cli.elevated, "main", lambda path: seen.append(path) or 0)
+    assert "elevated" not in h.run("--help").out
+    assert h.run("elevated", "C:\\x\\req.json").code == 0
+    assert seen == ["C:\\x\\req.json"]

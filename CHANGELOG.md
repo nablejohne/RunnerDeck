@@ -43,6 +43,12 @@ job fails.
   `http_proxy`), so a runner uses it however it is started. Changing it rewrites the values
   RunnerDeck wrote and leaves a proxy you set yourself alone; running runners pick it up on
   their next start.
+- Service mode (CLI for now): `runnerdeck-cli add --service` registers a runner as a Windows
+  service (NETWORK SERVICE, starts with Windows, no sign-in needed) after one UAC prompt and
+  lets you start / stop it without further prompts; `to-service` turns a process-mode runner
+  into a service (its GitHub runner id changes), `grant-service` grants start / stop rights
+  for a service runner you imported. `start`, `stop`, `status` and `remove` handle service
+  runners; removing one deletes the service too.
 - "加固权限" on the settings page restricts the runner root to Administrators, SYSTEM and you
   (other users can only list it). A root RunnerDeck creates itself gets this automatically.
 

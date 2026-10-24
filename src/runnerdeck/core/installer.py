@@ -149,9 +149,11 @@ def build_config_command(
     labels: Sequence[str],
     work_folder: str = WORK_DIR,
     replace: bool = True,
+    run_as_service: bool = False,
 ) -> list[str]:
     """Argument list for `config.cmd --unattended`; every value is validated against cmd.exe
-    metacharacters first (InvalidInputError)."""
+    metacharacters first (InvalidInputError). run_as_service adds `--runasservice` (needs an
+    elevated process; the service starts right away, spike-notes §12)."""
     register_secret(token)
     _check_token(token)
     if not _URL_RE.fullmatch(url):
@@ -168,6 +170,8 @@ def build_config_command(
     args += ["--work", work_folder]
     if replace:
         args.append("--replace")
+    if run_as_service:
+        args.append("--runasservice")
     return args
 
 
@@ -187,6 +191,7 @@ def configure(
     run: RunFn = run_command,
     timeout: float = CONFIG_TIMEOUT_S,
     env: Mapping[str, str] | None = None,
+    run_as_service: bool = False,
 ) -> CommandResult:
     """Register the runner in `runner_dir` with GitHub (blocking, up to `timeout` seconds).
 
@@ -194,7 +199,9 @@ def configure(
     the runner reads them while configuring, not only while running).
     """
     register_secret(token)
-    args = build_config_command(url=url, token=token, name=name, labels=labels)
+    args = build_config_command(
+        url=url, token=token, name=name, labels=labels, run_as_service=run_as_service
+    )
     return _run_config(
         runner_dir,
         args,
@@ -204,6 +211,20 @@ def configure(
         timeout=timeout,
         env=env,
     )
+
+
+def registration_happened(runner_dir: Path, error: BaseException) -> bool:
+    """After a failed configure: did GitHub get a runner anyway?
+
+    `.runner` written, or config.cmd printed a registration marker before failing.
+    """
+    try:
+        if (runner_dir / ".runner").is_file():
+            return True
+    except OSError:
+        pass
+    output = error.output if isinstance(error, InstallError) else ""
+    return any(m in line for m in REGISTERED_MARKERS for line in output.splitlines())
 
 
 def unconfigure(
