@@ -1903,3 +1903,31 @@ def test_start_all_summarises_services_that_need_a_grant(
     assert len(failures.calls) == 1
     op, message = failures.calls[0][:2]
     assert op == "start" and "box-demo" in message and "box-b" in message
+
+
+def test_stopping_a_service_runner_ends_stopped_on_card_and_badge(
+    make_controller: Any, qtbot: Any, tmp_path: Path
+) -> None:
+    from runnerdeck.core.status import LocalSnapshot, RemoteSnapshot
+
+    record = _service_record(tmp_path)
+    log_file = Path(record.path) / "_diag" / "Runner_1.log"
+    log_file.parent.mkdir(parents=True)
+    log_file.write_text(f"{LISTEN}\n", encoding="utf-8")
+    h = make_controller(records=[record])
+    h.manager.service_states[record.id] = _scm(True)
+    h.controller._remotes[record.id] = RemoteSnapshot(RemoteStatus.ONLINE, fetched_at=NOW)
+    _poll(qtbot, h)
+    assert h.controller.display(record.id).state is DisplayState.IDLE
+    states = Spy(h.controller.runner_state)
+    # the user clicks stop: the Listener logs "Exiting...", the SCM then says STOPPED
+    with log_file.open("a", encoding="utf-8") as f:
+        f.write("[2026-10-24 06:09:08Z INFO Terminal] WRITE LINE: Exiting...\n")
+    h.manager.service_states[record.id] = LocalSnapshot(
+        state=LocalState.STOPPED, running=False, external=False, state_since=NOW, stopped_at=NOW
+    )
+    _poll(qtbot, h)
+    shown = h.controller.display(record.id)
+    assert h.controller.local_state(record.id)[0] is LocalState.STOPPED
+    assert shown.state is DisplayState.STOPPED
+    assert states.calls and states.calls[-1][1] is LocalState.STOPPED

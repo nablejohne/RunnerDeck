@@ -325,6 +325,8 @@ class RunnerController(QObject):
         # Live-merge inputs and outputs per record id (see the module docstring).
         self._locals: dict[str, LocalSnapshot] = {}  # last row.local
         self._service_logs: dict[str, _ServiceLog] = {}  # service runners' Runner logs
+        # last (state, job) sent as runner_state for each service runner
+        self._service_states_emitted: dict[str, tuple[LocalState, str | None]] = {}
         self._insights: dict[str, RepoInsights] = {}  # load_repo_insights cache
         self._session_stopped: list[str] = []  # signalled by the last emergency_stop_all
         self._needs_grant: list[str] = []  # services start / stop all skipped (no rights)
@@ -879,6 +881,7 @@ class RunnerController(QObject):
             for rid, follow in logs.items():
                 if self._config.get(rid) is not None:
                     self._feed_service_log(rid, follow)
+            self._emit_service_states(list(locals_))
             self._refresh_displays(list(locals_))
         if self._service_poll_again:
             self._service_poll_again = False
@@ -897,12 +900,22 @@ class RunnerController(QObject):
             if event is None:
                 continue
             service_log.seen = True
-            before = (machine.state, machine.current_job)
             machine.feed(event)
-            if (machine.state, machine.current_job) != before and not follow.catch_up:
-                self.runner_state.emit(record_id, machine.state, machine.current_job)
             if event.kind is EventKind.COMPLETED and event.detail and not follow.catch_up:
                 self.runner_job_finished.emit(record_id, event.detail, event.result or "")
+
+    def _emit_service_states(self, record_ids: Iterable[str]) -> None:
+        """`runner_state` for service runners whose live state (SCM + Runner log) changed:
+        the cards and the tray switch start / stop on it, as they do for our processes."""
+        now = self._clock()
+        for rid in record_ids:
+            if self._config.get(rid) is None:
+                continue
+            live = self._live_local(rid, now)
+            shown = (live.state, live.current_job)
+            if self._service_states_emitted.get(rid) != shown:
+                self._service_states_emitted[rid] = shown
+                self.runner_state.emit(rid, live.state, live.current_job)
 
     def _service_log(self, record_id: str) -> _ServiceLog:
         service_log = self._service_logs.get(record_id)
@@ -1455,7 +1468,13 @@ class RunnerController(QObject):
         return merged
 
     def _drop_caches(self, record_id: str) -> None:
-        for cache in (self._locals, self._remotes, self._displays, self._service_logs):
+        for cache in (
+            self._locals,
+            self._remotes,
+            self._displays,
+            self._service_logs,
+            self._service_states_emitted,
+        ):
             cache.pop(record_id, None)
 
     def _sync_remerge_timer(self) -> None:
