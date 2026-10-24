@@ -24,6 +24,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import psutil
@@ -467,11 +468,16 @@ class FakeStartManager:
     def __init__(self, scripts: dict[str, Script]) -> None:
         self.scripts = scripts
         self.procs: dict[str, FakeProcess] = {}
+        self.stops: dict[str, bool] = {}  # runner dir name -> forced, from record_stop
 
     def process_for(self, record: RunnerRecord, *, on_line: Any, on_state: Any) -> FakeProcess:
         proc = FakeProcess(record, self.scripts[record.name], on_line, on_state)
         self.procs[record.name] = proc
         return proc
+
+    def record_stop(self, runner_dir: Path, *, forced: bool, at: Any = None) -> None:
+        assert at is None  # the manager's clock decides
+        self.stops[Path(runner_dir).name] = forced
 
 
 class FakePopenProc:
@@ -708,6 +714,8 @@ def _parse(argv: list[str]) -> Any:
             {"key": "a", "keep_work": True, "yes": True},
         ),
         (["import", "D:/runners/x"], "_cmd_import", {"path": "D:/runners/x"}),
+        (["forget", "a"], "_cmd_forget", {"key": "a", "yes": False}),
+        (["forget", "a", "-y"], "_cmd_forget", {"key": "a", "yes": True}),
         (["scan"], "_cmd_scan", {}),
         (["settings"], "_cmd_settings_show", {}),
         (["settings", "show"], "_cmd_settings_show", {}),
@@ -1197,7 +1205,7 @@ def test_status_table(h: Harness) -> None:
         remote(4, "ext"),
     ]
     h.client.list_failures[_key(OWNER, "other")] = GitHubError("GitHub 服务暂时不可用", status=502)
-    h.running[ext.path] = [object()]
+    h.running[ext.path] = [SimpleNamespace(pid=1)]
 
     result = h.run("status")
     assert result.code == 0, result.err
@@ -1275,6 +1283,7 @@ def test_start_supervises_until_ctrl_c(h: Harness) -> None:
     assert procs["alpha"].stop_calls == [7.5]
     assert procs["beta"].stop_calls == [7.5]
     assert h.sleeps == [0.01]
+    assert h.start_manager.stops == {"alpha": False, "beta": True}  # type: ignore[union-attr]
 
 
 def test_start_all_graceful_stop_has_no_linger_hint(h: Harness) -> None:
@@ -1375,6 +1384,7 @@ def test_start_second_ctrl_c_kills_without_waiting_for_ctrl_break(h: Harness) ->
     main = threading.main_thread()
     assert all(t is not main for t in (*alpha.stop_threads, *beta.stop_threads))
     assert not alpha.running and not beta.running
+    assert h.start_manager.stops == {"alpha": True, "beta": True}  # type: ignore[union-attr]
 
 
 def test_start_third_ctrl_c_lists_runners_still_alive(h: Harness) -> None:
@@ -1404,6 +1414,7 @@ def test_start_third_ctrl_c_lists_runners_still_alive(h: Harness) -> None:
         assert f"请执行 {PROG} stop {name} 结束它" in result.err
     assert "gamma" not in result.err
     assert LINGER_HINT not in result.out  # nothing was killed
+    assert h.start_manager.stops == {"gamma": False}  # type: ignore[union-attr]  # others alive
 
 
 def test_start_kill_failure_never_exits_0(h: Harness) -> None:
@@ -1484,6 +1495,7 @@ def test_start_stop_failure_is_reported(h: Harness) -> None:
     assert result.code == 1
     assert "错误：[alpha] 无法结束 runner 进程（PID 9）" in result.err
     assert f"{PROG} stop alpha" in result.err  # still running: say how to end it
+    assert h.start_manager.stops == {}  # type: ignore[union-attr]
 
 
 def test_start_reports_runner_ended_from_outside(h: Harness) -> None:
@@ -1538,6 +1550,7 @@ def test_ctrl_c_only_stops_runners_still_running(h: Harness) -> None:
     assert procs["busy"].stop_calls == [7.5]
     assert "[done] 已停止" not in result.out
     assert "[busy] 已停止" in result.out
+    assert h.start_manager.stops == {"busy": False}  # type: ignore[union-attr]
 
 
 def test_start_all_without_runners(h: Harness) -> None:
@@ -1673,6 +1686,31 @@ def test_stop_kills_and_prints_linger_hint(h: Harness) -> None:
     assert h.stopped == [Path(record.path)]
     assert f"已强制结束 runner {DEFAULT_NAME}（PID 11, 12）" in result.out
     assert LINGER_HINT in result.out
+
+
+def test_stop_records_a_forced_stop_and_status_shows_the_lingering_session(
+    h: Harness,
+) -> None:
+    # docs/m3-design.md §9: after a CLI `stop`, `status` must say "GitHub 会话未过期",
+    # not "被其他进程运行".
+    h.login()
+    record = h.seed(github_runner_id=AGENT_ID)
+    h.stop_results[record.path] = ExternalStop([11, 12], [])
+    assert h.run("stop", DEFAULT_NAME).code == 0
+    h.client.runners[_key(OWNER, REPO)] = [remote(AGENT_ID, DEFAULT_NAME, "online")]
+    result = h.run("status")  # a new process: only the stop record knows about the kill
+    assert result.code == 0, result.err
+    assert "GitHub 会话未过期" in result.out
+    assert "被其他进程运行" not in result.out
+
+
+def test_stop_records_nothing_when_nothing_was_killed(h: Harness) -> None:
+    h.login()
+    record = h.seed(github_runner_id=AGENT_ID)
+    h.stop_results[record.path] = ExternalStop([], [12])
+    assert h.run("stop", DEFAULT_NAME).code == 1
+    h.client.runners[_key(OWNER, REPO)] = [remote(AGENT_ID, DEFAULT_NAME, "online")]
+    assert "被其他进程运行" in h.run("status").out
 
 
 def test_stop_not_running(h: Harness) -> None:
@@ -1877,6 +1915,44 @@ def test_import_rejects_non_runner_dir(h: Harness) -> None:
     result = h.run("import", str(plain))
     assert result.code == 1
     assert "不是 runner 目录" in result.err
+
+
+def test_forget_keeps_directory_and_registration(h: Harness) -> None:
+    path = make_runner_dir(h.root / "mine")
+    record = h.seed(path=str(path), github_runner_id=AGENT_ID)
+    h.answers = ["y"]
+    result = h.run("forget", DEFAULT_NAME)
+    assert result.code == 0, result.err
+    assert "只删除 RunnerDeck 的记录" in result.out
+    assert f"已取消登记 runner {DEFAULT_NAME}" in result.out
+    assert f"{PROG} import {record.path}" in result.out
+    assert h.config().runners == []
+    assert (path / ".runner").is_file() and (path / ".credentials").is_file()
+    assert h.client_calls == [] and h.cmd.calls == []
+
+
+def test_forget_yes_skips_the_question(h: Harness) -> None:
+    h.seed()
+    result = h.run("forget", DEFAULT_NAME, "-y")
+    assert result.code == 0
+    assert h.prompts == []
+    assert h.config().runners == []
+
+
+@pytest.mark.parametrize("answer", ["n", "", EOFError()])
+def test_forget_cancelled(h: Harness, answer: str | BaseException) -> None:
+    record = h.seed()
+    h.answers = [answer]
+    result = h.run("forget", DEFAULT_NAME)
+    assert result.code == 1
+    assert "已取消，没有做任何改动" in result.out
+    assert h.config().runners == [record]
+
+
+def test_forget_unknown_runner(h: Harness) -> None:
+    result = h.run("forget", "nope", "-y")
+    assert result.code == 1
+    assert "找不到 runner" in result.err
 
 
 def test_scan_lists_unregistered(h: Harness) -> None:

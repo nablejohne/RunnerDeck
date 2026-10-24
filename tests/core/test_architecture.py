@@ -43,8 +43,14 @@ BANNED_IN_UI = (
     "runnerdeck.core.secrets",
     "runnerdeck.core.winproc",
     "runnerdeck.core.cli",
+    # M3 IO modules (registry, stop records on disk, _diag files): also controller-only
+    "runnerdeck.core.autostart",
+    "runnerdeck.core.stop_marks",
+    "runnerdeck.core.diag",
     "httpx",
     "subprocess",
+    "winreg",
+    "psutil",
 )
 BANNED_IN_APP = ("runnerdeck.ui", "qfluentwidgets")
 

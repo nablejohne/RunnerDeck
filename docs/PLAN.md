@@ -113,7 +113,7 @@ runnerdeck/
 │  ├─ PROGRESS.md           # 里程碑进度，唯一状态来源
 │  └─ spike-notes.md        # M0 验证结论
 ├─ src/runnerdeck/
-│  ├─ __main__.py           # 入口：单实例检查、创建 QApplication、托盘
+│  ├─ __main__.py           # 入口：单实例检查、创建 QApplication、托盘（M3：`--autostart` 只在托盘启动）
 │  ├─ core/                 # 纯 Python，不依赖 Qt
 │  │  ├─ models.py          # RunnerRecord、AppSettings、RemoteRunner
 │  │  ├─ paths.py           # 各目录位置
@@ -126,6 +126,9 @@ runnerdeck/
 │  │  ├─ runner_file.py     # 解析 .runner
 │  │  ├─ service.py         # Windows 服务模式（M4）
 │  │  ├─ errors.py / redact.py / logs.py / winproc.py   # M1 新增：异常、脱敏、日志、Windows 进程工具
+│  │  ├─ autostart.py       # M3：HKCU Run 开机自启实际放在这里（纯 winreg，可注入，见 m3-design §0）
+│  │  ├─ stop_marks.py      # M3 新增：停止记录（时间 + 是否强杀），GUI 和 CLI 跨进程共用
+│  │  ├─ diag.py            # M3 新增：列出 / 读取 runner 的 _diag 日志（尾部截断、脱敏）
 │  │  ├─ status.py          # M1 新增：本地 + 远端状态合并（纯函数）
 │  │  ├─ manager.py         # M1 新增：添加/移除/导入/状态的业务流程与回滚，CLI 和 Controller 共用
 │  │  └─ cli.py             # 调试用命令行（runnerdeck-cli），M1 验收用
@@ -133,10 +136,12 @@ runnerdeck/
 │  │  ├─ controller.py      # RunnerController(QObject)：对外的唯一入口
 │  │  ├─ workers.py         # QRunnable + 信号
 │  │  ├─ poller.py          # 定时同步 GitHub 状态
-│  │  ├─ autostart.py       # HKCU\...\Run 开机自启
-│  │  └─ tray.py
+│  │  ├─ single_instance.py # M3 新增：单实例锁 + 本地套接字，再次启动时激活已有窗口
+│  │  ├─ autostart.py       # HKCU\...\Run 开机自启 → M3 改放 core/autostart.py
+│  │  └─ tray.py            # → M3 改放 ui/tray.py（菜单用 qfluentwidgets，app 层不能 import）
 │  └─ ui/
 │     ├─ main_window.py     # FluentWindow
+│     ├─ tray.py            # M3：托盘图标 + 菜单 + 通知
 │     ├─ pages/             # login / dashboard / add_wizard / runner_detail / settings
 │     ├─ components/        # runner_card / status_badge / log_viewer
 │     └─ resources/         # 图标

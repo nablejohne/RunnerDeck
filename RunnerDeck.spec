@@ -46,8 +46,13 @@ a_gui = Analysis(
         *collect_submodules("qfluentwidgets"),
         *KEYRING_HIDDEN,
         "truststore",
+        # Imported lazily by __main__ (M3: the single-instance server needs QtNetwork).
+        "PyQt5.QtNetwork",
         "runnerdeck.app.controller",
+        "runnerdeck.app.poller",
+        "runnerdeck.app.single_instance",
         "runnerdeck.ui.main_window",
+        "runnerdeck.ui.tray",
     ],
     hookspath=[],
     hooksconfig={},

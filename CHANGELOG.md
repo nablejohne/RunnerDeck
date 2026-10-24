@@ -5,6 +5,58 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+M3: RunnerDeck can be left running all day. It lives in the tray, starts with Windows if
+asked to, starts your runners itself, keeps their GitHub status current and tells you when a
+job fails.
+
+### Added
+- Tray icon with a status dot (grey: all stopped, green: online, blue: running a job, red:
+  something needs attention) and a menu: open the window, start / stop all, start or stop
+  each runner, quit. A left click opens the window.
+- Closing the window hides it to the tray (setting, on by default); "退出" in the tray menu
+  stops every runner gracefully first, after a confirmation that names the jobs in progress.
+- Launch on login through `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+  (`RunnerDeck.exe --autostart`: tray only, no window). The entry is checked at every start
+  and rewritten if the unzipped folder was moved; an entry disabled in Task Manager is
+  reported, not overridden.
+- "随 RunnerDeck 启动" per runner (add wizard, card menu, detail page): those runners start
+  when RunnerDeck starts; one already run by another process is skipped with a notice.
+- Status poller: GitHub status is refreshed every 15–300 s (settings page, default 30 s) and
+  a few seconds after a runner changes state; while every repository request fails it backs
+  off to every 5 minutes. Local process checks are never slowed down.
+- Runner detail page (click a card): status, repository, directory, labels, GitHub id and
+  runner version; live output and the runner's `_diag` logs (last 1 MB, redacted) in one
+  log view. It replaces the output dialog.
+- Import an existing runner directory ("导入" on the dashboard). A banner lists unregistered
+  runner directories under the runner root and runner processes RunnerDeck did not start,
+  with import / end-process buttons.
+- Take over a runner that another process runs (for example `runnerdeck-cli start`): end
+  that process and start the runner from RunnerDeck.
+- "取消登记" (CLI: `runnerdeck-cli forget <key>`): drop RunnerDeck's record only; the
+  directory and the GitHub registration stay as they are.
+- Tray notifications: failed jobs by default (all / failed only / off in settings), a runner
+  entering an error state, and new unregistered directories or stray runner processes found
+  while the window is hidden.
+- Settings: launch on login, start minimised to the tray, close to the tray, job
+  notifications, theme (system / light / dark), poll interval.
+
+### Changed
+- Starting RunnerDeck a second time brings the running window to the front instead of
+  showing "已经在运行" (a per-user local server next to the lock file).
+- Right after a graceful stop GitHub keeps a runner online for up to about a minute; that
+  window now shows "已停止" instead of "被其他进程运行". A GitHub answer older than the latest
+  local state change no longer overrides it, and dashboard counts use the same grouping as
+  the tray colour.
+- A status refresh scans the runner processes once instead of once per runner.
+- On Windows logoff or shutdown running runners are told to stop without holding up the
+  session end.
+
+### Fixed
+- Whether a runner was killed or stopped gracefully was only kept in memory: after a restart,
+  or a `runnerdeck-cli stop` from another terminal, a killed runner showed as "被其他进程运行"
+  until its GitHub session expired. Stop records are now saved per runner under
+  `%LOCALAPPDATA%\RunnerDeck\stops`, so the status shows "GitHub 会话未过期" instead.
+
 ## [0.1.0] - 2026-10-24
 
 First pre-release: a Windows desktop app that registers and runs repo-level GitHub Actions

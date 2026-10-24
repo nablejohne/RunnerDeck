@@ -27,10 +27,44 @@ PAT 只保存在 Windows 凭据管理器，不写入文件和日志。
 ## 功能概览
 
 - 登录一次，列出你的仓库，几步向导把本机注册成某个仓库的 runner（自动下载并校验 actions/runner）。
-- 概览页为每个 runner 显示本地状态、当前 job，可单个或全部启停、查看输出、打开目录、移除。
-- 设置页：runner 根目录、默认标签、代理、更换 PAT / 退出登录。
-- 关闭窗口会先优雅停止所有运行中的 runner 再退出。
-- 托盘、开机自启、状态自动轮询在 M3 加入。
+- 概览页为每个 runner 显示状态（本地进程 + GitHub 端，自动轮询）和当前 job，可单个或全部启停、打开目录、移除；点卡片进详情页看实时输出和诊断日志。
+- 常驻托盘、开机自启、随 RunnerDeck 自动启动 runner、job 失败通知。
+- 导入已有的 runner 目录；发现不归 RunnerDeck 管的 runner 进程时可以结束或接管。
+- 设置页：runner 根目录、默认标签、代理、轮询间隔、启动与托盘、通知、主题、更换 PAT / 退出登录。
+
+## 托盘
+
+RunnerDeck 常驻任务栏右下角的托盘。图标右下角的小圆点表示整体状态：灰色全部停止，绿色在线空闲，蓝色正在执行 job，红色有 runner 出错或需要处理。
+
+- 左键单击托盘图标打开主窗口；右键菜单可以全部启动 / 全部停止、单独启停每个 runner、退出。
+- 关闭窗口默认只是隐藏到托盘，runner 继续运行（设置 →“关闭窗口时最小化到托盘”可关掉）。
+- 托盘菜单的“退出”才真正退出：先确认（会列出正在执行的 job），再优雅停止所有 runner。
+- 再次双击 `RunnerDeck.exe` 不会开第二个实例，而是把已有窗口切到前面。
+- Windows 注销或关机时会通知所有 runner 停止，不会卡住注销。
+
+## 开机自启
+
+设置 → 启动与托盘 →“开机自启”。打开后 RunnerDeck 写入当前用户的启动项（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，不需要管理员权限），登录后以 `RunnerDeck.exe --autostart` 启动：只在托盘，不弹窗口。
+
+- 想让某个 runner 开机后自动上线，在添加向导里勾选“随 RunnerDeck 自动启动”，或在卡片菜单 / 详情页打开“随 RunnerDeck 启动”。RunnerDeck 启动时会拉起这些 runner；如果该目录已经有别的进程在跑，会跳过并提示。
+- 挪动了解压目录也没关系：每次启动都会检查启动项，路径不对就改写。
+- 如果在任务管理器的“启动”页把 RunnerDeck 禁用了，设置页会提示，请回任务管理器启用（RunnerDeck 不会替你改回来）。
+- 平时手动启动也想只在托盘里，打开“启动时最小化到托盘”。
+
+## 导入已有的 runner
+
+已经用官方脚本配置好的 runner 目录（含 `.runner` 文件）可以直接交给 RunnerDeck 管理：概览页“导入”→ 选择目录。导入只登记，不重新注册、不移动目录；PAT 需要能访问这个 runner 注册的仓库。
+
+- RunnerDeck 会扫描 runner 根目录：发现未登记的 runner 目录、或者不是 RunnerDeck 启动的 runner 进程，概览页顶部会出现横幅，可以逐个导入或结束进程。
+- 卡片菜单里的“取消登记”只删除 RunnerDeck 的记录，目录和 GitHub 上的注册原样保留（和“移除”不同，“移除”会注销并删除目录）。
+
+## 接管其他进程运行的 runner
+
+如果一个已登记的 runner 正被别的进程运行（比如在终端里用 `runnerdeck-cli start` 启动的），卡片会显示“被其他进程运行”，主按钮变成“接管”：RunnerDeck 结束那个进程，再自己启动它。强制结束后 GitHub 端的旧会话大约 3 分钟才过期，这段时间会显示“等待旧会话过期”，之后恢复空闲；如果当时正在执行 job，强杀会在 GitHub 上留下一个僵尸 job，确认框会提醒。
+
+## 通知
+
+job 结束时托盘弹通知，默认“仅失败”（失败或被放弃的 job），可在设置里改成“全部”或“关闭”。runner 进入出错状态时也会通知；窗口隐藏在托盘时，新发现未登记的 runner 目录或残留进程也会提示。
 
 ## 从源码运行
 
@@ -38,7 +72,7 @@ PAT 只保存在 Windows 凭据管理器，不写入文件和日志。
 
 ```powershell
 uv sync
-uv run python -m runnerdeck          # 图形界面
+uv run python -m runnerdeck          # 图形界面（加 --autostart 只在托盘启动）
 uv run runnerdeck-cli --help         # 调试 CLI
 uv run pytest                        # 测试（macOS/Linux 上 Windows 专属用例自动跳过）
 pwsh scripts/build.ps1               # 打包到 dist\RunnerDeck 和 dist\*.zip

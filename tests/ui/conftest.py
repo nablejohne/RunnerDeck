@@ -1,4 +1,5 @@
-"""Fixtures for the ui tests: a recording FakeController with the §4 signal/method surface.
+"""Fixtures for the ui tests: a recording FakeController with the controller's surface
+(docs/m2-design.md §4 + docs/m3-design.md §4.1).
 
 The real controller (runnerdeck.app.controller) is replaced by FakeController so these tests
 never touch the network, keyring or subprocesses. Tests call `fake.<signal>.emit(...)` to play
@@ -19,6 +20,7 @@ from runnerdeck.core.manager import AddPlan, RunnerStatusRow
 from runnerdeck.core.models import (
     AppConfig,
     AppSettings,
+    AutostartState,
     DisplayState,
     GitHubUser,
     LocalState,
@@ -38,6 +40,20 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("RUNNERDECK_HOME", str(tmp_path))
     monkeypatch.delenv("RUNNERDECK_PAT", raising=False)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def app_quits(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Record QApplication.quit() instead of calling it (MainWindow.quit_app does).
+
+    A real quit() outside exec() sets Qt's sticky quitNow flag: every later event loop
+    (qtbot.wait / waitUntil / waitSignal) would then return at once and later tests time out.
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    quits: list[bool] = []
+    monkeypatch.setattr(QApplication, "quit", staticmethod(lambda: quits.append(True)))
+    return quits
 
 
 class FakeController(QObject):
@@ -65,6 +81,16 @@ class FakeController(QObject):
     busy_changed = pyqtSignal(str, bool)
     runner_line = pyqtSignal(str, str)
     runner_job_finished = pyqtSignal(str, str, str)
+    refreshing_changed = pyqtSignal(bool)
+    # M3 (docs/m3-design.md §4.1)
+    display_changed = pyqtSignal(str, object)  # record id, DisplayStatus
+    discovery_updated = pyqtSignal(object)  # Discovery
+    runner_imported = pyqtSignal(object)  # RunnerRecord
+    runner_forgotten = pyqtSignal(str)  # record id
+    external_stopped = pyqtSignal(str, object)  # record id or stray path, ExternalStop
+    diag_logs_loaded = pyqtSignal(str, object)  # record id, list[DiagLog]
+    diag_text_loaded = pyqtSignal(str, str, str)  # record id, path, text
+    autostart_state_loaded = pyqtSignal(object)  # AutostartState
 
     def __init__(self, config: AppConfig | None = None, *, logged_in: bool = True) -> None:
         super().__init__()
@@ -79,6 +105,10 @@ class FakeController(QObject):
         self.auto_plan: AddPlan | None = None
         self.auto_add_steps: list[tuple[str, str]] = []
         self.auto_added: RunnerRecord | None = None
+        self.refreshing = False
+        self.remote_busy_ids: set[str] = set()
+        self.autostart_supported = True
+        self.emergency_count = 0
 
     # --- read-only -----------------------------------------------------------------
 
@@ -106,6 +136,12 @@ class FakeController(QObject):
             return self.displays[record_id]
         state, job = self.local_state(record_id)
         return make_display(DisplayState(state.value), job=job)
+
+    def all_displays(self) -> dict[str, DisplayStatus]:
+        return {r.id: self.display(r.id) for r in self.records}
+
+    def remote_busy(self, record_id: str) -> bool:
+        return record_id in self.remote_busy_ids
 
     # --- recorded operations ---------------------------------------------------------------
 
@@ -140,8 +176,10 @@ class FakeController(QObject):
         if self.auto_plan is not None:
             self.plan_ready.emit(self.auto_plan)
 
-    def add_runner(self, plan: AddPlan, *, start_after: bool = False) -> None:
-        self._record("add_runner", plan, start_after=start_after)
+    def add_runner(
+        self, plan: AddPlan, *, start_after: bool = False, auto_start: bool = False
+    ) -> None:
+        self._record("add_runner", plan, start_after=start_after, auto_start=auto_start)
         for step, text in self.auto_add_steps:
             self.add_progress.emit(step, text)
         if self.auto_added is not None:
@@ -164,8 +202,8 @@ class FakeController(QObject):
     def remove(self, record_id: str, *, keep_work: bool = False) -> None:
         self._record("remove", record_id, keep_work=keep_work)
 
-    def refresh_statuses(self) -> None:
-        self._record("refresh_statuses")
+    def refresh_statuses(self, *, remote: bool = True, quiet: bool = False) -> None:
+        self._record("refresh_statuses", remote=remote, quiet=quiet)
 
     def save_settings(self, settings: AppSettings) -> None:
         self._record("save_settings", settings)
@@ -179,12 +217,71 @@ class FakeController(QObject):
         self._record("shutdown", timeout=timeout)
         return list(self.shutdown_leftovers)
 
+    # M3 (docs/m3-design.md §4.1)
+
+    def start_auto_runners(self) -> None:
+        self._record("start_auto_runners")
+
+    def set_auto_start(self, record_id: str, enabled: bool) -> None:
+        self._record("set_auto_start", record_id, enabled)
+
+    def import_runner(self, path: str, *, auto_start: bool = False) -> None:
+        self._record("import_runner", path, auto_start=auto_start)
+
+    def forget(self, record_id: str) -> None:
+        self._record("forget", record_id)
+
+    def discover(self) -> None:
+        self._record("discover")
+
+    def kill_external(self, record_id: str) -> None:
+        self._record("kill_external", record_id)
+
+    def take_over(self, record_id: str) -> None:
+        self._record("take_over", record_id)
+
+    def kill_stray(self, path: str) -> None:
+        self._record("kill_stray", path)
+
+    def load_diag_logs(self, record_id: str) -> None:
+        self._record("load_diag_logs", record_id)
+
+    def load_diag_text(self, record_id: str, path: str) -> None:
+        self._record("load_diag_text", record_id, path)
+
+    def load_autostart_state(self) -> None:
+        self._record("load_autostart_state")
+
+    def set_launch_on_login(self, enabled: bool) -> None:
+        self._record("set_launch_on_login", enabled)
+        self.config.settings = self.config.settings.model_copy(update={"launch_on_login": enabled})
+        self.autostart_state_loaded.emit(
+            AutostartState(supported=True, registered=enabled, command="x", expected="x")
+        )
+        self.config_changed.emit(self.config)
+
+    def reconcile_autostart(self) -> None:
+        self._record("reconcile_autostart")
+
+    def emergency_stop_all(self) -> int:
+        self._record("emergency_stop_all")
+        return self.emergency_count
+
     # --- test helpers ---------------------------------------------------------------------
 
     def set_state(self, record_id: str, state: LocalState, job: str | None = None) -> None:
-        """Change the local state and emit runner_state like the real controller."""
+        """Change the local state; emit runner_state and display_changed like the controller.
+
+        The display follows the local state unless a test pinned one in `displays`.
+        """
         self.states[record_id] = (state, job)
         self.runner_state.emit(record_id, state, job)
+        self.display_changed.emit(record_id, self.display(record_id))
+
+    def set_display(self, record_id: str, display: DisplayStatus) -> None:
+        """Pin the merged display of a runner and emit display_changed."""
+        self.displays[record_id] = display
+        self.display_changed.emit(record_id, display)
 
 
 # --- model helpers --------------------------------------------------------------------------

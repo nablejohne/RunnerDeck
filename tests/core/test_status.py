@@ -18,14 +18,20 @@ from runnerdeck.core.models import (
 )
 from runnerdeck.core.status import (
     LABELS,
+    OFFLINE_LAG_S,
     SESSION_LINGER_S,
     STALL_AFTER_S,
+    Bucket,
     DisplayStatus,
     LocalSnapshot,
     RemoteSnapshot,
+    TrayLevel,
+    bucket,
     display_label,
+    is_job_failure,
     match_remote,
     merge_status,
+    tray_level,
 )
 
 NOW = datetime(2026, 10, 22, 8, 10, 0, tzinfo=UTC)
@@ -158,8 +164,16 @@ def test_stopping_wins_over_remote(rem: RemoteSnapshot | None, running: bool) ->
 def test_error_wins_over_remote_and_carries_last_error(
     rem: RemoteSnapshot | None, running: bool
 ) -> None:
-    loc = local(L.ERROR, running=running, external=True, error="run.cmd 退出码 1")
+    loc = local(L.ERROR, running=running, error="run.cmd 退出码 1")
     assert merge(loc, rem) == DisplayStatus(D.ERROR, "异常", "run.cmd 退出码 1")
+
+
+@pytest.mark.parametrize("rem", NON_MISSING, ids=NON_MISSING_IDS)
+def test_error_yields_to_an_external_process(rem: RemoteSnapshot | None) -> None:
+    # Our run failed, then someone started the runner elsewhere: offer take-over / kill
+    # (EXTERNAL) instead of a dead-end "异常" whose 启动 can never succeed.
+    loc = local(L.ERROR, running=False, external=True, error="run.cmd 退出码 1")
+    assert merge(loc, rem) == DisplayStatus(D.EXTERNAL, "被其他进程运行", st.DETAIL_EXTERNAL_LOCAL)
 
 
 def test_error_without_message_has_no_detail() -> None:
@@ -300,7 +314,9 @@ def test_external_process_in_directory(rem: RemoteSnapshot | None, forced: bool)
         (True, SESSION_LINGER_S + 1, D.EXTERNAL),  # 241 s
         (True, 3600, D.EXTERNAL),
         (True, None, D.EXTERNAL),  # forced but stop time unknown
-        (False, 0, D.EXTERNAL),  # graceful stop: GitHub drops the session itself
+        (False, 0, D.STOPPED),  # graceful stop: GitHub's online flag lags (m3-design §2)
+        (False, OFFLINE_LAG_S - 1, D.STOPPED),
+        (False, OFFLINE_LAG_S, D.EXTERNAL),  # "< 90" is strict
         (False, 100, D.EXTERNAL),
         (False, None, D.EXTERNAL),  # never stopped by us: service / other machine
     ],
@@ -317,6 +333,8 @@ def test_not_running_remote_online_session_linger_boundary(
     assert result.label == LABELS[expected]
     if expected is D.EXTERNAL:
         assert result.detail == st.DETAIL_EXTERNAL_REMOTE
+    elif expected is D.STOPPED:
+        assert result.detail == st.DETAIL_OFFLINE_LAG
     else:
         assert "等待旧会话过期" in result.detail  # type: ignore[operator]
 
@@ -359,6 +377,144 @@ def test_not_running_remote_unknown_is_stopped_with_note(
 def test_busy_remote_with_stopped_local_is_external() -> None:
     result = merge(local(L.STOPPED, running=False), ONLINE_BUSY)
     assert result.state is D.EXTERNAL
+
+
+def test_graceful_lag_window_does_not_hide_an_external_process() -> None:
+    loc = local(L.STOPPED, running=False, external=True, stopped_ago_s=5)
+    assert merge(loc, ONLINE).state is D.EXTERNAL
+
+
+@pytest.mark.parametrize("rem", [OFFLINE, UNKNOWN, None], ids=["offline", "unknown", "none"])
+def test_graceful_lag_detail_only_while_github_says_online(rem: RemoteSnapshot | None) -> None:
+    loc = local(L.STOPPED, running=False, stopped_ago_s=5)
+    assert merge(loc, rem).detail != st.DETAIL_OFFLINE_LAG
+
+
+# --- remote snapshot older than the local state (m3-design §2) ----------------------------
+
+
+def older(status: RemoteStatus, busy: bool = False, *, age_s: float = 30) -> RemoteSnapshot:
+    return RemoteSnapshot(status=status, busy=busy, fetched_at=NOW - timedelta(seconds=age_s))
+
+
+@pytest.mark.parametrize(
+    "rem",
+    [
+        older(RemoteStatus.ONLINE),
+        older(RemoteStatus.ONLINE, busy=True),
+        older(RemoteStatus.OFFLINE),
+    ],
+    ids=["online", "online-busy", "offline"],
+)
+@pytest.mark.parametrize(
+    ("state", "job", "expected"),
+    [
+        (L.STARTING, None, D.STARTING),
+        (L.IDLE, None, D.IDLE),
+        (L.BUSY, "build", D.BUSY),
+        (L.STOPPED, None, D.STARTING),  # running but nothing reported yet
+    ],
+)
+def test_remote_older_than_local_state_shows_local_state_without_detail(
+    rem: RemoteSnapshot, state: LocalState, job: str | None, expected: DisplayState
+) -> None:
+    # The state began 10 s ago; the snapshot is 30 s old.
+    result = merge(local(state, running=True, since_s=10, job=job), rem)
+    assert result == DisplayStatus(expected, display_label(expected, job), None)
+
+
+def test_remote_older_than_local_state_does_not_stall() -> None:
+    # Offline for ages, but the snapshot predates the IDLE state that began 70 s ago.
+    rem = older(RemoteStatus.OFFLINE, age_s=STALL_AFTER_S + 20)
+    assert merge(local(L.IDLE, running=True, since_s=STALL_AFTER_S + 10), rem).state is D.IDLE
+
+
+def test_remote_fetched_at_state_start_is_used() -> None:
+    # Equal timestamps: the snapshot is not older, the normal rules apply.
+    assert merge(local(L.IDLE, running=True, since_s=0), OFFLINE).state is D.CONNECTING
+
+
+@pytest.mark.parametrize("status", [RemoteStatus.UNKNOWN, RemoteStatus.MISSING])
+def test_old_unknown_or_missing_snapshot_keeps_its_rules(status: RemoteStatus) -> None:
+    result = merge(local(L.IDLE, running=True, since_s=10), older(status))
+    if status is RemoteStatus.MISSING:
+        assert result.state is D.MISSING
+    else:
+        assert result == DisplayStatus(D.IDLE, "空闲", st.DETAIL_REMOTE_UNKNOWN)
+
+
+def test_old_snapshot_does_not_override_reconnecting() -> None:
+    loc = local(L.RECONNECTING, running=True, since_s=10)
+    assert merge(loc, older(RemoteStatus.ONLINE)).state is D.RECONNECTING
+
+
+def test_old_snapshot_for_a_stopped_runner_keeps_rule_4() -> None:
+    loc = local(L.STOPPED, running=False, since_s=10, forced=True, stopped_ago_s=10)
+    assert merge(loc, older(RemoteStatus.ONLINE)).state is D.SESSION_LINGERING
+
+
+# --- buckets / tray level / job results ---------------------------------------------------
+
+
+def test_every_display_state_has_a_bucket() -> None:
+    assert {bucket(s) for s in DisplayState} == set(Bucket)
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (D.IDLE, Bucket.IDLE),
+        (D.BUSY, Bucket.RUNNING),
+        (D.STARTING, Bucket.RUNNING),
+        (D.CONNECTING, Bucket.RUNNING),
+        (D.RECONNECTING, Bucket.RUNNING),
+        (D.STOPPING, Bucket.RUNNING),
+        (D.STALLED, Bucket.TROUBLE),
+        (D.ERROR, Bucket.TROUBLE),
+        (D.MISSING, Bucket.TROUBLE),
+        (D.EXTERNAL, Bucket.TROUBLE),
+        (D.STOPPED, Bucket.STOPPED),
+        (D.UNKNOWN, Bucket.STOPPED),
+        (D.SESSION_LINGERING, Bucket.STOPPED),
+    ],
+)
+def test_bucket(state: DisplayState, expected: Bucket) -> None:
+    assert bucket(state) is expected
+
+
+@pytest.mark.parametrize(
+    ("states", "expected"),
+    [
+        ([], TrayLevel.STOPPED),
+        ([D.STOPPED, D.SESSION_LINGERING, D.UNKNOWN], TrayLevel.STOPPED),
+        ([D.STOPPED, D.IDLE], TrayLevel.ONLINE),
+        ([D.STARTING], TrayLevel.ONLINE),
+        ([D.IDLE, D.BUSY, D.STOPPED], TrayLevel.BUSY),
+        ([D.BUSY, D.ERROR], TrayLevel.ERROR),
+        ([D.STOPPED, D.EXTERNAL], TrayLevel.ERROR),
+        ([D.MISSING], TrayLevel.ERROR),
+    ],
+)
+def test_tray_level(states: list[DisplayState], expected: TrayLevel) -> None:
+    assert tray_level(states) is expected
+    assert tray_level(iter(states)) is expected  # any iterable, consumed once
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ("Failed", True),
+        ("failed", True),
+        (" Abandoned ", True),
+        ("Succeeded", False),
+        ("SucceededWithIssues", False),
+        ("Canceled", False),
+        ("Skipped", False),
+        ("", False),
+    ],
+)
+def test_is_job_failure(result: str, expected: bool) -> None:
+    assert is_job_failure(result) is expected
 
 
 # --- whole input space -----------------------------------------------------------------
@@ -484,3 +640,37 @@ def test_match_returns_none_when_neither_id_nor_name_match(remotes: list[RemoteR
 def test_match_accepts_any_sequence() -> None:
     target = _remote_runner(42, "x")
     assert match_remote(_record(), (target,)) is target
+
+
+# --- rule 4 windows are measured from the snapshot's fetch time --------------------------
+
+
+def fetched(status: RemoteStatus, *, ago_s: float) -> RemoteSnapshot:
+    return RemoteSnapshot(status=status, fetched_at=NOW - timedelta(seconds=ago_s))
+
+
+def test_graceful_stop_with_an_old_online_snapshot_stays_stopped() -> None:
+    # Stopped 200 s ago, GitHub said online 3 s after the stop and nobody polled since
+    # (poll interval 300 s): still lag, not EXTERNAL.
+    loc = local(L.STOPPED, running=False, stopped_ago_s=200)
+    result = merge(loc, fetched(RemoteStatus.ONLINE, ago_s=197))
+    assert result == DisplayStatus(D.STOPPED, "已停止", st.DETAIL_OFFLINE_LAG)
+
+
+def test_graceful_stop_online_long_after_the_stop_is_external() -> None:
+    loc = local(L.STOPPED, running=False, stopped_ago_s=200)
+    assert merge(loc, fetched(RemoteStatus.ONLINE, ago_s=5)).state is D.EXTERNAL
+
+
+def test_forced_stop_with_an_old_online_snapshot_keeps_lingering() -> None:
+    # Session window is over by the clock, but the latest snapshot is from inside it.
+    loc = local(L.STOPPED, running=False, forced=True, stopped_ago_s=SESSION_LINGER_S + 60)
+    result = merge(loc, fetched(RemoteStatus.ONLINE, ago_s=SESSION_LINGER_S + 50))
+    assert result.state is D.SESSION_LINGERING
+    assert "约 1 秒" in result.detail  # type: ignore[operator]
+
+
+def test_snapshot_from_before_the_stop_is_not_external() -> None:
+    # Fetched while our own process still ran; the stop came after it.
+    loc = local(L.STOPPED, running=False, stopped_ago_s=10)
+    assert merge(loc, fetched(RemoteStatus.ONLINE, ago_s=20)).state is D.STOPPED

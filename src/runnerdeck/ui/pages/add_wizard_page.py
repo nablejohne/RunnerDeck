@@ -2,7 +2,8 @@
 
 Step 1 picks a repository (controller.load_repos), step 2 collects name / labels / options
 and asks the controller for an AddPlan (plan_add -> plan_ready), step 3 runs add_runner and
-shows add_progress until runner_added or failed("add").
+shows add_progress until runner_added or failed("add"). "随 RunnerDeck 自动启动" (M3) is passed
+to add_runner, not to the plan.
 
 The page reads the plan only through attributes (full_name, name, labels, target_dir, version,
 warnings, needs_confirmation, private): it never imports runnerdeck.core.manager.
@@ -50,6 +51,7 @@ STEP_REPO, STEP_CONFIG, STEP_PROGRESS = 0, 1, 2
 SUCCESS_RETURN_DELAY_MS = 2000
 REPO_ROLE = Qt.UserRole
 PS_POLICY_TEXT = "允许 PowerShell 步骤（.env 写入 PSExecutionPolicyPreference=RemoteSigned）"
+AUTO_START_TEXT = "随 RunnerDeck 自动启动"
 CONFIRM_TEXT = "我已了解上述风险"
 # Progress rows in the order manager.Step reports them (rollback is shown in the status line).
 PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
@@ -180,6 +182,10 @@ class ConfigStep(QWidget):
         self.psPolicyBox.setChecked(True)
         self.startAfterBox = CheckBox("添加后立即启动", self)
         self.startAfterBox.setChecked(True)
+        # Not part of the plan: toggling it never invalidates the checked plan.
+        self.autoStartBox = CheckBox(AUTO_START_TEXT, self)
+        self.autoStartBox.setChecked(True)
+        self.autoStartBox.setToolTip("RunnerDeck 启动时（包括开机自启）自动拉起这个 runner")
 
         self.summaryTitle = StrongBodyLabel("即将执行", self)
         self.summaryLabel = BodyLabel("", self)
@@ -206,6 +212,7 @@ class ConfigStep(QWidget):
         layout.addWidget(self.labelsEdit)
         layout.addWidget(self.psPolicyBox)
         layout.addWidget(self.startAfterBox)
+        layout.addWidget(self.autoStartBox)
         layout.addSpacing(8)
         for widget in self.summaryWidgets:
             layout.addWidget(widget)
@@ -233,6 +240,10 @@ class ConfigStep(QWidget):
         return self.startAfterBox.isChecked()
 
     @property
+    def auto_start(self) -> bool:
+        return self.autoStartBox.isChecked()
+
+    @property
     def confirmed(self) -> bool:
         return not self.confirmBox.isVisibleTo(self) or self.confirmBox.isChecked()
 
@@ -243,7 +254,13 @@ class ConfigStep(QWidget):
         self.labelsEdit.setText(", ".join(labels))
 
     def set_inputs_enabled(self, enabled: bool) -> None:
-        for widget in (self.nameEdit, self.labelsEdit, self.psPolicyBox, self.startAfterBox):
+        for widget in (
+            self.nameEdit,
+            self.labelsEdit,
+            self.psPolicyBox,
+            self.startAfterBox,
+            self.autoStartBox,
+        ):
             widget.setEnabled(enabled)
 
     def clear_plan(self) -> None:
@@ -449,6 +466,7 @@ class AddWizardPage(QWidget):
         self.configStep.set_default_labels(list(self._controller.config.settings.default_labels))
         self.configStep.psPolicyBox.setChecked(True)
         self.configStep.startAfterBox.setChecked(True)
+        self.configStep.autoStartBox.setChecked(True)
         self.configStep.clear_plan()
         self.configStep.set_inputs_enabled(True)
         self.progressStep.reset()
@@ -546,7 +564,11 @@ class AddWizardPage(QWidget):
         self.progressStep.set_env_visible(bool(getattr(self._plan, "runner_env", ())))
         self.stack.setCurrentIndex(STEP_PROGRESS)
         self._refresh_buttons()
-        self._controller.add_runner(self._plan, start_after=self.configStep.start_after)
+        self._controller.add_runner(
+            self._plan,
+            start_after=self.configStep.start_after,
+            auto_start=self.configStep.auto_start,
+        )
 
     # --- controller signals ------------------------------------------------------------
 

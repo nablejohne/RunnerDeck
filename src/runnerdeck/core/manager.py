@@ -8,6 +8,8 @@ Grounded in docs/spike-notes.md:
 - §3: `config.cmd remove` deletes `.runner`, so remove reads `agentId` first and keeps it for the
   `DELETE /actions/runners/{id}` fallback.
 - §5: a hard kill leaves the GitHub session alive for minutes; status merging lives in status.py.
+  Who stopped a runner and how is kept across processes in stop_marks.py (record_stop), so a
+  CLI `stop` in another terminal or a GUI restart still shows "GitHub 会话未过期".
 Registration and remove tokens live about an hour: they are fetched right before config.cmd
 runs and never cached.
 
@@ -36,7 +38,7 @@ from types import MappingProxyType
 
 import psutil
 
-from runnerdeck.core import installer, process, release, runner_file
+from runnerdeck.core import installer, process, release, runner_file, winproc
 from runnerdeck.core.errors import (
     GitHubError,
     InstallError,
@@ -45,21 +47,30 @@ from runnerdeck.core.errors import (
     ProcessError,
     RunnerDeckError,
     RunnerFileError,
+    RunnerNotFoundError,
 )
 from runnerdeck.core.github_client import GitHubClient
 from runnerdeck.core.installer import RunFn
 from runnerdeck.core.models import (
     AppConfig,
+    Discovery,
     LocalState,
     RemoteRunner,
     RemoteStatus,
     RunnerRecord,
+    StrayRunner,
     default_runner_name,
     normalize_labels,
     validate_owner_repo,
     validate_runner_name,
 )
-from runnerdeck.core.process import Launch, PopenFn, RunnerProcess
+from runnerdeck.core.process import (
+    ExternalStop,
+    Launch,
+    PopenFn,
+    RunnerProcess,
+    RunnerProcessInfo,
+)
 from runnerdeck.core.redact import redact, register_secret
 from runnerdeck.core.release import ReleaseCache
 from runnerdeck.core.status import (
@@ -69,6 +80,7 @@ from runnerdeck.core.status import (
     match_remote,
     merge_status,
 )
+from runnerdeck.core.stop_marks import StopMarks, path_key
 from runnerdeck.core.store import ConfigStore, resolve_runner
 
 log = logging.getLogger(__name__)
@@ -76,7 +88,12 @@ log = logging.getLogger(__name__)
 ProgressFn = Callable[[str, str], None]  # (step id, Chinese description), calling thread
 ClientFactory = Callable[[], GitHubClient]
 ProcessFinder = Callable[[Path], Sequence[psutil.Process]]
+# One pass over every runner process on the machine (process.scan_runner_processes).
+ProcessScanner = Callable[[], Sequence[RunnerProcessInfo]]
+ExternalStopper = Callable[[Path], ExternalStop]
 Clock = Callable[[], datetime]
+
+SERVICE_FILE = ".service"  # written by the runner's service installer (service mode is M4)
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)")
 _MB = 1024 * 1024
@@ -239,8 +256,7 @@ def _local_hostname() -> str:
     return socket.gethostname().split(".")[0] or "runner"
 
 
-def _path_key(path: str | os.PathLike[str]) -> str:
-    return os.path.normcase(os.path.abspath(os.fspath(path)))
+_path_key = path_key  # one normalization for records and stop marks (stop_marks.path_key)
 
 
 def _repo_key(owner: str, repo: str) -> tuple[str, str]:
@@ -362,6 +378,53 @@ def _download_reporter(report: ProgressFn, version: str) -> Callable[[int, int |
     return on_progress
 
 
+class _ProcessIndex:
+    """Runner processes looked up by directory, from at most one scan (taken lazily).
+
+    scanner: the one-pass scan (RunnerManager's `scan_processes`). None means the legacy
+    `find_processes` injection: one finder call per looked-up directory, as before M3.
+    Lookups never raise: a failed scan is logged once and then counts as "no processes",
+    because callers (status, discovery) only use the result as a hint.
+    """
+
+    def __init__(self, scanner: ProcessScanner | None, finder: ProcessFinder) -> None:
+        self._scanner = scanner
+        self._finder = finder
+        self._found: list[RunnerProcessInfo] | None = None
+
+    def _scan(self) -> list[RunnerProcessInfo]:
+        if self._found is None:
+            assert self._scanner is not None
+            try:
+                self._found = list(self._scanner())
+            except (psutil.Error, OSError) as e:
+                log.warning("cannot list runner processes: %s", e)
+                self._found = []
+        return self._found
+
+    def pids_under(self, directory: Path) -> list[int]:
+        """PIDs of runner processes whose executable lives under `directory`."""
+        if self._scanner is None:
+            try:
+                return sorted({p.pid for p in self._finder(directory)})
+            except (psutil.Error, OSError) as e:
+                log.warning("cannot scan processes of %s: %s", directory, e)
+                return []
+        return sorted({p.pid for p in self._scan() if winproc.is_under(p.exe, directory)})
+
+
+def is_service(runner_dir: str | os.PathLike[str]) -> bool:
+    """The runner was installed as a Windows service (`.service` exists; stat() only)."""
+    try:
+        return (Path(runner_dir) / SERVICE_FILE).is_file()
+    except OSError as e:
+        log.warning("cannot stat %s: %s", Path(runner_dir) / SERVICE_FILE, e)
+        return False
+
+
+_SERVICE_REFUSED = "这个 runner 以 Windows 服务方式运行，请在“服务”里停止（服务模式 M4 支持）"
+
+
 class RunnerManager:
     """Add / remove / import / scan / status flows with exact rollback.
 
@@ -383,7 +446,19 @@ class RunnerManager:
         popen: PopenFn = subprocess.Popen,
         find_processes: ProcessFinder = process.running_processes,
         clock: Clock = _utcnow,
+        stop_marks: StopMarks | None = None,
+        scan_processes: ProcessScanner | None = None,
+        stop_external: ExternalStopper = process.stop_external,
     ) -> None:
+        """find_processes: runner processes of one directory (remove_runner's running check).
+        scan_processes: all runner processes in one pass, grouped by directory for statuses()
+        and discover(); default process.scan_runner_processes. When it is not given but
+        find_processes is injected, statuses() / discover() fall back to one find_processes
+        call per directory, so callers that only faked find_processes never scan for real.
+        stop_marks: cross-process stop records (default StopMarks() under the local app dir).
+        stop_external: hard kill of processes not owned by a RunnerProcess (kill_external,
+        kill_stray); default process.stop_external.
+        """
         self._store = store
         self._client_factory = client_factory
         self._cache = cache if cache is not None else ReleaseCache()
@@ -391,6 +466,11 @@ class RunnerManager:
         self._installer_run = installer_run
         self._popen = popen
         self._find_processes = find_processes
+        if scan_processes is None and find_processes is process.running_processes:
+            scan_processes = process.scan_runner_processes
+        self._scan_processes = scan_processes
+        self._stop_marks = stop_marks if stop_marks is not None else StopMarks()
+        self._stop_external = stop_external
         self._clock = clock
         self._config_lock = threading.RLock()
         self._install_lock = threading.Lock()
@@ -480,9 +560,11 @@ class RunnerManager:
             warnings.append(f"本机已为 {plan.full_name} 登记了 runner：{'、'.join(same_repo)}")
         return replace(plan, warnings=tuple(warnings))
 
-    def add_runner(self, plan: AddPlan, *, progress: ProgressFn | None = None) -> RunnerRecord:
+    def add_runner(
+        self, plan: AddPlan, *, auto_start: bool = False, progress: ProgressFn | None = None
+    ) -> RunnerRecord:
         """Download -> verify -> extract -> registration token -> configure -> read .runner ->
-        save the record.
+        save the record (with `auto_start`: started whenever RunnerDeck starts).
 
         Rollback: once extraction succeeded, any failure deletes the directory. If GitHub got a
         registration (configure succeeded, or it failed after writing `.runner` / printing
@@ -499,7 +581,7 @@ class RunnerManager:
                 zip_path = self._prepare_package(client, plan, report)
                 report(Step.EXTRACT, f"解压到 {plan.target_dir}")
                 installer.extract_runner(zip_path, plan.target_dir)
-                record = self._register_extracted(client, plan, report, child_env)
+                record = self._register_extracted(client, plan, report, child_env, auto_start)
             try:
                 for pruned in self._cache.prune():
                     log.info("pruned old runner package %s", pruned.name)
@@ -527,6 +609,7 @@ class RunnerManager:
         plan: AddPlan,
         report: ProgressFn,
         child_env: Mapping[str, str] | None,
+        auto_start: bool = False,
     ) -> RunnerRecord:
         """Everything after a successful extraction; rolls back on any failure.
 
@@ -577,6 +660,7 @@ class RunnerManager:
                 labels=list(plan.labels),
                 path=str(runner_dir),
                 github_runner_id=agent_id,
+                auto_start=auto_start,
             )
             record_id = record.id
             report(Step.SAVE, "保存 runner 记录")
@@ -808,6 +892,7 @@ class RunnerManager:
             config = self._store.load()
             config.remove(record.id)
             self._store.save(config)
+        self._stop_marks.clear(runner_dir)
         _report_safely(report, Step.DONE, f"已移除 runner {record.name}")
         log.info("removed runner %s (%s, %s)", record.name, record.full_name, remote)
         return RemoveResult(
@@ -923,10 +1008,13 @@ class RunnerManager:
 
     # --- import / scan --------------------------------------------------------------------------
 
-    def import_runner(self, path: str | os.PathLike[str]) -> RunnerRecord:
+    def import_runner(
+        self, path: str | os.PathLike[str], *, auto_start: bool = False
+    ) -> RunnerRecord:
         """Record an already configured runner directory (e.g. one set up by hand).
 
-        Same path already recorded -> that record (no network). Otherwise reads `.runner`, maps
+        auto_start: for a new record only. Same path already recorded -> that record as it is
+        (no network). Otherwise reads `.runner`, maps
         `gitHubUrl` to owner/repo and asks GitHub whether the runner still exists (missing ->
         RunnerDeckError, but only once list_runners proved the repo is visible; a repo the PAT
         cannot see -> NotFoundError). A recorded runner with the same GitHub id whose directory
@@ -990,6 +1078,7 @@ class RunnerManager:
                 labels=_custom_labels(remote.labels),
                 path=str(runner_dir),
                 github_runner_id=remote.id,
+                auto_start=auto_start,
             )
             config.upsert(record)
             self._store.save(config)
@@ -998,10 +1087,173 @@ class RunnerManager:
 
     def scan_unregistered(self) -> list[Path]:
         """Configured runner directories directly under runners_root that have no record."""
-        config = self._store.load()
+        return self._unregistered(self._store.load())
+
+    @staticmethod
+    def _runners_root(config: AppConfig) -> Path:
+        return Path(os.path.abspath(Path(config.settings.runners_root).expanduser()))
+
+    def _unregistered(self, config: AppConfig) -> list[Path]:
         known = {_path_key(r.path) for r in config.runners}
-        root = Path(config.settings.runners_root).expanduser()
+        root = self._runners_root(config)
         return [p for p in runner_file.scan_runner_dirs(root) if _path_key(p) not in known]
+
+    def discover(self) -> Discovery:
+        """What lives under runners_root without a record (one process scan).
+
+        unregistered: scan_unregistered(). strays: runner processes whose executable is inside
+        a direct subdirectory of the root that has no record (configured: `.runner` and
+        `.credentials` exist; service: installed as a Windows service). A failed process scan
+        only means no strays (logged); an unreadable root raises RunnerDeckError.
+        """
+        config = self._store.load()
+        root = self._runners_root(config)
+        unregistered = self._unregistered(config)
+        known = {_path_key(r.path) for r in config.runners}
+        index = self._process_index()
+        strays: list[StrayRunner] = []
+        if index.pids_under(root):
+            for child in self._child_dirs(root):
+                if _path_key(child) in known or self._holds_record(config, child):
+                    continue  # recorded (or holds a recorded runner deeper down): not a stray
+                pids = index.pids_under(child)
+                if pids:
+                    strays.append(
+                        StrayRunner(
+                            path=child,
+                            pids=tuple(pids),
+                            configured=runner_file.is_configured(child),
+                            service=is_service(child),
+                        )
+                    )
+        return Discovery(root=root, unregistered=tuple(unregistered), strays=tuple(strays))
+
+    @staticmethod
+    def _child_dirs(root: Path) -> list[Path]:
+        try:
+            children = list(root.iterdir())
+        except FileNotFoundError:
+            return []
+        except OSError as e:
+            raise RunnerDeckError(f"无法读取目录 {root}：{e.strerror or e}") from e
+        dirs: list[Path] = []
+        for child in children:
+            try:
+                if child.is_dir():
+                    dirs.append(child)
+            except OSError as e:
+                log.warning("cannot stat %s: %s", child, e)
+        dirs.sort(key=lambda p: (p.name.casefold(), p.name))
+        return dirs
+
+    is_service = staticmethod(is_service)
+
+    # --- record-only changes ----------------------------------------------------------------
+
+    def _update_record(self, record_id: str, **changes: object) -> RunnerRecord:
+        with self._config_lock:
+            config = self._store.load()
+            record = self._require_record(config, record_id)
+            updated = record.model_copy(update=changes)
+            if updated != record:
+                config.upsert(updated)
+                self._store.save(config)
+            return updated
+
+    @staticmethod
+    def _require_record(config: AppConfig, record_id: str) -> RunnerRecord:
+        record = config.get(record_id)
+        if record is None:
+            raise RunnerNotFoundError(f"找不到 runner 记录 {record_id[:8]}（可能已被移除）")
+        return record
+
+    def set_auto_start(self, record_id: str, enabled: bool) -> RunnerRecord:
+        """Turn "start together with RunnerDeck" on or off for one record."""
+        return self._update_record(record_id, auto_start=bool(enabled))
+
+    def forget_runner(self, record_id: str) -> RunnerRecord:
+        """Delete only the record: no GitHub call, the directory and `.runner` stay untouched.
+
+        For an imported directory the user keeps managing elsewhere; it shows up again in
+        scan_unregistered() / discover() and can be imported later. Its stop record is kept
+        (it expires by itself) so a re-import right after a hard kill still knows about it.
+        """
+        with self._config_lock:
+            config = self._store.load()
+            record = self._require_record(config, record_id)
+            config.remove(record.id)
+            self._store.save(config)
+        log.info(
+            "forgot runner %s (%s), directory kept: %s", record.name, record.full_name, record.path
+        )
+        return record
+
+    # --- processes not owned by a RunnerProcess -----------------------------------------------
+
+    def record_stop(
+        self, runner_dir: str | os.PathLike[str], *, forced: bool, at: datetime | None = None
+    ) -> None:
+        """Remember how `runner_dir` stopped (default time: this manager's clock). Never raises."""
+        try:
+            self._stop_marks.record(runner_dir, forced=forced, at=at or self._clock())
+        except Exception:  # a hint only: never let it break a stop flow
+            log.exception("recording the stop of %s failed", runner_dir)
+
+    def kill_external(self, record_id: str) -> ExternalStop:
+        """Hard-kill the runner processes in a recorded runner's directory that are not ours
+        (a CLI `start` in another terminal, a double-clicked run.cmd).
+
+        Service mode -> InvalidInputError (stop it in services.msc). Something killed -> a
+        forced stop record, so the status shows the lingering GitHub session. Check
+        ExternalStop.ok: survivors mean the runner is still alive. Raises ProcessError if the
+        process scan fails.
+        """
+        record = self._require_record(self._store.load(), record_id)
+        return self._kill_dir(Path(record.path))
+
+    def kill_stray(self, path: str | os.PathLike[str]) -> ExternalStop:
+        """Like kill_external, for a stray: `path` must be a direct subdirectory of
+        runners_root that has no record (InvalidInputError otherwise)."""
+        runner_dir = Path(os.path.abspath(Path(path).expanduser()))
+        config = self._store.load()
+        root = self._runners_root(config)
+        if _path_key(runner_dir.parent) != _path_key(root):
+            raise InvalidInputError(
+                f"{runner_dir} 不在 runner 根目录 {root} 下，不会结束其中的进程"
+            )
+        existing = self._record_for_path(config, runner_dir)
+        if existing is not None:
+            raise InvalidInputError(
+                f"{runner_dir} 已登记为 runner “{existing.name}”，请在它的卡片上操作"
+            )
+        nested = self._holds_record(config, runner_dir)
+        if nested is not None:
+            # stop_external would also kill that runner, which may be ours and mid-job.
+            raise InvalidInputError(
+                f"{runner_dir} 下有已登记的 runner “{nested.name}”（{nested.path}），"
+                "不会结束其中的进程"
+            )
+        return self._kill_dir(runner_dir)
+
+    @staticmethod
+    def _holds_record(config: AppConfig, directory: Path) -> RunnerRecord | None:
+        """A record whose directory lies inside `directory` (not equal to it)."""
+        key = _path_key(directory)
+        for record in config.runners:
+            if _path_key(record.path) != key and winproc.is_under(record.path, directory):
+                return record
+        return None
+
+    def _kill_dir(self, runner_dir: Path) -> ExternalStop:
+        if is_service(runner_dir):
+            raise InvalidInputError(_SERVICE_REFUSED)
+        try:
+            outcome = self._stop_external(runner_dir)
+        except (psutil.Error, OSError) as e:
+            raise ProcessError(f"无法结束 {runner_dir} 下的 runner 进程：{e}") from e
+        if outcome.killed:
+            self.record_stop(runner_dir, forced=True)
+        return outcome
 
     @staticmethod
     def _record_for_path(config: AppConfig, runner_dir: Path) -> RunnerRecord | None:
@@ -1011,37 +1263,46 @@ class RunnerManager:
     # --- status / processes ----------------------------------------------------------------------
 
     def statuses(
-        self, processes: Mapping[str, RunnerProcess] | None = None
+        self, processes: Mapping[str, RunnerProcess] | None = None, *, remote: bool = True
     ) -> list[RunnerStatusRow]:
         """Merged local + GitHub status for every record, in config order.
 
         processes: RunnerProcess objects owned by the caller, keyed by record id. Records
         without one count as not running (external if runner processes live in the dir).
+        At most one process scan per call, only if some record has no running process.
+        The last stop comes from the RunnerProcess or from the stop records (record_stop),
+        whichever is newer.
         GitHub is asked once per repo; a repo whose list fails (or no client at all, e.g. not
         logged in) shows remote UNKNOWN with `remote_error`, without affecting other repos.
+        remote=False: no client is built and GitHub is not asked; remote is UNKNOWN and
+        remote_error None for every row.
         """
         config = self._store.load()
         if not config.runners:
             return []
         now = self._clock()
-        lists, errors = self._fetch_remote_lists(config.runners)
+        if remote:
+            lists, errors = self._fetch_remote_lists(config.runners)
+        else:
+            lists, errors = {}, {}
+        index = self._process_index()
         rows: list[RunnerStatusRow] = []
         for record in config.runners:
             proc = processes.get(record.id) if processes else None
-            local = self._local_snapshot(record, proc, now)
+            local = self._local_snapshot(record, proc, now, index)
             key = _repo_key(record.owner, record.repo)
             remote_runner: RemoteRunner | None = None
             if key in lists:
                 remote_runner = match_remote(record, lists[key])
-                remote = RemoteSnapshot.from_remote(remote_runner, fetched_at=now)
+                snapshot = RemoteSnapshot.from_remote(remote_runner, fetched_at=now)
             else:
-                remote = RemoteSnapshot(RemoteStatus.UNKNOWN)
+                snapshot = RemoteSnapshot(RemoteStatus.UNKNOWN)
             rows.append(
                 RunnerStatusRow(
                     record=record,
-                    display=merge_status(local, remote, now=now),
+                    display=merge_status(local, snapshot, now=now),
                     local=local,
-                    remote=remote,
+                    remote=snapshot,
                     remote_runner=remote_runner,
                     remote_error=errors.get(key),
                 )
@@ -1070,34 +1331,57 @@ class RunnerManager:
                     errors[key] = str(e)
         return lists, errors
 
+    def _process_index(self) -> _ProcessIndex:
+        return _ProcessIndex(self._scan_processes, self._find_processes)
+
     def _local_snapshot(
-        self, record: RunnerRecord, proc: RunnerProcess | None, now: datetime
+        self,
+        record: RunnerRecord,
+        proc: RunnerProcess | None,
+        now: datetime,
+        index: _ProcessIndex,
     ) -> LocalSnapshot:
+        """Local view of `record`. The last stop: the RunnerProcess's when it has one, the
+        stop record otherwise (app restarted, CLI `stop` from another terminal), the newer
+        of the two when both exist. A running process ignores stop records."""
+        runner_dir = Path(record.path)
+        if proc is not None and proc.is_running():
+            return LocalSnapshot(
+                state=proc.state,
+                running=True,
+                external=False,
+                state_since=proc.state_since,
+                last_stop_forced=proc.last_stop_forced,
+                stopped_at=proc.stopped_at,
+                current_job=proc.current_job,
+                last_error=proc.last_error,
+            )
+        forced, stopped_at = False, None
+        if proc is not None:
+            forced, stopped_at = proc.last_stop_forced, proc.stopped_at
+        mark = self._stop_marks.get(runner_dir, now=now)
+        if mark is not None and (stopped_at is None or mark.stopped_at > stopped_at):
+            forced, stopped_at = mark.forced, mark.stopped_at
+        external = bool(index.pids_under(runner_dir))
         if proc is None:
             return LocalSnapshot(
                 state=LocalState.STOPPED,
                 running=False,
-                external=self._has_external(record),
+                external=external,
                 state_since=now,
+                last_stop_forced=forced,
+                stopped_at=stopped_at,
             )
-        running = proc.is_running()
         return LocalSnapshot(
             state=proc.state,
-            running=running,
-            external=False if running else self._has_external(record),
+            running=False,
+            external=external,
             state_since=proc.state_since,
-            last_stop_forced=proc.last_stop_forced,
-            stopped_at=proc.stopped_at,
+            last_stop_forced=forced,
+            stopped_at=stopped_at,
             current_job=proc.current_job,
             last_error=proc.last_error,
         )
-
-    def _has_external(self, record: RunnerRecord) -> bool:
-        try:
-            return bool(self._find_processes(Path(record.path)))
-        except (psutil.Error, OSError) as e:
-            log.warning("cannot scan processes of %s: %s", record.path, e)
-            return False
 
     def process_for(
         self,

@@ -4,14 +4,18 @@ Persisted: AppConfig (settings + RunnerRecord index), written to config.json.
 API views: GitHubUser, Repo, RemoteRunner, RunnerToken, ReleaseInfo (unknown fields ignored).
 Runner dir: RunnerFileInfo (parsed `.runner`).
 Runtime enums: LocalState, RemoteStatus, DisplayState.
+Runtime data (M3, plain frozen dataclasses so ui/ can use them): DiagLog, AutostartState,
+StrayRunner, Discovery.
 """
 
 from __future__ import annotations
 
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import (
@@ -137,6 +141,8 @@ class AppSettings(BaseModel):
     start_minimized: bool = False
     close_to_tray: bool = True
     theme: Literal["auto", "light", "dark"] = "auto"
+    # Tray notification when a job ends: every job / only Failed or Abandoned / never.
+    notify_jobs: Literal["all", "failed", "off"] = "failed"
 
 
 CONFIG_SCHEMA_VERSION = 1
@@ -286,3 +292,63 @@ class DisplayState(StrEnum):
     MISSING = "missing"  # deleted on GitHub
     ERROR = "error"
     UNKNOWN = "unknown"
+
+
+# --- runtime data (never persisted, docs/m3-design.md §1.1) -------------------------------
+
+
+@dataclass(frozen=True)
+class DiagLog:
+    """One file in a runner's `_diag` directory (Runner_*.log / Worker_*.log / other)."""
+
+    path: Path
+    kind: Literal["runner", "worker", "other"]
+    modified: datetime
+    size: int
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+
+@dataclass(frozen=True)
+class AutostartState:
+    """The HKCU Run entry as found. `expected` is what this installation would write."""
+
+    supported: bool
+    registered: bool = False
+    command: str | None = None
+    expected: str | None = None
+    disabled_by_user: bool = False  # StartupApproved\Run says disabled (Task Manager)
+
+    @property
+    def matches(self) -> bool:
+        return (
+            self.registered
+            and self.command is not None
+            and self.expected is not None
+            and self.command.casefold() == self.expected.casefold()
+        )
+
+
+@dataclass(frozen=True)
+class StrayRunner:
+    """Runner processes under runners_root whose directory has no record."""
+
+    path: Path
+    pids: tuple[int, ...]
+    configured: bool  # `.runner` and `.credentials` exist
+    service: bool  # `.service` exists: installed as a Windows service
+
+
+@dataclass(frozen=True)
+class Discovery:
+    """What discover() found under `root`: unrecorded runner dirs and stray processes."""
+
+    root: Path
+    unregistered: tuple[Path, ...] = ()
+    strays: tuple[StrayRunner, ...] = ()
+
+    @property
+    def empty(self) -> bool:
+        return not self.unregistered and not self.strays

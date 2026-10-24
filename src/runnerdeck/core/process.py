@@ -264,7 +264,8 @@ class RunnerProcess:
         self._proc: subprocess.Popen[bytes] | None = None
         self._reader: threading.Thread | None = None
         self._active = False
-        self._stop_requested = False
+        self._stop_requested = False  # stop() is under way for the current run
+        self._stop_signalled = False  # signal_stop() delivered a stop request this run
         self._machine = OutputStateMachine()
         self._state = LocalState.STOPPED
         self._current_job: str | None = None
@@ -434,6 +435,7 @@ class RunnerProcess:
                 self._proc = proc
                 self._active = True
                 self._stop_requested = False
+                self._stop_signalled = False
                 self._machine = OutputStateMachine()
                 self._exit_code = None
                 self._listener_exit = None
@@ -473,6 +475,33 @@ class RunnerProcess:
                 self._killed_elsewhere = True
                 self._last_stop_forced = True
 
+    def signal_stop(self) -> bool:
+        """Ask the runner to stop and return at once: no waiting, no hard kill.
+
+        For Windows logoff / shutdown, where nothing may block: Launch.HELPER writes "stop" to
+        the helper's stdin, Launch.CONSOLE sends Ctrl+Break (only with a console of our own).
+        Once delivered, the run counts as stopped by us: state STOPPING, and the exit that
+        follows is STOPPED rather than ERROR. A later stop() does not ask again; it only waits
+        (and kills after its timeout). Returns False when not running or when the request
+        could not be delivered (then nothing changes); True while a stop() is already under
+        way. Safe from any thread, also from callbacks; never takes the start/stop lock.
+        """
+        with self._lock:
+            if not self._active or self._proc is None:
+                return False
+            if self._stop_requested or self._stop_signalled:
+                return True
+            proc, gen = self._proc, self._gen
+        if not self._deliver_stop_request(proc):
+            return False
+        with self._lock:
+            if gen == self._gen and self._active:
+                self._stop_signalled = True
+                self._publish_locked(LocalState.STOPPING, self._current_job)
+        self._emit()
+        log.info("asked %s to stop (pid %s), not waiting", self._runner_dir, proc.pid)
+        return True
+
     def stop(self, timeout: float | None = None) -> StopResult:
         """Stop the runner: Ctrl+Break first, hard kill if that fails. Final state STOPPED.
 
@@ -498,24 +527,15 @@ class RunnerProcess:
                     return StopResult(True, StopMethod.CTRL_BREAK, None, [])
                 proc, gen, reader = self._proc, self._gen, self._reader
                 assert proc is not None
+                already_asked = self._stop_signalled
                 self._stop_requested = True
                 self._publish_locked(LocalState.STOPPING, self._current_job)
             self._emit()
 
             pid = proc.pid
             graceful = False
-            if self._launch is Launch.HELPER:
-                requested = self._request_helper_stop(proc)
-            elif winproc.has_console():
-                requested = True
-                try:
-                    winproc.send_ctrl_break(pid)
-                except ProcessError as e:
-                    requested = False
-                    log.warning("Ctrl+Break to %s failed, killing instead: %s", pid, e)
-            else:
-                requested = False
-                log.info("no console: Ctrl+Break cannot reach pid %s, killing", pid)
+            # signal_stop() already delivered the request: asking twice gains nothing.
+            requested = already_asked or self._deliver_stop_request(proc)
             if requested:
                 graceful = self._wait_proc(proc, max(timeout, 0.0))
                 if not graceful:
@@ -630,8 +650,9 @@ class RunnerProcess:
             self._log_queue.append(
                 ("%s: job %s finished: %s", (self._runner_dir.name, *machine.last_job))
             )
-        # Once stop() is under way the published state stays STOPPING whatever the output says.
-        state = LocalState.STOPPING if self._stop_requested else machine.state
+        # Once a stop is under way the published state stays STOPPING whatever the output says.
+        stopping = self._stop_requested or self._stop_signalled
+        state = LocalState.STOPPING if stopping else machine.state
         self._publish_locked(state, machine.current_job)
 
     def _finalize(self, gen: int, rc: int | None, *, error: str | None = None) -> bool:
@@ -643,7 +664,7 @@ class RunnerProcess:
             _close_stdin(self._proc)
             self._exit_code = rc
             self._stopped_at = _now()
-            if error is None and not self._stop_requested:
+            if error is None and not (self._stop_requested or self._stop_signalled):
                 error = self._unexpected_exit_locked(rc)
             if error is None:
                 state = LocalState.STOPPED
@@ -773,6 +794,21 @@ class RunnerProcess:
             return False
         return True
 
+    def _deliver_stop_request(self, proc: subprocess.Popen[bytes]) -> bool:
+        """Ctrl+Break for run.cmd, relayed by the helper or sent directly. False if it cannot
+        be delivered (the caller kills instead, or gives up for signal_stop)."""
+        if self._launch is Launch.HELPER:
+            return self._request_helper_stop(proc)
+        if not winproc.has_console():
+            log.info("no console: Ctrl+Break cannot reach pid %s", proc.pid)
+            return False
+        try:
+            winproc.send_ctrl_break(proc.pid)
+        except ProcessError as e:
+            log.warning("Ctrl+Break to %s failed: %s", proc.pid, e)
+            return False
+        return True
+
     def _request_helper_stop(self, proc: subprocess.Popen[bytes]) -> bool:
         """Ask the console helper to send Ctrl+Break; False if it cannot be asked (-> kill)."""
         stdin = proc.stdin
@@ -854,6 +890,33 @@ _RUN_SCRIPT_RE = re.compile(r"""(?:^|[\\/"'\s])run(?:-helper)?\.cmd(?=$|["'\s])"
 def running_processes(runner_dir: Path) -> list[psutil.Process]:
     """Runner.Listener / Worker / PluginHost processes whose executable is under runner_dir."""
     return winproc.find_runner_processes(runner_dir)
+
+
+@dataclass(frozen=True)
+class RunnerProcessInfo:
+    """One Runner.Listener / Worker / PluginHost process seen by scan_runner_processes()."""
+
+    pid: int
+    exe: str  # absolute path of its executable
+
+
+def scan_runner_processes() -> list[RunnerProcessInfo]:
+    """Every runner process on this machine, from a single psutil.process_iter pass.
+
+    RunnerManager groups the result by directory (winproc.is_under), so a status refresh or a
+    discovery costs one scan however many runners are recorded. Processes whose executable
+    cannot be read (another user's, access denied) are left out, as in find_runner_processes.
+    Raises psutil.Error / OSError if the process list itself cannot be read.
+    """
+    import psutil
+
+    found: list[RunnerProcessInfo] = []
+    for proc in psutil.process_iter(["name", "exe"]):
+        name = (proc.info.get("name") or "").lower()
+        exe = proc.info.get("exe") or ""
+        if name in winproc.RUNNER_PROCESS_NAMES and exe:
+            found.append(RunnerProcessInfo(proc.pid, exe))
+    return found
 
 
 @dataclass(frozen=True)

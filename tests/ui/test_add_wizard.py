@@ -86,6 +86,7 @@ def test_walks_three_steps_for_private_repo(
     assert page.step == STEP_CONFIG
     assert page.configStep.labelsEdit.text() == "gpu, win"
     assert page.configStep.psPolicyBox.isChecked() and page.configStep.startAfterBox.isChecked()
+    assert page.configStep.autoStartBox.isChecked()  # M3: auto-start by default
 
     page.configStep.nameEdit.setText("my-runner")
     page.configStep.labelsEdit.setText("gpu, ci")
@@ -102,11 +103,16 @@ def test_walks_three_steps_for_private_repo(
     assert "my-runner" in page.configStep.summaryLabel.text()
     assert not page.configStep.confirmBox.isVisibleTo(page.configStep)  # private: no risk box
     assert page.nextButton.text() == "开始添加" and page.nextButton.isEnabled()
+    page.configStep.autoStartBox.setChecked(False)
+    assert page.plan is fake.auto_plan  # not part of the plan: no re-check needed
 
     fake.auto_add_steps = [("release", "查询"), ("download", "下载 50%"), ("configure", "注册")]
     page.nextButton.click()
     assert page.step == STEP_PROGRESS
-    assert fake.calls_of("add_runner") == [((fake.auto_plan,), {"start_after": True})]
+    assert fake.calls_of("add_runner") == [
+        ((fake.auto_plan,), {"start_after": True, "auto_start": False})
+    ]
+    assert not page.configStep.autoStartBox.isEnabled()
     rows = page.progressStep.rows
     assert rows["release"][1].isVisibleTo(page.progressStep)  # check mark
     assert rows["configure"][0].isVisibleTo(page.progressStep)  # spinner on the current step
@@ -122,6 +128,7 @@ def test_walks_three_steps_for_private_repo(
         pass
     assert page.step == STEP_REPO
     assert page.configStep.nameEdit.text() == ""
+    assert page.configStep.autoStartBox.isChecked()  # reset for the next runner
 
 
 def test_public_repo_needs_confirmation(
@@ -143,6 +150,7 @@ def test_public_repo_needs_confirmation(
     assert page.nextButton.isEnabled()
     page.nextButton.click()
     assert page.step == STEP_PROGRESS
+    assert fake.calls_of("add_runner")[0][1] == {"start_after": True, "auto_start": True}
     assert page.progressStep.rows["env"][2].isVisibleTo(page.progressStep)
 
 

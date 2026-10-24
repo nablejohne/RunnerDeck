@@ -1,21 +1,35 @@
-"""Tests for runnerdeck.app.controller.RunnerController (docs/m2-design.md §4).
+"""Tests for runnerdeck.app.controller.RunnerController (docs/m2-design.md §4, m3-design §4.1).
 
-A fake manager / client / process (tests/app/conftest.py) replace network, config.cmd and
-run.cmd; the ConfigStore and the keyring are real but isolated. Every operation is checked for
-its success signal, its `failed(op, ...)` on error, the busy bookkeeping, and that signals
-fed from worker or reader threads arrive on the main thread.
+A fake manager / client / process / autostart / diag (tests/app/conftest.py) replace network,
+config.cmd, run.cmd and the registry; the ConfigStore and the keyring are real but isolated.
+Every operation is checked for its success signal, its `failed(op, ...)` on error, the busy
+bookkeeping, and that signals fed from worker or reader threads arrive on the main thread. The
+controller's clock is a FakeClock, so the time-dependent merge rules are driven explicitly.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import os
+import sys
 import threading
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from PyQt5.QtCore import QCoreApplication, QThread, QUrl
 
-from runnerdeck.app.controller import LOGIN_HINT, STEP_STOP, RunnerController
+from runnerdeck.app.controller import (
+    AUTOSTART_SKIPPED,
+    AUTOSTART_UNSUPPORTED,
+    LOGIN_HINT,
+    REMERGE_INTERVAL_MS,
+    STEP_STOP,
+    CoreAutostart,
+    CoreDiag,
+    RunnerController,
+)
 from runnerdeck.core import account, secrets
 from runnerdeck.core.errors import (
     AuthError,
@@ -26,12 +40,28 @@ from runnerdeck.core.errors import (
     StoreError,
 )
 from runnerdeck.core.manager import POWERSHELL_POLICY_ENV, RunnerManager, Step
-from runnerdeck.core.models import AppSettings, DisplayState, LocalState, RunnerRecord
-from runnerdeck.core.process import Launch, StopMethod, StopResult
+from runnerdeck.core.models import (
+    AppSettings,
+    DiagLog,
+    Discovery,
+    DisplayState,
+    LocalState,
+    RemoteStatus,
+    RunnerRecord,
+    StrayRunner,
+)
+from runnerdeck.core.process import ExternalStop, Launch, StopMethod, StopResult
+from runnerdeck.core.status import (
+    DETAIL_CONNECTING,
+    DETAIL_OFFLINE_LAG,
+    DETAIL_REMOTE_UNKNOWN,
+    DETAIL_STALLED,
+)
 from runnerdeck.core.store import ConfigStore
 
 from .conftest import (
     FAKE_PAT,
+    NOW,
     OTHER_PAT,
     OWNER,
     REPO,
@@ -308,7 +338,7 @@ def test_add_runner_reports_progress_then_the_record(make_controller: Any, qtbot
     assert all(progress.threads_ok)
     assert [r.id for r in h.controller.records] == [record.id]
     assert changed.calls and changed.calls[-1][0].runners[0].id == record.id
-    assert h.manager.calls[-1] == ("add_runner", {"plan": plan})
+    assert h.manager.calls[-1] == ("add_runner", {"plan": plan, "auto_start": False})
     assert not h.manager.processes  # start_after=False
 
 
@@ -539,7 +569,7 @@ def test_start_stop_remove_are_mutually_exclusive_per_runner(
     assert op == "stop"
     gate.set()
     _wait_idle(qtbot, h, record.id)
-    assert h.manager.calls[-1][0] == "process_for"  # remove_runner never ran
+    assert "remove_runner" not in [name for name, _ in h.manager.calls]
 
 
 def test_start_all_and_stop_all(make_controller: Any, qtbot: Any) -> None:
@@ -683,7 +713,10 @@ def test_refresh_statuses_caches_the_display(make_controller: Any, qtbot: Any) -
     a, b = record_model("a", repo="one"), record_model("b", repo="two")
     h = _started(make_controller, qtbot, a)
     h.controller.config.upsert(b)
-    h.manager.rows = [status_row(a, LocalState.IDLE), status_row(b, remote_error="网络错误")]
+    h.manager.rows = [
+        status_row(a, LocalState.IDLE, remote=RemoteStatus.ONLINE),
+        status_row(b, remote_error="网络错误"),
+    ]
     refreshing = Spy(h.controller.refreshing_changed)
     with qtbot.waitSignal(h.controller.statuses_updated, timeout=WAIT_MS) as blocker:
         h.controller.refresh_statuses()
@@ -693,16 +726,19 @@ def test_refresh_statuses_caches_the_display(make_controller: Any, qtbot: Any) -
     assert [r.record.id for r in rows] == [a.id, b.id]
     assert len(h.manager.statuses_seen) == 1
     assert h.manager.statuses_seen[0] == {a.id: h.process(a.id)}
+    assert h.manager.calls[-1] == ("statuses", {"remote": True})
     assert not h.controller.refreshing
     assert refreshing.calls == [(True,), (False,)]
-    assert h.controller.display(a.id) is rows[0].display
+    # Our process says STARTING (live), GitHub says online -> idle.
+    assert h.controller.display(a.id) == rows[0].display
+    assert rows[0].display.state is DisplayState.IDLE
     assert h.controller.display(b.id).state is DisplayState.STOPPED
     assert rows[1].remote_error == "网络错误"
-    # A local state change invalidates the cached merge for that runner only.
+    # A local state change is merged with the cached GitHub snapshot of that runner.
     h.process(a.id).drive_state(LocalState.BUSY, "build")
     qtbot.waitUntil(lambda: h.controller.display(a.id).state is DisplayState.BUSY, timeout=WAIT_MS)
     assert h.controller.display(a.id).label == "运行中：build"
-    assert h.controller.display(b.id) is rows[1].display
+    assert h.controller.display(b.id) == rows[1].display
 
 
 def test_refresh_statuses_failure(make_controller: Any, qtbot: Any) -> None:
@@ -841,3 +877,778 @@ def test_shutdown_names_runners_that_did_not_stop(make_controller: Any, qtbot: A
 def test_shutdown_without_running_runners(make_controller: Any) -> None:
     h = make_controller(records=[record_model()])
     assert h.controller.shutdown() == []
+
+
+# --- M3: live merge (docs/m3-design.md §4.1) ----------------------------------------------------
+
+
+def _refresh(qtbot: Any, h: Harness, rows: list[Any], **kw: Any) -> list[Any]:
+    """Run one refresh_statuses(**kw) answering `rows`; the rows statuses_updated carried."""
+    h.manager.rows = rows
+    with qtbot.waitSignal(h.controller.statuses_updated, timeout=WAIT_MS) as blocker:
+        h.controller.refresh_statuses(**kw)
+    return blocker.args[0]
+
+
+def test_state_change_during_a_refresh_is_not_overwritten(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = _started(make_controller, qtbot, record)
+    proc = h.process(record.id)
+    proc.drive_state(LocalState.IDLE)
+    qtbot.waitUntil(lambda: h.controller.display(record.id).state is DisplayState.IDLE)
+    gate = threading.Event()
+    h.manager.block_statuses = gate
+    # The manager scanned while the runner was idle, GitHub said online and not busy.
+    h.manager.rows = [
+        status_row(record, LocalState.IDLE, remote=RemoteStatus.ONLINE, fetched_at=NOW)
+    ]
+    changed = Spy(h.controller.display_changed)
+    with qtbot.waitSignal(h.controller.statuses_updated, timeout=WAIT_MS) as blocker:
+        h.controller.refresh_statuses()
+        proc.drive_state(LocalState.BUSY, "build")  # after the refresh was submitted
+        qtbot.waitUntil(lambda: h.controller.local_state(record.id)[0] is LocalState.BUSY)
+        gate.set()
+    (rows,) = blocker.args
+    assert rows[0].display.state is DisplayState.BUSY
+    assert rows[0].display.label == "运行中：build"
+    assert rows[0].local.state is LocalState.IDLE  # only display is replaced
+    assert h.controller.display(record.id) == rows[0].display
+    assert changed.calls[-1] == (record.id, rows[0].display)
+    assert all(changed.threads_ok)
+
+
+def test_remote_snapshot_older_than_the_local_state_shows_the_local_state(
+    make_controller: Any, qtbot: Any
+) -> None:
+    record = record_model()
+    h = _started(make_controller, qtbot, record)
+    proc = h.process(record.id)
+    h.clock.advance(10)
+    _refresh(qtbot, h, [status_row(record, remote=RemoteStatus.OFFLINE, fetched_at=h.clock.now)])
+    assert h.controller.display(record.id).state is DisplayState.CONNECTING
+    proc.state_since = h.clock.now + timedelta(seconds=1)  # went idle after that fetch
+    proc.drive_state(LocalState.IDLE)
+    qtbot.waitUntil(lambda: h.controller.display(record.id).state is DisplayState.IDLE)
+    assert h.controller.display(record.id).detail is None
+
+
+def test_display_changed_only_on_change(make_controller: Any, qtbot: Any) -> None:
+    a, b = record_model("a", repo="one"), record_model("b", repo="two")
+    h = make_controller(records=[a, b])
+    changed = Spy(h.controller.display_changed)
+    rows = [status_row(a, remote=RemoteStatus.OFFLINE), status_row(b, remote=RemoteStatus.OFFLINE)]
+    _refresh(qtbot, h, rows)
+    # Both were STOPPED + "remote unknown" before; now plain STOPPED.
+    assert sorted(rid for rid, _ in changed.calls) == sorted([a.id, b.id])
+    assert all(d.detail is None for _, d in changed.calls)
+    _refresh(qtbot, h, rows)
+    assert len(changed.calls) == 2  # nothing changed the second time
+    h.controller._on_remerge_timer()
+    assert len(changed.calls) == 2
+    assert h.controller.all_displays() == {a.id: changed.calls[0][1], b.id: changed.calls[1][1]}
+
+
+def test_runner_state_is_followed_by_display_changed(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = _started(make_controller, qtbot, record)
+    order: list[str] = []
+    h.controller.runner_state.connect(lambda *_: order.append("state"))
+    h.controller.display_changed.connect(lambda rid, d: order.append(f"display:{d.state}"))
+    h.process(record.id).drive_state(LocalState.IDLE)
+    qtbot.waitUntil(lambda: len(order) == 2, timeout=WAIT_MS)
+    assert order == ["state", "display:idle"]
+
+
+def test_graceful_stop_shows_stopped_while_github_lags(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = _started(make_controller, qtbot, record)
+    _refresh(qtbot, h, [status_row(record, LocalState.IDLE, remote=RemoteStatus.ONLINE)])
+    with qtbot.waitSignal(h.controller.runner_stopped, timeout=WAIT_MS):
+        h.controller.stop(record.id)  # graceful; FakeProcess.stopped_at = NOW
+    h.clock.advance(30)
+    shown = h.controller.display(record.id)
+    assert (shown.state, shown.detail) == (DisplayState.STOPPED, DETAIL_OFFLINE_LAG)
+    # A local-only refresh keeps GitHub's (stale) "online" and the grace period still holds.
+    rows = _refresh(qtbot, h, [status_row(record, remote=RemoteStatus.UNKNOWN)], remote=False)
+    assert h.manager.calls[-1] == ("statuses", {"remote": False})
+    assert rows[0].display.detail == DETAIL_OFFLINE_LAG
+    changed = Spy(h.controller.display_changed)
+    h.clock.advance(70)  # 100 s after the stop: GitHub should have noticed by now
+    h.controller._on_remerge_timer()
+    assert [d.state for _, d in changed.calls] == [DisplayState.EXTERNAL]
+
+
+def test_a_newer_stop_mark_beats_the_process_stop_info(make_controller: Any, qtbot: Any) -> None:
+    """The CLI hard-killed the runner after our own graceful stop: the cached stop mark wins."""
+    record = record_model()
+    h = _started(make_controller, qtbot, record)
+    with qtbot.waitSignal(h.controller.runner_stopped, timeout=WAIT_MS):
+        h.controller.stop(record.id)
+    h.clock.advance(20)
+    newer = status_row(
+        record,
+        remote=RemoteStatus.ONLINE,
+        stopped_at=NOW + timedelta(seconds=10),
+        forced=True,
+    )
+    rows = _refresh(qtbot, h, [newer])
+    assert rows[0].display.state is DisplayState.SESSION_LINGERING
+    older = status_row(
+        record,
+        remote=RemoteStatus.ONLINE,
+        stopped_at=NOW - timedelta(seconds=10),
+        forced=True,
+    )
+    rows = _refresh(qtbot, h, [older])
+    assert (rows[0].display.state, rows[0].display.detail) == (
+        DisplayState.STOPPED,
+        DETAIL_OFFLINE_LAG,
+    )
+
+
+def test_remerge_timer_turns_connecting_into_stalled(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = _started(make_controller, qtbot, record)
+    timer = h.controller._remerge_timer
+    assert timer.isActive() and timer.interval() == REMERGE_INTERVAL_MS
+    _refresh(qtbot, h, [status_row(record, LocalState.STARTING, remote=RemoteStatus.OFFLINE)])
+    assert h.controller.display(record.id).detail == DETAIL_CONNECTING
+    changed = Spy(h.controller.display_changed)
+    h.clock.advance(30)
+    h.controller._on_remerge_timer()
+    assert changed.calls == []
+    h.clock.advance(31)
+    h.controller._on_remerge_timer()
+    assert [(rid, d.state, d.detail) for rid, d in changed.calls] == [
+        (record.id, DisplayState.STALLED, DETAIL_STALLED)
+    ]
+
+
+def test_remerge_timer_runs_only_with_records(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller()
+    assert not h.controller._remerge_timer.isActive()
+    with qtbot.waitSignal(h.controller.runner_imported, timeout=WAIT_MS):
+        h.controller.import_runner("/runners/imported")
+    assert h.controller._remerge_timer.isActive()
+    (record,) = h.controller.records
+    with qtbot.waitSignal(h.controller.runner_forgotten, timeout=WAIT_MS):
+        h.controller.forget(record.id)
+    assert not h.controller._remerge_timer.isActive()
+
+
+def test_a_failed_repo_resets_its_remote_cache(make_controller: Any, qtbot: Any) -> None:
+    a, b = record_model("a", repo="one"), record_model("b", repo="two")
+    h = make_controller(records=[a, b])
+    _refresh(
+        qtbot,
+        h,
+        [
+            status_row(a, remote=RemoteStatus.ONLINE, busy=True),
+            status_row(b, remote=RemoteStatus.ONLINE),
+        ],
+    )
+    assert h.controller.remote_busy(a.id) and not h.controller.remote_busy(b.id)
+    assert h.controller.display(a.id).state is DisplayState.EXTERNAL
+    # remote=False: the GitHub cache survives.
+    _refresh(
+        qtbot,
+        h,
+        [status_row(a, remote=RemoteStatus.UNKNOWN), status_row(b, remote=RemoteStatus.UNKNOWN)],
+        remote=False,
+    )
+    assert h.controller.remote_busy(a.id)
+    assert h.controller.display(a.id).state is DisplayState.EXTERNAL
+    # a's repo fails, b's answers: only a falls back to "unknown".
+    _refresh(
+        qtbot,
+        h,
+        [status_row(a, remote_error="网络错误"), status_row(b, remote=RemoteStatus.OFFLINE)],
+    )
+    assert not h.controller.remote_busy(a.id)
+    assert h.controller.display(a.id).detail == DETAIL_REMOTE_UNKNOWN
+    assert h.controller.display(b.id) == h.controller.all_displays()[b.id]
+    assert h.controller.display(b.id).detail is None
+    assert not h.controller.remote_busy("unknown")
+
+
+def test_quiet_refresh_failure_only_logs(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller(records=[record_model()])
+    h.manager.errors["statuses"] = StoreError("配置文件不可读")
+    failed = Spy(h.controller.failed)
+    refreshing = Spy(h.controller.refreshing_changed)
+    h.controller.refresh_statuses(remote=False, quiet=True)
+    refreshing.wait(qtbot, 2)
+    assert refreshing.calls == [(True,), (False,)]
+    assert failed.calls == []
+    assert not h.controller.refreshing
+
+
+def test_rows_of_records_removed_during_a_refresh_are_not_cached(
+    make_controller: Any, qtbot: Any
+) -> None:
+    a, b = record_model("a", repo="one"), record_model("b", repo="two")
+    h = make_controller(records=[a])
+    rows = _refresh(qtbot, h, [status_row(a, remote=RemoteStatus.ONLINE), status_row(b)])
+    assert rows[1] is h.manager.rows[1]  # unknown record: passed through untouched
+    assert b.id not in h.controller._locals and b.id not in h.controller._remotes
+
+
+# --- M3: stop marks ----------------------------------------------------------------------------
+
+
+def test_stop_records_the_stop_on_the_worker(make_controller: Any, qtbot: Any) -> None:
+    a, b = record_model("a", repo="one"), record_model("b", repo="two")
+    h = _started(make_controller, qtbot, a, b)
+    h.process(b.id).stop_result = StopResult(False, StopMethod.KILL, 1, [10])
+    stopped = Spy(h.controller.runner_stopped)
+    h.controller.stop(a.id)
+    h.controller.stop(b.id)
+    stopped.wait(qtbot, 2)
+    assert sorted(h.manager.stop_marks, key=lambda m: str(m[0])) == [
+        (Path(a.path), False),
+        (Path(b.path), True),
+    ]
+    marks = [i for i, (name, _) in enumerate(h.manager.calls) if name == "record_stop"]
+    assert all(h.manager.threads[i] is not threading.main_thread() for i in marks)
+
+
+def test_shutdown_records_the_stops(make_controller: Any, qtbot: Any) -> None:
+    a = record_model("a", repo="one")
+    h = _started(make_controller, qtbot, a)
+    assert h.controller.shutdown() == []
+    assert h.manager.stop_marks == [(Path(a.path), False)]
+    assert h.manager.threads[-1] is not threading.main_thread()
+
+
+def test_remove_does_not_record_a_stop_mark(make_controller: Any, qtbot: Any) -> None:
+    """remove_runner clears the mark anyway; the stop inside remove() writes none."""
+    record = record_model()
+    h = _started(make_controller, qtbot, record)
+    with qtbot.waitSignal(h.controller.runner_removed, timeout=WAIT_MS):
+        h.controller.remove(record.id)
+    assert h.manager.stop_marks == []
+
+
+# --- M3: auto start ------------------------------------------------------------------------------
+
+
+def test_start_auto_runners_skips_external_processes(make_controller: Any, qtbot: Any) -> None:
+    auto = record_model("auto", repo="one").model_copy(update={"auto_start": True})
+    taken = record_model("taken", repo="two").model_copy(update={"auto_start": True})
+    manual = record_model("manual", repo="three")
+    h = make_controller(records=[auto, taken, manual])
+    h.manager.rows = [
+        status_row(auto, remote=RemoteStatus.UNKNOWN),
+        status_row(taken, remote=RemoteStatus.UNKNOWN, external=True),
+        status_row(manual, remote=RemoteStatus.UNKNOWN),
+    ]
+    statuses = Spy(h.controller.statuses_updated)
+    changed = Spy(h.controller.display_changed)
+    op, message, exc = _wait_failed(qtbot, h, h.controller.start_auto_runners)
+    assert (op, message, exc) == ("autostart", AUTOSTART_SKIPPED + "taken", None)
+    assert ("statuses", {"remote": False}) in h.manager.calls
+    assert h.manager.statuses_seen == [{}]
+    _wait_idle(qtbot, h, auto.id)
+    assert list(h.manager.processes) == [auto.id]
+    assert h.process(auto.id).calls == ["start"]
+    process_for = [i for i, (name, _) in enumerate(h.manager.calls) if name == "process_for"]
+    assert h.manager.threads[process_for[0]] is threading.main_thread()
+    assert statuses.calls == []  # a private scan, not a refresh
+    assert (taken.id, h.controller.display(taken.id)) in changed.calls
+    assert h.controller.display(taken.id).state is DisplayState.EXTERNAL
+
+
+def test_start_auto_runners_skips_running_ones_and_needs_auto_records(
+    make_controller: Any, qtbot: Any
+) -> None:
+    h = make_controller(records=[record_model()])
+    h.controller.start_auto_runners()  # no auto_start record: nothing scanned
+    assert h.manager.calls == []
+
+    auto = record_model("auto").model_copy(update={"auto_start": True})
+    h2 = _started(make_controller, qtbot, auto)
+    h2.manager.rows = [status_row(auto, LocalState.STARTING, remote=RemoteStatus.UNKNOWN)]
+    failed = Spy(h2.controller.failed)
+    h2.controller.start_auto_runners()
+    qtbot.waitUntil(lambda: ("statuses", {"remote": False}) in h2.manager.calls)
+    qtbot.wait(50)
+    assert h2.process(auto.id).calls == ["start"]  # not started twice
+    assert failed.calls == []
+
+
+def test_start_auto_runners_failure(make_controller: Any, qtbot: Any) -> None:
+    auto = record_model("auto").model_copy(update={"auto_start": True})
+    h = make_controller(records=[auto])
+    h.manager.errors["statuses"] = ProcessError("无法扫描进程")
+    op, message, _ = _wait_failed(qtbot, h, h.controller.start_auto_runners)
+    assert (op, message) == ("autostart", "无法扫描进程")
+
+
+def test_set_auto_start(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = make_controller(records=[record])
+    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS) as blocker:
+        h.controller.set_auto_start(record.id, True)
+    assert blocker.args[0].runners[0].auto_start
+    assert h.controller.records[0].auto_start
+    assert h.manager.calls[-1] == ("set_auto_start", {"record_id": record.id, "enabled": True})
+    h.manager.errors["set_auto_start"] = StoreError("无法写入配置文件")
+    op, message, _ = _wait_failed(qtbot, h, lambda: h.controller.set_auto_start(record.id, False))
+    assert (op, message) == ("auto_start", "无法写入配置文件")
+    op, _, _ = _wait_failed(qtbot, h, lambda: h.controller.set_auto_start("nope", True))
+    assert op == "auto_start"
+
+
+def test_add_runner_passes_auto_start(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller()
+    with qtbot.waitSignal(h.controller.runner_added, timeout=WAIT_MS) as blocker:
+        h.controller.add_runner(plan_model(), auto_start=True)
+    assert blocker.args[0].auto_start
+    assert h.manager.calls[-1][1]["auto_start"] is True
+
+
+# --- M3: import / forget / discover --------------------------------------------------------------
+
+
+def test_import_runner_emits_imported_then_config_changed(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller()
+    order: list[str] = []
+    h.controller.runner_imported.connect(lambda r: order.append(f"imported:{r.name}"))
+    h.controller.config_changed.connect(lambda c: order.append(f"config:{len(c.runners)}"))
+    changed = Spy(h.controller.display_changed)
+    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
+        h.controller.import_runner("/runners/imported", auto_start=True)
+    assert order == ["imported:box-imported", "config:1"]
+    (record,) = h.controller.records
+    assert record.auto_start
+    assert h.manager.calls[-1] == (
+        "import_runner",
+        {"path": "/runners/imported", "auto_start": True},
+    )
+    assert h.manager.threads[-1] is not threading.main_thread()
+    assert changed.calls == [(record.id, h.controller.display(record.id))]
+
+
+def test_import_runner_failure(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller()
+    h.manager.errors["import_runner"] = InvalidInputError("不是 runner 目录")
+    op, message, _ = _wait_failed(qtbot, h, lambda: h.controller.import_runner("/x"))
+    assert (op, message) == ("import", "不是 runner 目录")
+    assert h.controller.records == []
+
+
+def test_forget_deletes_only_the_record(make_controller: Any, qtbot: Any) -> None:
+    keep, gone = record_model("keep", repo="one"), record_model("gone", repo="two")
+    h = make_controller(records=[keep, gone])
+    _refresh(qtbot, h, [status_row(keep), status_row(gone, remote=RemoteStatus.ONLINE)])
+    order: list[str] = []
+    h.controller.runner_forgotten.connect(lambda rid: order.append(f"forgotten:{rid}"))
+    h.controller.config_changed.connect(lambda c: order.append(f"config:{len(c.runners)}"))
+    busy = Spy(h.controller.busy_changed)
+    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
+        h.controller.forget(gone.id)
+    assert order == [f"forgotten:{gone.id}", "config:1"]
+    assert [r.id for r in h.controller.records] == [keep.id]
+    assert h.manager.calls[-1] == ("forget_runner", {"record_id": gone.id})
+    assert busy.calls == [(gone.id, True), (gone.id, False)]
+    assert gone.id not in h.controller._remotes and gone.id not in h.controller._displays
+    assert not h.controller.remote_busy(gone.id)
+
+
+def test_forget_is_refused_while_running_or_busy(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = _started(make_controller, qtbot, record)
+    op, message, exc = _wait_failed(qtbot, h, lambda: h.controller.forget(record.id))
+    assert (op, exc) == ("forget", None)
+    assert "正在运行" in message
+    gate = threading.Event()
+    h.process(record.id).block_stop = gate
+    h.controller.stop(record.id)
+    h.process(record.id)._running = False  # stopped, but the stop operation still runs
+    op, message, _ = _wait_failed(qtbot, h, lambda: h.controller.forget(record.id))
+    assert op == "forget" and "正在执行其他操作" in message
+    gate.set()
+    _wait_idle(qtbot, h, record.id)
+    assert "forget_runner" not in [name for name, _ in h.manager.calls]
+    op, _, _ = _wait_failed(qtbot, h, lambda: h.controller.forget("nope"))
+    assert op == "forget"
+
+
+def test_forget_failure_keeps_the_record(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = make_controller(records=[record])
+    h.manager.errors["forget_runner"] = StoreError("无法写入配置文件")
+    op, message, _ = _wait_failed(qtbot, h, lambda: h.controller.forget(record.id))
+    assert (op, message) == ("forget", "无法写入配置文件")
+    _wait_idle(qtbot, h, record.id)
+    assert [r.id for r in h.controller.records] == [record.id]
+
+
+def test_discover(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller()
+    stray = StrayRunner(path=Path("/runners/old"), pids=(5,), configured=True, service=False)
+    h.manager.discovery = Discovery(
+        root=Path("/runners"), unregistered=(Path("/runners/new"),), strays=(stray,)
+    )
+    with qtbot.waitSignal(h.controller.discovery_updated, timeout=WAIT_MS) as blocker:
+        h.controller.discover()
+    assert blocker.args == [h.manager.discovery]
+    assert h.manager.threads[-1] is not threading.main_thread()
+    h.manager.errors["discover"] = ProcessError("无法扫描进程")
+    op, message, _ = _wait_failed(qtbot, h, h.controller.discover)
+    assert (op, message) == ("discover", "无法扫描进程")
+
+
+# --- M3: external processes ----------------------------------------------------------------------
+
+
+def test_kill_external_clears_the_cached_external(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = make_controller(records=[record])
+    _refresh(qtbot, h, [status_row(record, remote=RemoteStatus.ONLINE, external=True)])
+    assert h.controller.display(record.id).state is DisplayState.EXTERNAL
+    busy = Spy(h.controller.busy_changed)
+    with qtbot.waitSignal(h.controller.external_stopped, timeout=WAIT_MS) as blocker:
+        h.controller.kill_external(record.id)
+    assert blocker.args == [record.id, h.manager.external_result]
+    assert h.manager.calls[-1] == ("kill_external", {"record_id": record.id})
+    assert h.manager.threads[-1] is not threading.main_thread()
+    assert busy.calls == [(record.id, True), (record.id, False)]
+    # Killed = a forced stop just now: GitHub's lingering session, not "someone else's".
+    assert h.controller.display(record.id).state is DisplayState.SESSION_LINGERING
+
+
+def test_kill_external_with_survivors_keeps_external(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = make_controller(records=[record])
+    _refresh(qtbot, h, [status_row(record, remote=RemoteStatus.ONLINE, external=True)])
+    h.manager.external_result = ExternalStop(killed=[1], survivors=[2])
+    with qtbot.waitSignal(h.controller.external_stopped, timeout=WAIT_MS):
+        h.controller.kill_external(record.id)
+    assert h.controller.display(record.id).state is DisplayState.EXTERNAL
+
+
+def test_kill_external_refusals_and_failure(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = _started(make_controller, qtbot, record)
+    op, message, exc = _wait_failed(qtbot, h, lambda: h.controller.kill_external(record.id))
+    assert (op, exc) == ("kill", None)
+    assert "由 RunnerDeck 运行" in message
+    op, _, _ = _wait_failed(qtbot, h, lambda: h.controller.kill_external("nope"))
+    assert op == "kill"
+    other = record_model("other", repo="two")
+    h2 = make_controller(records=[other])
+    h2.manager.errors["kill_external"] = InvalidInputError("这个 runner 以 Windows 服务方式运行")
+    op, message, _ = _wait_failed(qtbot, h2, lambda: h2.controller.kill_external(other.id))
+    assert (op, message) == ("kill", "这个 runner 以 Windows 服务方式运行")
+    _wait_idle(qtbot, h2, other.id)
+
+
+def test_take_over_kills_then_starts_on_the_main_thread(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = make_controller(records=[record])
+    _refresh(qtbot, h, [status_row(record, remote=RemoteStatus.ONLINE, external=True)])
+    order: list[str] = []
+    h.controller.external_stopped.connect(lambda *_: order.append("external_stopped"))
+    h.controller.runner_state.connect(lambda _rid, s, _j: order.append(f"state:{s}"))
+    h.controller.take_over(record.id)
+    qtbot.waitUntil(lambda: h.controller.is_running(record.id), timeout=WAIT_MS)
+    _wait_idle(qtbot, h, record.id)
+    qtbot.waitUntil(lambda: len(order) == 2, timeout=WAIT_MS)
+    assert order == ["external_stopped", "state:starting"]
+    names = [name for name, _ in h.manager.calls]
+    assert names[-2:] == ["kill_external", "process_for"]
+    assert h.manager.threads[-2] is not threading.main_thread()
+    assert h.manager.threads[-1] is threading.main_thread()
+    assert h.process(record.id).calls == ["start"]
+    assert h.controller.display(record.id).state is not DisplayState.EXTERNAL
+
+
+def test_take_over_with_survivors_does_not_start(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = make_controller(records=[record])
+    h.manager.external_result = ExternalStop(killed=[], survivors=[7, 8])
+    stopped = Spy(h.controller.external_stopped)
+    op, message, _ = _wait_failed(qtbot, h, lambda: h.controller.take_over(record.id))
+    assert op == "take_over"
+    assert "7、8" in message
+    assert stopped.calls == [(record.id, h.manager.external_result)]
+    assert h.manager.processes == {}
+    assert not h.controller.is_busy(record.id)
+
+
+def test_take_over_failure_and_refusal(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = make_controller(records=[record])
+    h.manager.errors["kill_external"] = ProcessError("无法结束进程")
+    op, message, _ = _wait_failed(qtbot, h, lambda: h.controller.take_over(record.id))
+    assert (op, message) == ("take_over", "无法结束进程")
+    _wait_idle(qtbot, h, record.id)
+    assert h.manager.processes == {}
+    h2 = _started(make_controller, qtbot, record_model("mine", repo="two"))
+    (mine,) = h2.controller.records
+    op, _, exc = _wait_failed(qtbot, h2, lambda: h2.controller.take_over(mine.id))
+    assert (op, exc) == ("take_over", None)
+
+
+def test_kill_stray(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller()
+    with (
+        qtbot.waitSignal(h.controller.discovery_updated, timeout=WAIT_MS),
+        qtbot.waitSignal(h.controller.external_stopped, timeout=WAIT_MS) as blocker,
+    ):
+        h.controller.kill_stray("/runners/old")
+    assert blocker.args == ["/runners/old", h.manager.stray_result]
+    names = [name for name, _ in h.manager.calls]
+    assert ("kill_stray", {"path": "/runners/old"}) in h.manager.calls
+    assert names.index("discover") > names.index("kill_stray")  # the banner is refreshed
+    h.manager.errors["kill_stray"] = InvalidInputError("这个目录已登记")
+    op, message, _ = _wait_failed(qtbot, h, lambda: h.controller.kill_stray("/runners/x"))
+    assert (op, message) == ("kill", "这个目录已登记")
+
+
+# --- M3: diagnostics logs ------------------------------------------------------------------------
+
+
+def _diag_record(tmp_path: Path) -> tuple[RunnerRecord, Path]:
+    runner_dir = tmp_path / "runner"
+    diag_dir = runner_dir / "_diag"
+    diag_dir.mkdir(parents=True)
+    log_file = diag_dir / "Runner_20261023-120000-utc.log"
+    log_file.write_text("x", encoding="utf-8")
+    return record_model(path=str(runner_dir)), log_file
+
+
+def test_load_diag_logs(make_controller: Any, qtbot: Any, tmp_path: Path) -> None:
+    record, log_file = _diag_record(tmp_path)
+    h = make_controller(records=[record])
+    h.diag.logs = [DiagLog(path=log_file, kind="runner", modified=NOW, size=1)]
+    with qtbot.waitSignal(h.controller.diag_logs_loaded, timeout=WAIT_MS) as blocker:
+        h.controller.load_diag_logs(record.id)
+    assert blocker.args == [record.id, h.diag.logs]
+    assert h.diag.calls == [("list_logs", Path(record.path))]
+    assert h.diag.threads[0] is not threading.main_thread()
+    h.diag.error = RunnerDeckError("无法读取")
+    op, message, _ = _wait_failed(qtbot, h, lambda: h.controller.load_diag_logs(record.id))
+    assert (op, message) == ("diag", "无法读取")
+    op, _, _ = _wait_failed(qtbot, h, lambda: h.controller.load_diag_logs("nope"))
+    assert op == "diag"
+
+
+def test_load_diag_text(make_controller: Any, qtbot: Any, tmp_path: Path) -> None:
+    record, log_file = _diag_record(tmp_path)
+    h = make_controller(records=[record])
+    h.diag.texts[log_file] = "Listening for Jobs"
+    with qtbot.waitSignal(h.controller.diag_text_loaded, timeout=WAIT_MS) as blocker:
+        h.controller.load_diag_text(record.id, str(log_file))
+    assert blocker.args == [record.id, str(log_file), "Listening for Jobs"]
+    assert h.diag.threads[0] is not threading.main_thread()
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["outside", "dotdot", "diag_dir_itself", "other_runner", "relative"],
+)
+def test_load_diag_text_refuses_paths_outside_diag(
+    make_controller: Any, qtbot: Any, tmp_path: Path, where: str
+) -> None:
+    record, log_file = _diag_record(tmp_path)
+    secret = tmp_path / "runner" / ".credentials"
+    secret.write_text("{}", encoding="utf-8")
+    other = tmp_path / "other" / "_diag" / "Runner_1.log"
+    other.parent.mkdir(parents=True)
+    other.write_text("x", encoding="utf-8")
+    path = {
+        "outside": str(secret),
+        "dotdot": str(log_file.parent / ".." / ".credentials"),
+        "diag_dir_itself": str(log_file.parent),
+        "other_runner": str(other),
+        "relative": "_diag/Runner_1.log",
+    }[where]
+    h = make_controller(records=[record])
+    op, message, exc = _wait_failed(qtbot, h, lambda: h.controller.load_diag_text(record.id, path))
+    assert op == "diag"
+    assert isinstance(exc, InvalidInputError)
+    assert "_diag" in message
+    assert h.diag.calls == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need a privilege on Windows")
+def test_load_diag_text_refuses_a_symlink_out_of_diag(
+    make_controller: Any, qtbot: Any, tmp_path: Path
+) -> None:
+    record, log_file = _diag_record(tmp_path)
+    secret = tmp_path / "runner" / ".credentials"
+    secret.write_text("{}", encoding="utf-8")
+    link = log_file.parent / "Runner_link.log"
+    os.symlink(secret, link)
+    h = make_controller(records=[record])
+    op, _, _ = _wait_failed(qtbot, h, lambda: h.controller.load_diag_text(record.id, str(link)))
+    assert op == "diag"
+    assert h.diag.calls == []
+
+
+# --- M3: launch on login -------------------------------------------------------------------------
+
+
+def test_autostart_supported_follows_the_ops(make_controller: Any) -> None:
+    assert make_controller().controller.autostart_supported
+    assert not make_controller(autostart_supported=False).controller.autostart_supported
+
+
+def test_load_autostart_state(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller()
+    with qtbot.waitSignal(h.controller.autostart_state_loaded, timeout=WAIT_MS) as blocker:
+        h.controller.load_autostart_state()
+    (state,) = blocker.args
+    assert state.supported and not state.registered
+    assert h.autostart.threads[0] is not threading.main_thread()
+    h.autostart.error = RunnerDeckError("无法读取注册表")
+    op, message, _ = _wait_failed(qtbot, h, h.controller.load_autostart_state)
+    assert (op, message) == ("launch_on_login", "无法读取注册表")
+
+
+def test_set_launch_on_login_writes_registry_then_settings(
+    make_controller: Any, qtbot: Any
+) -> None:
+    h = make_controller()
+    order: list[str] = []
+    h.controller.autostart_state_loaded.connect(lambda s: order.append(f"state:{s.registered}"))
+    h.controller.config_changed.connect(
+        lambda c: order.append(f"config:{c.settings.launch_on_login}")
+    )
+    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
+        h.controller.set_launch_on_login(True)
+    assert order == ["state:True", "config:True"]
+    assert h.autostart.calls == [("enable",)]
+    assert h.autostart.threads[0] is not threading.main_thread()
+    assert h.store.load().settings.launch_on_login
+    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
+        h.controller.set_launch_on_login(False)
+    assert h.autostart.calls[-1] == ("disable",)
+    assert not h.controller.config.settings.launch_on_login
+
+
+def test_set_launch_on_login_failure_keeps_settings(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller()
+    h.autostart.error = RunnerDeckError("无法写入注册表 HKCU\\...\\Run")
+    op, message, _ = _wait_failed(qtbot, h, lambda: h.controller.set_launch_on_login(True))
+    assert op == "launch_on_login"
+    assert "无法写入注册表" in message
+    assert not h.store.load().settings.launch_on_login
+
+
+def test_set_launch_on_login_unsupported(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller(autostart_supported=False)
+    op, message, exc = _wait_failed(qtbot, h, lambda: h.controller.set_launch_on_login(True))
+    assert (op, message, exc) == ("launch_on_login", AUTOSTART_UNSUPPORTED, None)
+    assert h.autostart.calls == []
+
+
+def test_reconcile_autostart_uses_the_saved_setting(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller(settings=AppSettings(launch_on_login=True))
+    with qtbot.waitSignal(h.controller.autostart_state_loaded, timeout=WAIT_MS) as blocker:
+        h.controller.reconcile_autostart()
+    assert blocker.args[0].registered
+    assert h.autostart.calls == [("reconcile", True)]
+
+
+def test_save_settings_applies_a_changed_launch_on_login(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller()
+    loaded = Spy(h.controller.autostart_state_loaded)
+    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
+        h.controller.save_settings(AppSettings(poll_interval_s=60))
+    assert h.autostart.calls == []  # launch_on_login unchanged
+    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
+        h.controller.save_settings(AppSettings(poll_interval_s=60, launch_on_login=True))
+    assert h.autostart.calls == [("enable",)]
+    assert h.autostart.threads[0] is not threading.main_thread()
+    assert loaded.calls and loaded.calls[-1][0].registered
+    h.autostart.error = RunnerDeckError("无法写入注册表")
+    op, _, _ = _wait_failed(
+        qtbot, h, lambda: h.controller.save_settings(AppSettings(launch_on_login=False))
+    )
+    assert op == "settings"
+    assert h.store.load().settings.launch_on_login  # nothing saved
+
+
+def test_save_settings_ignores_launch_on_login_when_unsupported(
+    make_controller: Any, qtbot: Any
+) -> None:
+    h = make_controller(autostart_supported=False)
+    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
+        h.controller.save_settings(AppSettings(launch_on_login=True))
+    assert h.autostart.calls == []
+    assert h.store.load().settings.launch_on_login
+
+
+# --- M3: session end ------------------------------------------------------------------------------
+
+
+def test_emergency_stop_all_signals_running_runners(make_controller: Any, qtbot: Any) -> None:
+    a, b, c = (
+        record_model("a", repo="one"),
+        record_model("b", repo="two"),
+        record_model("c", repo="three"),
+    )
+    h = _started(make_controller, qtbot, a, b, c)
+    with qtbot.waitSignal(h.controller.runner_stopped, timeout=WAIT_MS):
+        h.controller.stop(c.id)
+    h.process(a.id).signal_error = OSError("pipe closed")
+    assert h.controller.emergency_stop_all() == 1
+    assert h.process(a.id).calls[-1] == "signal_stop"
+    assert h.process(b.id).calls == ["start", "signal_stop"]
+    assert h.process(b.id).threads[-1] is threading.main_thread()
+    assert "signal_stop" not in h.process(c.id).calls
+    assert h.manager.stop_marks == [(Path(c.path), False)]  # no disk IO at session end
+    assert make_controller().controller.emergency_stop_all() == 0
+
+
+# --- M3: defaults ---------------------------------------------------------------------------------
+
+
+def test_default_ops(isolated_home: Path, pool: Any) -> None:
+    c = RunnerController(environ={}, pool=pool)
+    assert isinstance(c._autostart, CoreAutostart)
+    assert isinstance(c._diag, CoreDiag)
+    assert c.autostart_supported is (sys.platform == "win32")
+
+
+def test_core_diag_lists_nothing_without_a_diag_dir(tmp_path: Path) -> None:
+    pytest.importorskip("runnerdeck.core.diag")
+    assert CoreDiag().list_logs(tmp_path) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="would touch the real HKCU registry")
+def test_core_autostart_is_unsupported_off_windows() -> None:
+    pytest.importorskip("runnerdeck.core.autostart")
+    ops = CoreAutostart()
+    assert not ops.supported
+    assert not ops.reconcile(True).supported
+    assert not ops.state().supported
+
+
+def test_status_rows_keep_their_other_fields(make_controller: Any, qtbot: Any) -> None:
+    record = record_model()
+    h = make_controller(records=[record])
+    row = status_row(record, remote=RemoteStatus.OFFLINE)
+    (merged,) = _refresh(qtbot, h, [row])
+    assert dataclasses.replace(merged, display=row.display) == row
+
+
+def test_save_settings_from_a_stale_copy_keeps_the_other_save(
+    make_controller: Any, qtbot: Any
+) -> None:
+    # Review M3 #6: launch on login was switched on (and saved) after the UI made its copy;
+    # that stale copy still says False and must not switch it off again or drop other fields.
+    h = make_controller()
+    stale = h.controller.config.settings  # launch_on_login=False, poll 30
+    config = h.store.load()
+    config.settings = config.settings.model_copy(update={"launch_on_login": True})
+    h.store.save(config)  # e.g. set_launch_on_login landed on disk in the meantime
+    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
+        h.controller.save_settings(stale.model_copy(update={"poll_interval_s": 120}))
+    saved = h.store.load().settings
+    assert saved.poll_interval_s == 120
+    assert saved.launch_on_login  # not undone
+    assert h.autostart.calls == []  # and the Run entry was not touched

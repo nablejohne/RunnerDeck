@@ -14,6 +14,8 @@ Grounded in docs/spike-notes.md:
 - §5: only Ctrl+Break through the shared console stops a runner cleanly. The CLI runs in a
   console, so `start` can stop its runners gracefully; `stop` (another terminal) cannot and
   always hard-kills, after which the GitHub session lingers about 3 minutes.
+Both record how each runner stopped (RunnerManager.record_stop, docs/m3-design.md §3.6), so a
+later `status` here or in the GUI shows "GitHub 会话未过期" instead of "被其他进程运行".
 """
 
 from __future__ import annotations
@@ -303,6 +305,12 @@ def build_parser(console: Console) -> argparse.ArgumentParser:
 
     p = command("import", "登记一个已经配置好的 runner 目录", _cmd_import)
     p.add_argument("path", help="runner 目录")
+
+    p = command(
+        "forget", "取消登记：只删除 RunnerDeck 的记录，目录和 GitHub 上的注册都保留", _cmd_forget
+    )
+    p.add_argument("key", help="runner 的 id、id 前缀、名称或 owner/repo")
+    p.add_argument("-y", "--yes", action="store_true", help="不询问，直接确认")
 
     command("scan", "列出 runners_root 下还没登记的 runner 目录", _cmd_scan)
 
@@ -700,6 +708,25 @@ def _cmd_import(ctx: _Context, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_forget(ctx: _Context, args: argparse.Namespace) -> int:
+    console = ctx.console
+    config = ctx.config()
+    record = resolve_runner(config, args.key)
+    console.print(f"将取消登记 runner {record.name}（{record.full_name}，目录 {record.path}）")
+    console.print(
+        "只删除 RunnerDeck 的记录：不访问 GitHub，目录和其中的 .runner 原样保留，"
+        "GitHub 上的注册也保留"
+    )
+    if not args.yes and not ctx.confirm("确认取消登记？输入 y 继续，其他任意输入取消："):
+        console.print("已取消，没有做任何改动")
+        return EXIT_ERROR
+    ctx.manager.forget_runner(record.id)
+    console.print(
+        f"已取消登记 runner {record.name}；之后可以用 {PROG} import {record.path} 重新登记"
+    )
+    return EXIT_OK
+
+
 def _cmd_scan(ctx: _Context, args: argparse.Namespace) -> int:
     console = ctx.console
     found = ctx.manager.scan_unregistered()
@@ -729,6 +756,10 @@ def _cmd_stop(ctx: _Context, args: argparse.Namespace) -> int:
             code = EXIT_ERROR
             continue
         killed = ", ".join(map(str, outcome.killed))
+        if outcome.killed:
+            # Always a hard kill: the next `status` (here or in the GUI) must know the GitHub
+            # session lingers, rather than calling an online runner "被其他进程运行".
+            ctx.manager.record_stop(Path(record.path), forced=True)
         if outcome.ok and not outcome.killed:
             console.print(f"runner {name} 没有在运行")
         elif outcome.ok:
@@ -981,8 +1012,20 @@ class _Supervisor:
                 busy[0].wait(STOP_POLL_S)
             except KeyboardInterrupt:  # only without our SIGINT handler (off the main thread)
                 self._presses += 1
+        self._record_stops(targets)
         self._report_stops(targets)
         return gave_up
+
+    def _record_stops(self, targets: Sequence[_Run]) -> None:
+        """Stop records for every runner this stop phase ended (graceful or not)."""
+        for run in targets:
+            if run.result is not None:
+                forced = not run.result.graceful or bool(run.force_killed)
+            elif not run.proc.is_running():  # ended, but stop() raised (survivors)
+                forced = True
+            else:
+                continue  # may still be running: listed by _report_alive
+            self.ctx.manager.record_stop(Path(run.record.path), forced=forced)
 
     def _stop_one(self, run: _Run, timeout: float | None) -> None:
         try:

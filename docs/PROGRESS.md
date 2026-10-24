@@ -7,8 +7,24 @@
 - [x] M0 技术验证 + 工程地基（spike 脚本、stdout 样本、停止方式结论、pyproject/ruff/pytest、ci.yml 首次跑绿）
 - [x] M1 core 层 + CLI（架构守卫、覆盖率门槛）
 - [x] M2 UI 最小可用 + 打包 + release.yml → v0.1.0（2026-10-24 发布，预发布）
-- [ ] M3 日常可用（托盘、自启、Poller、导入）→ v0.2.0
+- [ ] M3 日常可用（托盘、自启、Poller、导入）→ v0.2.0（进行中：代码完成，待 CI / 真机验收）
 - [ ] M4 增强与发布（服务模式、Inno Setup、来源证明）→ v1.0.0
+
+## M3：进行中（2026-10-24 起）
+
+契约 `docs/m3-design.md`（§10 记实现后的修订）。实现方式：地基（本会话）→ 4 车道并行工作流 → 整合 → 一个独立 reviewer 评审（用户因成本取消了多 agent 评审工作流）。
+
+- [x] 地基：`models`（`notify_jobs` + 运行时数据类）、`status` 合并规则补两条（优雅停止后 90 s 宽限、远端快照早于本地状态）+ `bucket` / `tray_level` / `is_job_failure`、FakeController、架构守卫（ui 禁止 autostart/stop_marks/diag/winreg/psutil）
+- [x] 车道 A core：`stop_marks`（每 runner 一个文件，GUI/CLI 共用，补 M1 遗留的强杀信息缺口）、`diag`、`autostart`（HKCU Run，可注入注册表）、`RunnerProcess.signal_stop`、manager 一次性进程扫描 / discover / kill_external / kill_stray / forget / auto_start、CLI `forget`
+- [x] 车道 B app：controller 实时合并 + 5 s 重算 + `display_changed`、接管 / 结束进程、诊断日志、自启开关；`StatusPoller`（静默失败、全部失败降频 5 分钟、kick 去抖）
+- [x] 车道 C ui：托盘（颜色、菜单、通知）、关窗到托盘 / 退出、详情页（实时输出 + 诊断日志，取代 LogDialog）、接管 / 结束、导入、发现横幅、设置页新项、主题
+- [x] 车道 D：单实例激活、`--autostart`、注销处理、spec、README / CHANGELOG / CLAUDE.md
+- [x] 整合：全量 2215 passed（macOS 离屏）、smoke 退出 0、FakeController 与真实 controller 一致性测试、真实 controller + manager 接线脚本检查
+- [x] 独立评审（1 个 reviewer）9 条 → 修 8 条（卡片在确认框期间被重建删除、残留进程误判会杀自己的 runner、状态窗口按快照时间算、ERROR 让位 EXTERNAL、无窗口时的 MessageBox 崩溃、设置过期副本覆盖、登录框叠模态、停止记录读后删）；取消注销后不自动恢复留 M4；全量 2300 passed、smoke 0
+- [ ] CI（windows-latest）绿
+- [ ] XM：真机 pytest、`_diag` 运行中可读 spike、CLI stop 后显示“GitHub 会话未过期”
+- [ ] 桌面验收（m3-design §9 七项）
+- [ ] 发布 v0.2.0
 
 ## M2：已完成（2026-10-24，v0.1.0 预发布）
 

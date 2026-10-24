@@ -1,4 +1,5 @@
-"""SettingsPage: root / labels / proxy edits call save_settings; account card follows signals."""
+"""SettingsPage: edits call save_settings (launch-on-login: set_launch_on_login); the account
+and autostart cards follow controller signals."""
 
 from __future__ import annotations
 
@@ -11,12 +12,18 @@ from PyQt5.QtWidgets import QFileDialog
 from pytestqt.qtbot import QtBot
 from qfluentwidgets import MessageBox
 
-from runnerdeck.core.models import AppConfig, AppSettings
+from runnerdeck.core.models import AppConfig, AppSettings, AutostartState
 from runnerdeck.ui.components.login_dialog import LoginDialog
 from runnerdeck.ui.pages.settings_page import (
+    LAUNCH_DISABLED_TEXT,
+    LAUNCH_MISMATCH_TEXT,
+    LAUNCH_ON_TEXT,
+    LAUNCH_TEXT,
     NOT_LOGGED_IN,
     PROXY_FORMAT_ERROR,
     SettingsPage,
+    launch_text,
+    poll_options,
     validate_proxy,
 )
 from ui.conftest import FakeController, make_user
@@ -169,3 +176,134 @@ def test_settings_failure_reverts_fields(page: SettingsPage, fake: FakeControlle
     assert page.labelsCard.lineEdit.text() == "gpu"
     fake.failed.emit("account", "401")
     assert "失败" in page.accountCard.contentLabel.text()
+
+
+# --- M3: startup & tray, personalization, poll interval -------------------------------------
+
+
+def test_m3_cards_show_current_values(page: SettingsPage, fake: FakeController) -> None:
+    assert page.pollCard.value() == 30
+    assert [page.pollCard.comboBox.itemData(i) for i in range(page.pollCard.comboBox.count())] == [
+        15,
+        30,
+        60,
+        120,
+        300,
+    ]
+    assert page.notifyCard.value() == "failed"
+    assert page.notifyCard.comboBox.currentText() == "仅失败"
+    assert page.themeCard.value() == "auto"
+    assert page.themeCard.comboBox.currentText() == "跟随系统"
+    assert not page.launchCard.isChecked()
+    assert not page.startMinimizedCard.isChecked()
+    assert page.closeToTrayCard.isChecked()
+    assert not _saved(fake)  # showing values never saves
+
+
+def test_combo_cards_save(page: SettingsPage, fake: FakeController) -> None:
+    page.pollCard.select(120)
+    page.notifyCard.select("all")
+    page.themeCard.select("dark")
+    page.themeCard.select("dark")  # unchanged: no save
+    saved = _saved(fake)
+    assert [s.poll_interval_s for s in saved] == [120, 120, 120]
+    assert [s.notify_jobs for s in saved] == ["failed", "all", "all"]
+    assert saved[-1].theme == "dark"
+    assert page.themeCard.comboBox.currentText() == "深色"
+
+
+def test_odd_poll_interval_is_kept(qtbot: QtBot) -> None:
+    fake = FakeController(AppConfig(account="octocat", settings=AppSettings(poll_interval_s=45)))
+    page = SettingsPage(fake)
+    qtbot.addWidget(page)
+    assert page.pollCard.value() == 45
+    assert page.pollCard.comboBox.currentText() == "45 秒"
+    page.pollCard.select(15)
+    assert _saved(fake)[-1].poll_interval_s == 15
+    assert page.pollCard.comboBox.findData(45) == -1  # a hand-edited value goes once replaced
+
+
+def test_tray_switches_save(page: SettingsPage, fake: FakeController) -> None:
+    page.startMinimizedCard.switchButton.setChecked(True)
+    page.closeToTrayCard.switchButton.setChecked(False)
+    saved = _saved(fake)
+    assert [(s.start_minimized, s.close_to_tray) for s in saved] == [(True, True), (True, False)]
+    fake.config_changed.emit(fake.config)  # refresh sets the same values: nothing saved
+    assert len(_saved(fake)) == 2
+
+
+def test_launch_on_login_card(page: SettingsPage, fake: FakeController) -> None:
+    page.show()
+    assert fake.calls_of("load_autostart_state") == [((), {})]
+    assert page.launchCard.isEnabled()
+    page.launchCard.switchButton.setChecked(True)
+    assert fake.calls_of("set_launch_on_login") == [((True,), {})]
+    assert page.launchCard.isChecked()
+    assert page.launchCard.contentLabel.text() == LAUNCH_ON_TEXT  # fake answers registered
+    assert not _saved(fake)  # the controller saves launch_on_login itself
+
+    fake.autostart_state_loaded.emit(
+        AutostartState(
+            supported=True, registered=True, command="x", expected="x", disabled_by_user=True
+        )
+    )
+    assert page.launchCard.contentLabel.text() == LAUNCH_DISABLED_TEXT
+    assert "任务管理器" in LAUNCH_DISABLED_TEXT
+    fake.autostart_state_loaded.emit(
+        AutostartState(supported=True, registered=True, command="old", expected="new")
+    )
+    assert page.launchCard.contentLabel.text() == LAUNCH_MISMATCH_TEXT
+    fake.autostart_state_loaded.emit(AutostartState(supported=True, registered=False))
+    assert not page.launchCard.isChecked()
+    assert len(fake.calls_of("set_launch_on_login")) == 1  # programmatic updates do not call
+
+    fake.failed.emit("launch_on_login", "拒绝访问")
+    assert len(fake.calls_of("load_autostart_state")) == 2
+    assert not page.launchCard.isChecked()
+
+
+def test_launch_on_login_unsupported(qtbot: QtBot, fake: FakeController) -> None:
+    fake.autostart_supported = False
+    page = SettingsPage(fake)
+    qtbot.addWidget(page)
+    page.show()
+    assert not fake.calls_of("load_autostart_state")
+    assert not page.launchCard.isEnabled()
+    assert page.launchCard.contentLabel.text() == "只支持 Windows"
+
+    fake.autostart_supported = True
+    fake.autostart_state_loaded.emit(AutostartState(supported=False))
+    assert not page.launchCard.isEnabled()
+
+
+@pytest.mark.parametrize(
+    ("state", "text"),
+    [
+        (AutostartState(supported=False), "只支持 Windows"),
+        (AutostartState(supported=True), LAUNCH_TEXT),
+        (
+            AutostartState(supported=True, registered=True, command="a", expected="A"),
+            LAUNCH_ON_TEXT,
+        ),
+    ],
+)
+def test_launch_text(state: AutostartState, text: str) -> None:
+    assert launch_text(state) == text
+
+
+def test_poll_options() -> None:
+    assert poll_options(30) == [
+        (15, "15 秒"),
+        (30, "30 秒"),
+        (60, "60 秒"),
+        (120, "120 秒"),
+        (300, "300 秒"),
+    ]
+    assert poll_options(7)[0] == (7, "7 秒")
+
+
+def test_switch_cards_use_chinese_labels(page: SettingsPage) -> None:
+    assert page.closeToTrayCard.switchButton.getText() == "开"
+    assert page.startMinimizedCard.switchButton.getText() == "关"
+    page.startMinimizedCard.switchButton.setChecked(True)
+    assert page.startMinimizedCard.switchButton.getText() == "开"

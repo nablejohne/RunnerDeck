@@ -2,8 +2,9 @@
 
 `isolated_home` / `MemoryKeyring` are copies of the core fixtures (tests must not import
 tests.core). The fakes are duck-typed stand-ins for RunnerManager, RunnerProcess and
-GitHubClient: they record calls, can be told to raise, and FakeProcess can deliver the
-callbacks it was given from a non-main thread, as the real RunnerProcess does.
+GitHubClient (plus the controller's autostart / diag operations, docs/m3-design.md §4): they
+record calls, can be told to raise, and FakeProcess can deliver the callbacks it was given from
+a non-main thread, as the real RunnerProcess does. FakeClock is the controller's UTC clock.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,13 +32,16 @@ from runnerdeck.core.manager import (
 )
 from runnerdeck.core.models import (
     AppConfig,
+    AutostartState,
+    DiagLog,
+    Discovery,
     GitHubUser,
     LocalState,
     RemoteStatus,
     Repo,
     RunnerRecord,
 )
-from runnerdeck.core.process import Launch, StopMethod, StopResult
+from runnerdeck.core.process import ExternalStop, Launch, StopMethod, StopResult
 from runnerdeck.core.status import LocalSnapshot, RemoteSnapshot, merge_status
 from runnerdeck.core.store import ConfigStore
 
@@ -46,6 +50,7 @@ FAKE_PAT = "github_pat_" + "0FAKE0" * 10  # right shape, obviously not real
 OTHER_PAT = "ghp_" + "FAKE0000" * 5
 NOW = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
 WAIT_MS = 5000
+AUTOSTART_COMMAND = '"C:\\RunnerDeck\\RunnerDeck.exe" --autostart'
 
 
 # --- core fixture copies ----------------------------------------------------------------------
@@ -238,6 +243,7 @@ class FakeProcess:
         self.last_stop_forced = False
         self.stopped_at: datetime | None = None
         self.last_error: str | None = None
+        self.signal_error: Exception | None = None
 
     # RunnerProcess API ------------------------------------------------------------------------
 
@@ -282,6 +288,14 @@ class FakeProcess:
             self._publish(LocalState.STOPPED, None)
         return self.stop_result
 
+    def signal_stop(self) -> bool:
+        """Records the call; True while running (the runner exits later, on its own)."""
+        self.calls.append("signal_stop")
+        self.threads.append(threading.current_thread())
+        if self.signal_error is not None:
+            raise self.signal_error
+        return self._running
+
     # test drivers ----------------------------------------------------------------------------
 
     def _publish(self, state: LocalState, job: str | None) -> None:
@@ -306,17 +320,35 @@ class FakeProcess:
 
 
 def status_row(
-    record: RunnerRecord, state: LocalState = LocalState.STOPPED, *, remote_error: str | None = None
+    record: RunnerRecord,
+    state: LocalState = LocalState.STOPPED,
+    *,
+    remote_error: str | None = None,
+    remote: RemoteStatus | None = None,
+    busy: bool = False,
+    fetched_at: datetime | None = None,
+    external: bool = False,
+    stopped_at: datetime | None = None,
+    forced: bool = False,
 ) -> RunnerStatusRow:
+    """A row as manager.statuses returns it. remote: default OFFLINE (UNKNOWN with an error);
+    pass RemoteStatus.UNKNOWN without an error for a `remote=False` row."""
     local = LocalSnapshot(
-        state=state, running=state is not LocalState.STOPPED, external=False, state_since=NOW
+        state=state,
+        running=state is not LocalState.STOPPED,
+        external=external,
+        state_since=NOW,
+        last_stop_forced=forced,
+        stopped_at=stopped_at,
     )
-    remote = RemoteSnapshot(RemoteStatus.UNKNOWN if remote_error else RemoteStatus.OFFLINE)
+    if remote is None:
+        remote = RemoteStatus.UNKNOWN if remote_error else RemoteStatus.OFFLINE
+    snapshot = RemoteSnapshot(remote, busy=busy, fetched_at=fetched_at)
     return RunnerStatusRow(
         record=record,
-        display=merge_status(local, remote, now=NOW),
+        display=merge_status(local, snapshot, now=NOW),
         local=local,
-        remote=remote,
+        remote=snapshot,
         remote_error=remote_error,
     )
 
@@ -333,7 +365,13 @@ class FakeManager:
         self.processes: dict[str, FakeProcess] = {}
         self.rows: list[RunnerStatusRow] = []
         self.statuses_seen: list[Mapping[str, Any]] = []
+        self.block_statuses: threading.Event | None = None  # holds statuses() until set
         self.next_record: RunnerRecord | None = None
+        self.discovery = Discovery(root=Path("/runners"))
+        self.external_result = ExternalStop(killed=[101, 102], survivors=[])
+        self.stray_result = ExternalStop(killed=[201], survivors=[])
+        self.services: set[Path] = set()
+        self.stop_marks: list[tuple[Path, bool]] = []  # (runner_dir, forced) per record_stop
 
     def _call(self, method: str, **kw: Any) -> None:
         self.calls.append((method, kw))
@@ -366,11 +404,13 @@ class FakeManager:
             runner_env=tuple((runner_env or {}).items()),
         )
 
-    def add_runner(self, plan: AddPlan, *, progress: Any = None) -> RunnerRecord:
+    def add_runner(
+        self, plan: AddPlan, *, auto_start: bool = False, progress: Any = None
+    ) -> RunnerRecord:
         if progress is not None:
             progress(Step.RELEASE, "查询 runner 版本")
             progress(Step.DOWNLOAD, "下载 50%")
-        self._call("add_runner", plan=plan)
+        self._call("add_runner", plan=plan, auto_start=auto_start)
         record = self.next_record or RunnerRecord(
             owner=plan.owner,
             repo=plan.repo,
@@ -378,6 +418,7 @@ class FakeManager:
             labels=list(plan.labels),
             path=str(plan.target_dir),
             github_runner_id=7,
+            auto_start=auto_start,
         )
         config = self.store.load()
         config.upsert(record)
@@ -407,10 +448,68 @@ class FakeManager:
             record=record, remote=RemoteRemoval.UNCONFIGURED, runner_id=None, dir_removed=True
         )
 
-    def statuses(self, processes: Mapping[str, Any] | None = None) -> list[RunnerStatusRow]:
+    def statuses(
+        self, processes: Mapping[str, Any] | None = None, *, remote: bool = True
+    ) -> list[RunnerStatusRow]:
         self.statuses_seen.append(dict(processes or {}))
-        self._call("statuses")
+        if self.block_statuses is not None:
+            assert self.block_statuses.wait(5)
+        self._call("statuses", remote=remote)
         return list(self.rows)
+
+    def import_runner(self, path: Any, *, auto_start: bool = False) -> RunnerRecord:
+        self._call("import_runner", path=path, auto_start=auto_start)
+        record = self.next_record or RunnerRecord(
+            owner=OWNER,
+            repo="imported",
+            name="box-imported",
+            path=str(path),
+            github_runner_id=9,
+            auto_start=auto_start,
+        )
+        config = self.store.load()
+        config.upsert(record)
+        self.store.save(config)
+        return record
+
+    def set_auto_start(self, record_id: str, enabled: bool) -> RunnerRecord:
+        self._call("set_auto_start", record_id=record_id, enabled=enabled)
+        config = self.store.load()
+        record = config.get(record_id)
+        assert record is not None, record_id
+        updated = record.model_copy(update={"auto_start": enabled})
+        config.upsert(updated)
+        self.store.save(config)
+        return updated
+
+    def forget_runner(self, record_id: str) -> RunnerRecord:
+        self._call("forget_runner", record_id=record_id)
+        config = self.store.load()
+        record = config.remove(record_id)
+        assert record is not None, record_id
+        self.store.save(config)
+        return record
+
+    def discover(self) -> Discovery:
+        self._call("discover")
+        return self.discovery
+
+    def is_service(self, runner_dir: Path) -> bool:
+        return Path(runner_dir) in self.services
+
+    def kill_external(self, record_id: str) -> ExternalStop:
+        self._call("kill_external", record_id=record_id)
+        return self.external_result
+
+    def kill_stray(self, path: Any) -> ExternalStop:
+        self._call("kill_stray", path=path)
+        return self.stray_result
+
+    def record_stop(self, runner_dir: Path, *, forced: bool, at: datetime | None = None) -> None:
+        """Never raises (like the real one); the call is still recorded with its thread."""
+        self.calls.append(("record_stop", {"runner_dir": Path(runner_dir), "forced": forced}))
+        self.threads.append(threading.current_thread())
+        self.stop_marks.append((Path(runner_dir), forced))
 
     def process_for(
         self,
@@ -434,6 +533,89 @@ class FakeManager:
         return proc
 
 
+class FakeAutostart:
+    """AutostartOps stand-in: an in-memory Run entry, never the real registry."""
+
+    def __init__(self, *, supported: bool = True) -> None:
+        self.supported = supported
+        self.registered = False
+        self.error: Exception | None = None
+        self.calls: list[tuple[Any, ...]] = []
+        self.threads: list[threading.Thread] = []
+
+    def _call(self, *call: Any) -> None:
+        self.calls.append(call)
+        self.threads.append(threading.current_thread())
+        if self.error is not None:
+            raise self.error
+
+    def _state(self) -> AutostartState:
+        return AutostartState(
+            supported=self.supported,
+            registered=self.registered,
+            command=AUTOSTART_COMMAND if self.registered else None,
+            expected=AUTOSTART_COMMAND if self.supported else None,
+        )
+
+    def state(self) -> AutostartState:
+        self._call("state")
+        return self._state()
+
+    def enable(self) -> AutostartState:
+        self._call("enable")
+        self.registered = True
+        return self._state()
+
+    def disable(self) -> AutostartState:
+        self._call("disable")
+        self.registered = False
+        return self._state()
+
+    def reconcile(self, wanted: bool) -> AutostartState:
+        self._call("reconcile", wanted)
+        if self.supported:
+            self.registered = wanted
+        return self._state()
+
+
+class FakeDiag:
+    """DiagOps stand-in: `logs` is what list_logs returns, `texts[path]` what read_tail does."""
+
+    def __init__(self) -> None:
+        self.logs: list[DiagLog] = []
+        self.texts: dict[Path, str] = {}
+        self.error: Exception | None = None
+        self.calls: list[tuple[str, Path]] = []
+        self.threads: list[threading.Thread] = []
+
+    def _call(self, name: str, path: Path) -> None:
+        self.calls.append((name, path))
+        self.threads.append(threading.current_thread())
+        if self.error is not None:
+            raise self.error
+
+    def list_logs(self, runner_dir: Path) -> list[DiagLog]:
+        self._call("list_logs", runner_dir)
+        return list(self.logs)
+
+    def read_tail(self, path: Path) -> str:
+        self._call("read_tail", path)
+        return self.texts.get(path, "")
+
+
+class FakeClock:
+    """The controller's UTC clock: fixed at NOW until a test advances it."""
+
+    def __init__(self, now: datetime = NOW) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
 # --- controller harness --------------------------------------------------------------------
 
 
@@ -446,6 +628,9 @@ class Harness:
     keyring: MemoryKeyring
     environ: dict[str, str]
     opened: list[QUrl]
+    autostart: FakeAutostart
+    diag: FakeDiag
+    clock: FakeClock
 
     def process(self, record_id: str) -> FakeProcess:
         return self.manager.processes[record_id]
@@ -455,7 +640,11 @@ class Harness:
 def make_controller(
     isolated_home: Path, memory_keyring: MemoryKeyring, pool: QThreadPool
 ) -> Iterator[Any]:
-    """Factory: make_controller(records=[...], account=..., environ={...}) -> Harness."""
+    """Factory: make_controller(records=[...], account=..., environ={...}) -> Harness.
+
+    The controller's clock is a FakeClock fixed at NOW (the fakes' timestamps), so merged
+    displays only change when a test advances it.
+    """
     harnesses: list[Harness] = []
 
     def factory(
@@ -465,9 +654,13 @@ def make_controller(
         environ: dict[str, str] | None = None,
         launch: Launch = Launch.HELPER,
         open_ok: bool = True,
+        autostart_supported: bool = True,
+        settings: Any = None,
     ) -> Harness:
         store = ConfigStore()
         config = AppConfig(account=account, runners=list(records))
+        if settings is not None:
+            config.settings = settings
         store.save(config)
         clients = FakeClientFactory()
         env = {} if environ is None else environ
@@ -483,6 +676,9 @@ def make_controller(
             opened.append(url)
             return open_ok
 
+        autostart = FakeAutostart(supported=autostart_supported)
+        diag = FakeDiag()
+        clock = FakeClock()
         controller = RunnerController(
             store=store,
             manager_factory=manager_factory,
@@ -491,13 +687,29 @@ def make_controller(
             launch=launch,
             client_factory=clients,
             open_url=open_url,
+            autostart=autostart,
+            diag=diag,
+            clock=clock,
         )
-        harness = Harness(controller, managers[0], clients, store, memory_keyring, env, opened)
+        harness = Harness(
+            controller,
+            managers[0],
+            clients,
+            store,
+            memory_keyring,
+            env,
+            opened,
+            autostart,
+            diag,
+            clock,
+        )
         harnesses.append(harness)
         return harness
 
     yield factory
     for harness in harnesses:
+        if harness.manager.block_statuses is not None:
+            harness.manager.block_statuses.set()
         for proc in harness.manager.processes.values():
             for event in (proc.block_start, proc.block_stop):
                 if event is not None:

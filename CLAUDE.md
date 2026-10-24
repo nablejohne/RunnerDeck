@@ -9,7 +9,7 @@ Windows 托盘应用：管理多个仓库级 GitHub Actions self-hosted runner�
 
 ## 常用命令
 - 安装依赖：uv sync
-- 运行：uv run python -m runnerdeck（`--version` 打印版本；`--smoke-test` 离屏建窗口并切换三个页面后退出，打包产物自检用）
+- 运行：uv run python -m runnerdeck（`--version` 打印版本；`--autostart` 只在托盘启动、不显示窗口，开机自启写进 HKCU Run 键的就是它；`--smoke-test` 离屏建窗口和托盘、切换各页面（含详情页）后退出，打包产物自检用）
 - 调试 CLI：uv run runnerdeck-cli --help（或 uv run python -m runnerdeck.core.cli --help）
 - 控制台 helper：uv run runnerdeck-helper <runner_dir>（GUI 启动 runner 时自动调用，给 run.cmd 一个隐藏控制台以便 Ctrl+Break 优雅停止；手动运行只用于排障，stdin 输入 `stop` 回车即停）
 - 测试：uv run pytest

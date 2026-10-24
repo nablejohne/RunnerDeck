@@ -1,11 +1,17 @@
 """Merge local process state with the GitHub runner list into one dashboard status.
 
-Pure functions, no IO: used by the CLI `status` command now and by the M3 Poller later.
-Rules follow docs/m1-design.md §9 (PLAN status table + spike §5 corrections):
+Pure functions, no IO: used by the CLI `status` command and the GUI controller (live re-merge,
+dashboard counters, tray colour).
+Rules follow docs/m1-design.md §9 (PLAN status table + spike §5 corrections), revised in
+docs/m3-design.md §2:
 - A hard kill leaves the GitHub session alive for ~3-3.5 min, so "online but not ours" right
   after a forced stop is SESSION_LINGERING, not EXTERNAL.
 - GitHub's `status` turns offline long before that session expires, so offline never means
   "safe to restart".
+- After a graceful stop GitHub still reports online for 11-70 s (spike §10), so a fresh graceful
+  stop with GitHub online is STOPPED, not EXTERNAL.
+- A remote snapshot fetched before the current local state began says nothing about that state,
+  so a running process then shows its local state as-is.
 
 All datetimes must be timezone-aware (UTC recommended); mixing naive and aware raises TypeError.
 """
@@ -13,9 +19,10 @@ All datetimes must be timezone-aware (UTC recommended); mixing naive and aware r
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from types import MappingProxyType
 
 from runnerdeck.core.models import (
@@ -28,6 +35,7 @@ from runnerdeck.core.models import (
 
 STALL_AFTER_S = 60  # running locally but GitHub still offline beyond this -> STALLED
 SESSION_LINGER_S = 240  # after a forced stop GitHub may stay online this long (spike §5)
+OFFLINE_LAG_S = 90  # after a graceful stop GitHub may still say online this long (spike §10)
 
 # The complete, final set of dashboard labels. BUSY gets "：<job>" appended when the job is known.
 LABELS: Mapping[DisplayState, str] = MappingProxyType(
@@ -59,6 +67,7 @@ DETAIL_EXTERNAL_LOCAL = (
 DETAIL_EXTERNAL_REMOTE = (
     "GitHub 显示在线，但本应用没有运行它（可能是服务或其他电脑上的同名 runner）"
 )
+DETAIL_OFFLINE_LAG = "已优雅停止，GitHub 端还显示在线（通常 1 分钟内更新）"
 
 # Local states that can be shown as-is while the process runs and GitHub gives no signal.
 _RUNNING_PASSTHROUGH: Mapping[LocalState, DisplayState] = MappingProxyType(
@@ -146,13 +155,24 @@ def merge_status(
     # 2. Local transitions / failures that GitHub cannot contradict.
     if local.state is LocalState.STOPPING:
         return _status(DisplayState.STOPPING)
-    if local.state is LocalState.ERROR:
+    if local.state is LocalState.ERROR and not local.external:
+        # Our run failed. Once someone else runs the directory, rule 4 shows EXTERNAL instead,
+        # so take-over / kill are offered rather than a start that cannot succeed.
         return _status(DisplayState.ERROR, local.last_error)
 
     # 3. Our process is running.
     if local.running:
         if local.state is LocalState.RECONNECTING:
             return _status(DisplayState.RECONNECTING, DETAIL_RECONNECTING)
+        if (
+            remote is not None
+            and remote_status in (RemoteStatus.ONLINE, RemoteStatus.OFFLINE)
+            and remote.fetched_at is not None
+            and remote.fetched_at < local.state_since
+        ):
+            # Fetched before this local state began: it neither confirms nor contradicts it.
+            shown = _RUNNING_PASSTHROUGH.get(local.state, DisplayState.STARTING)
+            return _status(shown, job=local.current_job)
         if remote_status is RemoteStatus.ONLINE:
             # GitHub's busy flag lags the stdout; trust local BUSY until the next poll agrees.
             if remote_busy or local.state is LocalState.BUSY:
@@ -170,21 +190,94 @@ def merge_status(
     # 4. Our process is not running.
     if local.external:
         return _status(DisplayState.EXTERNAL, DETAIL_EXTERNAL_LOCAL)
+    if remote_status is RemoteStatus.ONLINE and local.stopped_at is not None:
+        # Judge by when GitHub said "online", not by now: a snapshot taken shortly after the
+        # stop stays the latest one until the next poll (up to poll_interval_s, i.e. minutes).
+        seen = remote.fetched_at if remote is not None and remote.fetched_at else now
+        seen_after_stop_s = _elapsed_s(local.stopped_at, seen)
+        if not local.last_stop_forced and seen_after_stop_s < OFFLINE_LAG_S:
+            # The session is already released; GitHub's flag just lags behind.
+            return _status(DisplayState.STOPPED, DETAIL_OFFLINE_LAG)
+        if local.last_stop_forced and seen_after_stop_s < SESSION_LINGER_S:
+            # ceil so 239.5 s elapsed never reads "0 秒"; clamp against clock skew and against
+            # an old snapshot outliving the session.
+            left = math.ceil(SESSION_LINGER_S - _elapsed_s(local.stopped_at, now))
+            remaining = max(1, min(SESSION_LINGER_S, left))
+            return _status(
+                DisplayState.SESSION_LINGERING,
+                f"强制停止后 GitHub 端旧会话尚未过期（最多约 {remaining} 秒）；"
+                "现在重新启动会先显示“等待旧会话过期”",
+            )
     if remote_status is RemoteStatus.ONLINE:
-        if local.last_stop_forced and local.stopped_at is not None:
-            elapsed = _elapsed_s(local.stopped_at, now)
-            if elapsed < SESSION_LINGER_S:
-                # ceil so 239.5 s elapsed never reads "0 秒"; clamp against clock skew.
-                remaining = min(SESSION_LINGER_S, math.ceil(SESSION_LINGER_S - elapsed))
-                return _status(
-                    DisplayState.SESSION_LINGERING,
-                    f"强制停止后 GitHub 端旧会话尚未过期（最多约 {remaining} 秒）；"
-                    "现在重新启动会先显示“等待旧会话过期”",
-                )
         return _status(DisplayState.EXTERNAL, DETAIL_EXTERNAL_REMOTE)
     if remote_status is RemoteStatus.OFFLINE:
         return _status(DisplayState.STOPPED)
     return _status(DisplayState.STOPPED, DETAIL_REMOTE_UNKNOWN)
+
+
+# --- grouping (dashboard counters, tray colour) ------------------------------------------
+
+
+class Bucket(StrEnum):
+    """Coarse group of a DisplayState, shared by the dashboard counters and the tray icon."""
+
+    RUNNING = "running"
+    IDLE = "idle"
+    TROUBLE = "trouble"
+    STOPPED = "stopped"
+
+
+_BUCKETS: Mapping[DisplayState, Bucket] = MappingProxyType(
+    {
+        DisplayState.IDLE: Bucket.IDLE,
+        DisplayState.BUSY: Bucket.RUNNING,
+        DisplayState.STARTING: Bucket.RUNNING,
+        DisplayState.CONNECTING: Bucket.RUNNING,
+        DisplayState.RECONNECTING: Bucket.RUNNING,
+        DisplayState.STOPPING: Bucket.RUNNING,
+        DisplayState.STALLED: Bucket.TROUBLE,
+        DisplayState.ERROR: Bucket.TROUBLE,
+        DisplayState.MISSING: Bucket.TROUBLE,
+        DisplayState.EXTERNAL: Bucket.TROUBLE,
+        DisplayState.STOPPED: Bucket.STOPPED,
+        DisplayState.UNKNOWN: Bucket.STOPPED,
+        DisplayState.SESSION_LINGERING: Bucket.STOPPED,
+    }
+)
+
+
+def bucket(state: DisplayState) -> Bucket:
+    return _BUCKETS[state]
+
+
+class TrayLevel(StrEnum):
+    """Tray icon colour: grey / green / blue / red."""
+
+    STOPPED = "stopped"
+    ONLINE = "online"
+    BUSY = "busy"
+    ERROR = "error"
+
+
+def tray_level(states: Iterable[DisplayState]) -> TrayLevel:
+    """Any trouble -> ERROR, else any BUSY -> BUSY, else anything running -> ONLINE."""
+    shown = list(states)
+    groups = {bucket(s) for s in shown}
+    if Bucket.TROUBLE in groups:
+        return TrayLevel.ERROR
+    if DisplayState.BUSY in shown:
+        return TrayLevel.BUSY
+    if groups & {Bucket.RUNNING, Bucket.IDLE}:
+        return TrayLevel.ONLINE
+    return TrayLevel.STOPPED
+
+
+# Runner TaskResult values worth a "failed" notification; Canceled / Succeeded* / Skipped are not.
+JOB_FAILURE_RESULTS = frozenset({"failed", "abandoned"})
+
+
+def is_job_failure(result: str) -> bool:
+    return result.strip().casefold() in JOB_FAILURE_RESULTS
 
 
 def match_remote(record: RunnerRecord, remotes: Sequence[RemoteRunner]) -> RemoteRunner | None:

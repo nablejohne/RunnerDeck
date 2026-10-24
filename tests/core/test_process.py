@@ -2185,3 +2185,253 @@ def test_windows_helper_launch_restart_after_stop(tmp_path: Path, real_processes
     child = listener_pid(pid_file)
     assert proc.stop(timeout=15).graceful
     wait_until(lambda: not psutil.pid_exists(child), 10)
+
+
+# --- signal_stop (Windows logoff / shutdown: ask, never wait) ---------------------------------
+
+
+def test_signal_stop_when_not_running(runner_dir: Path, popen: FakePopen, rec: Recorder) -> None:
+    proc = make(runner_dir, popen, rec)
+    assert proc.signal_stop() is False
+    assert proc.state == S.STOPPED
+    assert rec.states == []
+
+
+def test_signal_stop_helper_asks_and_returns_at_once(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, helper_cmd: list[str]
+) -> None:
+    popen.helper_tail = None  # the helper takes its time: signal_stop must not wait for it
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT, launch=Launch.HELPER)
+    wait_until(lambda: proc.state == S.IDLE)
+    t0 = time.monotonic()
+    assert proc.signal_stop() is True
+    assert time.monotonic() - t0 < 1.0
+    stdin = popen.last.stdin
+    assert stdin is not None and stdin.writes == [b"stop\n"]
+    assert proc.state == S.STOPPING
+    assert proc.is_running()
+    assert win.called("kill_tree") == []  # never a hard kill
+    popen.last.finish(0, HELPER_STOP_TAIL)  # the runner exits cleanly later
+    assert proc.wait(5) == 0
+    assert proc.state == S.STOPPED
+    assert proc.last_error is None
+    assert proc.last_stop_forced is False
+    assert rec.states[-2:] == [(S.STOPPING, None), (S.STOPPED, None)]
+
+
+def test_signal_stop_makes_a_later_odd_exit_stopped_not_error(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
+) -> None:
+    win.console = True
+    win.ctrl_break_tail = None  # nothing happens until Windows ends the session
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT)
+    wait_until(lambda: proc.state == S.IDLE)
+    assert proc.signal_stop() is True
+    assert win.called("ctrl_break") == [popen.last.pid]
+    popen.last.finish(0xC000013A, b'"Exiting after unknown error code: 15"\r\n')
+    assert proc.wait(5) == 0xC000013A
+    assert proc.state == S.STOPPED
+    assert proc.last_error is None
+
+
+def test_signal_stop_keeps_stopping_while_output_continues(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
+) -> None:
+    win.console = True
+    win.ctrl_break_tail = None
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT)
+    wait_until(lambda: proc.state == S.IDLE)
+    assert proc.signal_stop()
+    popen.last.stdout.write(b"2026-10-22 08:09:53Z: Running job: late\r\n")
+    wait_until(lambda: proc.current_job == "late")
+    assert proc.state == S.STOPPING
+    popen.last.finish(0)
+    proc.wait(5)
+
+
+def test_signal_stop_without_console_changes_nothing(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
+) -> None:
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT)  # Launch.CONSOLE, win.console False
+    wait_until(lambda: proc.state == S.IDLE)
+    assert proc.signal_stop() is False
+    assert proc.state == S.IDLE
+    assert win.called("ctrl_break") == []
+    popen.last.finish(1)  # still an unexpected exit
+    proc.wait(5)
+    assert proc.state == S.ERROR
+
+
+def test_signal_stop_ctrl_break_failure(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
+) -> None:
+    win.console = True
+    win.ctrl_break_error = ProcessError("无法向进程组发送 Ctrl+Break")
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT)
+    wait_until(lambda: proc.state == S.IDLE)
+    assert proc.signal_stop() is False
+    assert proc.state == S.IDLE
+    proc.stop(timeout=0.1)  # falls back to the kill as before
+
+
+def test_signal_stop_helper_pipe_broken(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, helper_cmd: list[str]
+) -> None:
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT, launch=Launch.HELPER)
+    wait_until(lambda: proc.state == S.IDLE)
+    assert popen.last.stdin is not None
+    popen.last.stdin.broken = True
+    assert proc.signal_stop() is False
+    assert proc.state == S.IDLE
+    proc.stop(timeout=0.1)
+
+
+def test_signal_stop_twice_asks_once_and_stop_does_not_ask_again(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, helper_cmd: list[str]
+) -> None:
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT, launch=Launch.HELPER)
+    wait_until(lambda: proc.state == S.IDLE)
+    stdin = popen.last.stdin
+    assert stdin is not None
+    stdin.flush = lambda: None  # type: ignore[method-assign]  # helper never reacts
+    assert proc.signal_stop() is True
+    assert proc.signal_stop() is True
+    assert stdin.writes == [b"stop\n"]
+    result = proc.stop(timeout=0.2)  # waits for the request already sent, then kills
+    assert stdin.writes == [b"stop\n"]
+    assert result.graceful is False
+    assert win.called("kill_tree") == [popen.last.pid]
+    assert proc.state == S.STOPPED
+
+
+def test_stop_after_signal_stop_is_graceful_when_the_runner_exits(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, helper_cmd: list[str]
+) -> None:
+    popen.helper_tail = None  # exits only when the test says so
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT, launch=Launch.HELPER)
+    wait_until(lambda: proc.state == S.IDLE)
+    assert proc.signal_stop()
+    fake = popen.last
+    waiting = threading.Event()
+    real_wait = fake.wait
+
+    def wait(timeout: float | None = None) -> int:
+        waiting.set()  # first caller: stop(), after it saw the run still active
+        return real_wait(timeout)
+
+    fake.wait = wait  # type: ignore[method-assign]
+    results: list[StopResult] = []
+    stopper = threading.Thread(target=lambda: results.append(proc.stop(timeout=5)))
+    stopper.start()
+    assert waiting.wait(5)
+    fake.finish(0, HELPER_STOP_TAIL)
+    stopper.join(10)
+    assert results == [StopResult(True, StopMethod.CTRL_BREAK, 0, [])]
+    assert fake.stdin is not None and fake.stdin.writes == [b"stop\n"]  # not asked twice
+    assert win.called("kill_tree") == []
+
+
+def test_signal_stop_during_stop_does_not_block(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder
+) -> None:
+    win.console = True
+    win.ctrl_break_tail = None
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT)
+    wait_until(lambda: proc.state == S.IDLE)
+    stopper = threading.Thread(target=proc.stop, kwargs={"timeout": 1.0})
+    stopper.start()
+    wait_until(lambda: len(win.called("ctrl_break")) == 1)  # stop() is waiting now
+    t0 = time.monotonic()
+    assert proc.signal_stop() is True  # stop() holds the control lock; we never take it
+    assert time.monotonic() - t0 < 0.5
+    assert win.called("ctrl_break") == [popen.last.pid]  # not asked a second time
+    stopper.join(10)
+    assert proc.state == S.STOPPED
+
+
+def test_signal_stop_from_a_callback(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, helper_cmd: list[str]
+) -> None:
+    results: list[bool] = []
+    holder: list[RunnerProcess] = []
+
+    def on_state(state: LocalState, job: str | None) -> None:
+        if state is S.IDLE:
+            results.append(holder[0].signal_stop())
+
+    popen.data = IDLE_OUTPUT
+    proc = RunnerProcess(runner_dir, popen=popen, on_state=on_state, launch=Launch.HELPER)
+    holder.append(proc)
+    proc.start()
+    wait_until(lambda: results == [True])
+    assert proc.wait(5) == 0
+    assert proc.state == S.STOPPED
+
+
+def test_signal_stop_racing_the_exit(
+    runner_dir: Path, popen: FakePopen, win: FakeWin, rec: Recorder, monkeypatch: Any
+) -> None:
+    # The run ends between delivering the request and marking it: nothing is marked later.
+    win.console = True
+    win.ctrl_break_tail = None
+    proc = started(runner_dir, popen, rec, IDLE_OUTPUT)
+    wait_until(lambda: proc.state == S.IDLE)
+    fake = popen.last
+
+    def break_and_exit(pid: int) -> None:
+        fake.finish(0)
+        proc.wait(5)
+
+    monkeypatch.setattr(winproc, "send_ctrl_break", break_and_exit)
+    assert proc.signal_stop() is True
+    assert proc.state == S.STOPPED
+    assert not proc.is_running()
+
+
+@windows_only
+def test_windows_helper_signal_stop(tmp_path: Path, real_processes: Any) -> None:
+    runner_dir, pid_file = make_fake_runner_dir(tmp_path, "idle")
+    proc = RunnerProcess(runner_dir, launch=Launch.HELPER)
+    real_processes.append(proc)
+    proc.start()
+    wait_until(lambda: proc.state == S.IDLE, 30)
+    child = listener_pid(pid_file)
+    assert proc.signal_stop() is True
+    assert proc.wait(15) == 0
+    assert proc.state == S.STOPPED
+    assert proc.last_error is None
+    assert proc.last_stop_forced is False
+    wait_until(lambda: not psutil.pid_exists(child), 10)
+
+
+# --- scan_runner_processes (one pass for RunnerManager) -----------------------------------------
+
+
+class _IterProc:
+    def __init__(self, pid: int, name: str | None, exe: str | None) -> None:
+        self.pid = pid
+        self.info = {"name": name, "exe": exe}
+
+
+def test_scan_runner_processes_one_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+    procs = [
+        _IterProc(1, "Runner.Listener.exe", r"D:\runners\a\bin\Runner.Listener.exe"),
+        _IterProc(2, "runner.worker.exe", r"D:\runners\a\bin\Runner.Worker.exe"),
+        _IterProc(3, "Runner.PluginHost.exe", r"E:\elsewhere\bin\Runner.PluginHost.exe"),
+        _IterProc(4, "cmd.exe", r"C:\Windows\System32\cmd.exe"),
+        _IterProc(5, "Runner.Listener.exe", None),  # exe not readable (other user)
+        _IterProc(6, None, None),
+    ]
+
+    def process_iter(attrs: list[str]) -> list[_IterProc]:
+        calls.append(attrs)
+        return procs
+
+    monkeypatch.setattr(psutil, "process_iter", process_iter)
+    assert process_mod.scan_runner_processes() == [
+        process_mod.RunnerProcessInfo(1, r"D:\runners\a\bin\Runner.Listener.exe"),
+        process_mod.RunnerProcessInfo(2, r"D:\runners\a\bin\Runner.Worker.exe"),
+        process_mod.RunnerProcessInfo(3, r"E:\elsewhere\bin\Runner.PluginHost.exe"),
+    ]
+    assert calls == [["name", "exe"]]

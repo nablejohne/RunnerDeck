@@ -1,11 +1,14 @@
-"""Settings page: account, runner defaults, about (docs/m2-design.md §5).
+"""Settings page: account, runner defaults, startup & tray, theme, about.
 
-Every change is saved immediately through controller.save_settings; the page re-reads
-controller.config on config_changed. Theme / tray / autostart / polling come in M3.
+docs/m2-design.md §5 and docs/m3-design.md §5. Every change is saved immediately through
+controller.save_settings (launch-on-login through controller.set_launch_on_login, which also
+writes the registry); the page re-reads controller.config on config_changed. Cards never use
+qfluentwidgets' qconfig: the values live in AppSettings.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -14,6 +17,7 @@ from PyQt5.QtCore import Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import QFileDialog, QWidget
 from qfluentwidgets import (
+    ComboBox,
     ExpandLayout,
     HyperlinkCard,
     InfoBar,
@@ -25,6 +29,7 @@ from qfluentwidgets import (
     ScrollArea,
     SettingCard,
     SettingCardGroup,
+    SwitchSettingCard,
     TitleLabel,
 )
 from qfluentwidgets import FluentIcon as FIF
@@ -32,8 +37,9 @@ from qfluentwidgets import FluentIcon as FIF
 from runnerdeck import __version__
 from runnerdeck.core import paths
 from runnerdeck.core.account import TOKEN_KIND_LABELS, format_expiry
-from runnerdeck.core.models import AppSettings
+from runnerdeck.core.models import AppSettings, AutostartState
 from runnerdeck.ui.components.login_dialog import LoginDialog
+from runnerdeck.ui.theme import THEME_LABELS
 
 if TYPE_CHECKING:
     from runnerdeck.app.controller import RunnerController
@@ -43,6 +49,35 @@ REPO_URL = "https://github.com/nablejohne/RunnerDeck"
 PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
 NOT_LOGGED_IN = "未登录"
 PROXY_FORMAT_ERROR = "代理格式不对：应为 http://host:port、https://host:port 或 socks5://host:port"
+POLL_INTERVALS: tuple[int, ...] = (15, 30, 60, 120, 300)
+NOTIFY_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("all", "全部"),
+    ("failed", "仅失败"),
+    ("off", "关闭"),
+)
+LAUNCH_TEXT = "登录 Windows 后自动在托盘启动 RunnerDeck（并拉起设为随 RunnerDeck 启动的 runner）"
+LAUNCH_ON_TEXT = "已开启：登录 Windows 后自动在托盘启动 RunnerDeck"
+LAUNCH_DISABLED_TEXT = "已在任务管理器中禁用，请在任务管理器的‘启动’页启用"
+LAUNCH_MISMATCH_TEXT = "已开启，但启动项指向别的位置（程序被移动过？）；关掉再打开即可更新"
+LAUNCH_UNSUPPORTED_TEXT = "只支持 Windows"
+
+
+def poll_options(current: int) -> list[tuple[int, str]]:
+    """Poll interval choices; a hand-edited value outside the list is kept as an extra one."""
+    values = sorted({*POLL_INTERVALS, current})
+    return [(value, f"{value} 秒") for value in values]
+
+
+def launch_text(state: AutostartState) -> str:
+    if not state.supported:
+        return LAUNCH_UNSUPPORTED_TEXT
+    if not state.registered:
+        return LAUNCH_TEXT
+    if state.disabled_by_user:
+        return LAUNCH_DISABLED_TEXT
+    if not state.matches:
+        return LAUNCH_MISMATCH_TEXT
+    return LAUNCH_ON_TEXT
 
 
 def validate_proxy(text: str) -> str | None:
@@ -91,6 +126,78 @@ class LineEditSettingCard(SettingCard):
         self.committed.emit(value)
 
 
+class SwitchCard(SwitchSettingCard):
+    """SwitchSettingCard without qconfig, labelled 开 / 关 (no Qt translator is installed)."""
+
+    def __init__(
+        self, icon: FIF, title: str, content: str | None, parent: QWidget | None = None
+    ) -> None:
+        super().__init__(icon, title, content, parent=parent)
+        self.setValue(False)
+
+    def setValue(self, isChecked: bool) -> None:  # noqa: N802, N803 (qfluentwidgets API)
+        super().setValue(isChecked)
+        self.switchButton.setText("开" if isChecked else "关")
+
+
+class ComboSettingCard(SettingCard):
+    """SettingCard with a ComboBox on the right (no qconfig); emits `selected(value)`."""
+
+    selected = pyqtSignal(object)
+
+    def __init__(
+        self,
+        icon: FIF,
+        title: str,
+        content: str | None,
+        options: Sequence[tuple[object, str]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(icon, title, content, parent)
+        self.comboBox = ComboBox(self)
+        self.comboBox.setMinimumWidth(160)
+        self.hBoxLayout.addWidget(self.comboBox, 0, Qt.AlignRight)
+        self.hBoxLayout.addSpacing(16)
+        self._syncing = False
+        self.set_options(options)
+        self.comboBox.currentIndexChanged.connect(self._on_index_changed)
+
+    def set_options(self, options: Sequence[tuple[object, str]]) -> None:
+        current = self.value()
+        self._syncing = True
+        try:
+            self.comboBox.clear()
+            for value, text in options:
+                self.comboBox.addItem(text, userData=value)
+        finally:
+            self._syncing = False
+        if current is not None:
+            self.set_value(current)
+
+    def set_value(self, value: object) -> None:
+        index = self.comboBox.findData(value)
+        if index < 0:
+            return
+        self._syncing = True
+        try:
+            self.comboBox.setCurrentIndex(index)
+        finally:
+            self._syncing = False
+
+    def value(self) -> object:
+        return self.comboBox.currentData()
+
+    def select(self, value: object) -> None:
+        """Pick `value` as if the user chose it (emits `selected` when it changes)."""
+        index = self.comboBox.findData(value)
+        if index >= 0:
+            self.comboBox.setCurrentIndex(index)
+
+    def _on_index_changed(self, index: int) -> None:
+        if not self._syncing and index >= 0:
+            self.selected.emit(self.comboBox.itemData(index))
+
+
 class SettingsPage(ScrollArea):
     """objectName "settings"."""
 
@@ -99,6 +206,8 @@ class SettingsPage(ScrollArea):
         self.setObjectName("settings")
         self._controller = controller
         self._account_loaded = False
+        self._autostart: AutostartState | None = None
+        self._syncing = False  # refresh() sets widgets; their change signals must not save
 
         self.scrollWidget = QWidget(self)
         self.expandLayout = ExpandLayout(self.scrollWidget)
@@ -134,9 +243,58 @@ class SettingsPage(ScrollArea):
             "http://127.0.0.1:7890",
             self.runnerGroup,
         )
+        self.pollCard = ComboSettingCard(
+            FIF.SYNC,
+            "轮询间隔",
+            "多久从 GitHub 拉取一次在线状态（本机进程状态是实时的）",
+            poll_options(controller.config.settings.poll_interval_s),
+            self.runnerGroup,
+        )
         self.runnerGroup.addSettingCard(self.rootCard)
         self.runnerGroup.addSettingCard(self.labelsCard)
         self.runnerGroup.addSettingCard(self.proxyCard)
+        self.runnerGroup.addSettingCard(self.pollCard)
+
+        # startup & tray
+        self.startupGroup = SettingCardGroup("启动与托盘", self.scrollWidget)
+        self.launchCard = SwitchCard(FIF.POWER_BUTTON, "开机自启", LAUNCH_TEXT, self.startupGroup)
+        self.startMinimizedCard = SwitchCard(
+            FIF.MINIMIZE,
+            "启动时最小化到托盘",
+            "手动启动时也不显示窗口，只在托盘（开机自启时总是只在托盘）",
+            self.startupGroup,
+        )
+        self.closeToTrayCard = SwitchCard(
+            FIF.HIDE,
+            "关闭窗口时最小化到托盘",
+            "关闭窗口后 runner 继续运行；要退出请用托盘菜单的“退出”",
+            self.startupGroup,
+        )
+        self.notifyCard = ComboSettingCard(
+            FIF.RINGER,
+            "job 通知",
+            "job 结束时在托盘弹出通知",
+            NOTIFY_OPTIONS,
+            self.startupGroup,
+        )
+        for card in (
+            self.launchCard,
+            self.startMinimizedCard,
+            self.closeToTrayCard,
+            self.notifyCard,
+        ):
+            self.startupGroup.addSettingCard(card)
+
+        # personalization
+        self.personalGroup = SettingCardGroup("个性化", self.scrollWidget)
+        self.themeCard = ComboSettingCard(
+            FIF.BRUSH,
+            "主题",
+            "界面的浅色 / 深色外观",
+            list(THEME_LABELS.items()),
+            self.personalGroup,
+        )
+        self.personalGroup.addSettingCard(self.themeCard)
 
         # about
         self.aboutGroup = SettingCardGroup("关于", self.scrollWidget)
@@ -160,12 +318,23 @@ class SettingsPage(ScrollArea):
         self.rootCard.clicked.connect(self.choose_root)
         self.labelsCard.committed.connect(self._on_labels_committed)
         self.proxyCard.committed.connect(self._on_proxy_committed)
+        self.pollCard.selected.connect(lambda value: self._save(poll_interval_s=value))
+        self.launchCard.checkedChanged.connect(self._on_launch_switched)
+        self.startMinimizedCard.checkedChanged.connect(
+            lambda checked: self._save_switch(start_minimized=checked)
+        )
+        self.closeToTrayCard.checkedChanged.connect(
+            lambda checked: self._save_switch(close_to_tray=checked)
+        )
+        self.notifyCard.selected.connect(lambda value: self._save(notify_jobs=value))
+        self.themeCard.selected.connect(lambda value: self._save(theme=value))
         self.logCard.clicked.connect(self.open_log_dir)
 
         controller.config_changed.connect(self.refresh)
         controller.account_loaded.connect(self._on_account_loaded)
         controller.logged_in.connect(self._on_logged_in)
         controller.logged_out.connect(self._on_logged_out)
+        controller.autostart_state_loaded.connect(self._on_autostart_state_loaded)
         controller.failed.connect(self._on_failed)
 
         self.refresh()
@@ -180,7 +349,13 @@ class SettingsPage(ScrollArea):
         self.titleLabel.move(36, 30)
         self.expandLayout.setSpacing(28)
         self.expandLayout.setContentsMargins(36, 10, 36, 0)
-        for group in (self.accountGroup, self.runnerGroup, self.aboutGroup):
+        for group in (
+            self.accountGroup,
+            self.runnerGroup,
+            self.startupGroup,
+            self.personalGroup,
+            self.aboutGroup,
+        ):
             self.expandLayout.addWidget(group)
 
     # --- data -------------------------------------------------------------------------
@@ -194,6 +369,17 @@ class SettingsPage(ScrollArea):
         self.rootCard.setContent(settings.runners_root)
         self.labelsCard.set_value(", ".join(settings.default_labels))
         self.proxyCard.set_value(settings.proxy or "")
+        self.pollCard.set_options(poll_options(settings.poll_interval_s))
+        self.pollCard.set_value(settings.poll_interval_s)
+        self.notifyCard.set_value(settings.notify_jobs)
+        self.themeCard.set_value(settings.theme)
+        self._syncing = True
+        try:
+            self.startMinimizedCard.setChecked(settings.start_minimized)
+            self.closeToTrayCard.setChecked(settings.close_to_tray)
+        finally:
+            self._syncing = False
+        self._refresh_launch_card()
         if not self._controller.is_logged_in:
             self.accountCard.setTitle(NOT_LOGGED_IN)
             self.accountCard.setContent("点击“更换 PAT”登录")
@@ -208,9 +394,44 @@ class SettingsPage(ScrollArea):
         super().showEvent(event)  # type: ignore[arg-type]
         if self._controller.is_logged_in and not self._account_loaded:
             self._controller.load_account()
+        if self._controller.autostart_supported:
+            self._controller.load_autostart_state()  # the user may have changed it elsewhere
 
     def _save(self, **changes: object) -> None:
-        self._controller.save_settings(self.settings.model_copy(update=changes))
+        if any(getattr(self.settings, key) != value for key, value in changes.items()):
+            self._controller.save_settings(self.settings.model_copy(update=changes))
+
+    def _save_switch(self, **changes: object) -> None:
+        if not self._syncing:
+            self._save(**changes)
+
+    # --- launch on login ----------------------------------------------------------------
+
+    def _refresh_launch_card(self) -> None:
+        supported = bool(self._controller.autostart_supported)
+        state = self._autostart
+        if not supported or (state is not None and not state.supported):
+            checked, text, enabled = False, LAUNCH_UNSUPPORTED_TEXT, False
+        elif state is None:
+            checked, text, enabled = self.settings.launch_on_login, LAUNCH_TEXT, True
+        else:
+            checked, text, enabled = state.registered, launch_text(state), True
+        self._syncing = True
+        try:
+            self.launchCard.setChecked(checked)
+        finally:
+            self._syncing = False
+        self.launchCard.setContent(text)
+        self.launchCard.setEnabled(enabled)
+
+    def _on_autostart_state_loaded(self, state: object) -> None:
+        if isinstance(state, AutostartState):
+            self._autostart = state
+            self._refresh_launch_card()
+
+    def _on_launch_switched(self, checked: bool) -> None:
+        if not self._syncing:
+            self._controller.set_launch_on_login(checked)
 
     # --- account ---------------------------------------------------------------------
 
@@ -276,6 +497,10 @@ class SettingsPage(ScrollArea):
     def _on_failed(self, op: str, _message: str, _exc: object = None) -> None:
         if op == "settings":
             self.refresh()  # the window shows the message; undo the optimistic edit
+        elif op == "launch_on_login":
+            self._refresh_launch_card()  # back to the last known state
+            if self._controller.autostart_supported:
+                self._controller.load_autostart_state()
         elif op == "account":
             self.accountCard.setContent("读取 token 信息失败，详情见上方提示")
 

@@ -55,6 +55,7 @@ from runnerdeck.core.manager import (
 )
 from runnerdeck.core.models import (
     AppConfig,
+    Discovery,
     DisplayState,
     LocalState,
     RemoteRunner,
@@ -62,14 +63,18 @@ from runnerdeck.core.models import (
     Repo,
     RunnerRecord,
     RunnerToken,
+    StrayRunner,
 )
+from runnerdeck.core.process import ExternalStop, RunnerProcessInfo
 from runnerdeck.core.redact import redact
 from runnerdeck.core.release import ReleaseCache
 from runnerdeck.core.status import (
     DETAIL_EXTERNAL_LOCAL,
     DETAIL_EXTERNAL_REMOTE,
+    DETAIL_OFFLINE_LAG,
     DETAIL_REMOTE_UNKNOWN,
 )
+from runnerdeck.core.stop_marks import StopMark, StopMarks
 from runnerdeck.core.store import ConfigStore
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -427,9 +432,15 @@ class Env:
     cmd: FakeConfigCmd
     cache: FakeCache
     events: list[str]
+    marks: StopMarks
     running: dict[str, list[Any]] = field(default_factory=dict)
     factory_calls: int = 0
     factory_error: BaseException | None = None
+    scans: int = 0
+    scan_error: BaseException | None = None
+    elsewhere: list[RunnerProcessInfo] = field(default_factory=list)  # outside any record
+    stopped: list[Path] = field(default_factory=list)
+    stop_results: dict[str, ExternalStop | BaseException] = field(default_factory=dict)
     manager: RunnerManager = field(init=False)
 
     def factory(self) -> Any:
@@ -443,6 +454,26 @@ class Env:
         if isinstance(value, BaseException):
             raise value
         return value or []
+
+    def scanner(self) -> list[RunnerProcessInfo]:
+        """The one-pass scan: every process in `running` lives in <dir>/bin."""
+        self.scans += 1
+        if self.scan_error is not None:
+            raise self.scan_error
+        found = list(self.elsewhere)
+        for runner_dir, procs in self.running.items():
+            if isinstance(procs, BaseException):
+                continue
+            exe = str(Path(runner_dir) / "bin" / "Runner.Listener.exe")
+            found.extend(RunnerProcessInfo(p.pid, exe) for p in procs)
+        return found
+
+    def stop_external(self, runner_dir: Path) -> ExternalStop:
+        self.stopped.append(runner_dir)
+        value = self.stop_results.get(str(runner_dir), ExternalStop([], []))
+        if isinstance(value, BaseException):
+            raise value
+        return value
 
     def config(self) -> AppConfig:
         return self.store.load()
@@ -503,6 +534,7 @@ def env(tmp_path: Path) -> Env:
         cmd=FakeConfigCmd(events, client),
         cache=FakeCache(zip_path, events),
         events=events,
+        marks=StopMarks(tmp_path / "stops"),
     )
     e.manager = RunnerManager(
         store,
@@ -512,6 +544,9 @@ def env(tmp_path: Path) -> Env:
         installer_run=e.cmd,
         find_processes=e.finder,
         clock=lambda: NOW,
+        stop_marks=e.marks,
+        scan_processes=e.scanner,
+        stop_external=e.stop_external,
     )
     return e
 
@@ -1835,14 +1870,70 @@ def test_statuses_detects_external_processes(env: Env) -> None:
     a, b, gone, other = status_env(env)
     env.running[b.path] = [SimpleNamespace(pid=1)]
     env.running[other.path] = [SimpleNamespace(pid=2)]
-    env.running[a.path] = psutil.AccessDenied(pid=3)  # type: ignore[assignment]
+    env.elsewhere = [RunnerProcessInfo(9, str(env.tmp / "elsewhere" / "Runner.Listener.exe"))]
     processes = {other.id: FakeRunnerProcess(LocalState.STOPPED, False)}
     named = by_name(env.manager.statuses(processes))  # type: ignore[arg-type]
     assert named["b"].local.external
     assert named["b"].display.state is DisplayState.EXTERNAL
     assert named["b"].display.detail == DETAIL_EXTERNAL_LOCAL
     assert named["c"].local.external  # our process object exists but is not running
-    assert not named["a"].local.external  # scan failure -> not external
+    assert not named["a"].local.external
+    assert env.scans == 1  # one pass for all records
+
+
+def test_statuses_scan_failure_means_not_external(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    a, b, *_ = status_env(env)
+    env.running[b.path] = [SimpleNamespace(pid=1)]
+    env.scan_error = psutil.AccessDenied(pid=3)
+    with caplog.at_level(logging.WARNING, logger="runnerdeck.core.manager"):
+        rows = env.manager.statuses()
+    assert not any(row.local.external for row in rows)
+    assert env.scans == 1  # tried once, not once per record
+    assert caplog.text.count("cannot list runner processes") == 1
+
+
+def test_statuses_skips_the_scan_when_every_runner_is_ours(env: Env) -> None:
+    a, b, gone, other = status_env(env)
+    processes = {r.id: FakeRunnerProcess(LocalState.IDLE, True) for r in (a, b, gone, other)}
+    env.manager.statuses(processes)  # type: ignore[arg-type]
+    assert env.scans == 0
+
+
+def test_statuses_local_only_never_builds_a_client(env: Env) -> None:
+    a, b, *_ = status_env(env)
+    processes = {a.id: FakeRunnerProcess(LocalState.IDLE, True)}
+    rows = env.manager.statuses(processes, remote=False)  # type: ignore[arg-type]
+    assert env.factory_calls == 0
+    assert env.client.calls == []
+    assert all(row.remote.status is RemoteStatus.UNKNOWN for row in rows)
+    assert all(row.remote_error is None for row in rows)
+    assert all(row.remote_runner is None for row in rows)
+    named = by_name(rows)
+    assert named["a"].display.state is DisplayState.IDLE
+    assert named["a"].display.detail == DETAIL_REMOTE_UNKNOWN
+    assert named["b"].display.state is DisplayState.STOPPED
+    assert env.scans == 1
+
+
+def test_statuses_legacy_finder_only_injection(env: Env) -> None:
+    # Callers that faked only find_processes (M1/M2) still never scan for real.
+    a, b, *_ = status_env(env)
+    env.running[b.path] = [SimpleNamespace(pid=1)]
+    env.running[a.path] = psutil.AccessDenied(pid=3)  # type: ignore[assignment]
+    manager = RunnerManager(
+        env.store,
+        env.factory,
+        cache=env.cache,  # type: ignore[arg-type]
+        find_processes=env.finder,
+        clock=lambda: NOW,
+        stop_marks=env.marks,
+    )
+    named = by_name(manager.statuses(remote=False))
+    assert named["b"].local.external
+    assert not named["a"].local.external  # that directory's scan failed
+    assert env.scans == 0
 
 
 def test_statuses_running_process_is_never_external(env: Env) -> None:
@@ -1908,10 +1999,13 @@ def test_process_for(env: Env, proxy: str | None, expected: str | None) -> None:
     assert lines == ["√ Connected to GitHub", "2026-10-22Z: Listening for Jobs"]
 
 
-def test_manager_defaults(isolated_home: Path) -> None:
+def test_manager_defaults(isolated_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def no_login() -> Any:
         raise AuthError("请先登录")
 
+    scans: list[int] = []
+    # The default one-pass scan, faked so no test scans the developer's processes.
+    monkeypatch.setattr(manager_mod.process, "scan_runner_processes", lambda: scans.append(1) or [])
     store = ConfigStore()
     manager = RunnerManager(store, no_login)
     assert manager.hostname and "." not in manager.hostname
@@ -1927,6 +2021,11 @@ def test_manager_defaults(isolated_home: Path) -> None:
     assert row.remote_error == "请先登录"
     assert row.local.state_since.tzinfo is not None
     assert row.display.state is DisplayState.STOPPED
+    assert scans == [1]
+    manager.record_stop(isolated_home / "missing", forced=True)
+    assert (isolated_home / "stops").is_dir()  # default StopMarks under the local app dir
+    (row,) = manager.statuses()
+    assert row.local.last_stop_forced
 
 
 def test_rollback_error_message() -> None:
@@ -2007,3 +2106,350 @@ def test_process_for_launch_passthrough(env: Env) -> None:
     manager = RunnerManager(env.store, env.factory, cache=env.cache)  # type: ignore[arg-type]
     assert manager.process_for(record).launch is Launch.CONSOLE
     assert manager.process_for(record, launch=Launch.HELPER).launch is Launch.HELPER
+
+
+# --- stop records (docs/m3-design.md §2, §3.5) -------------------------------------------------
+
+
+def online_runner(env: Env, **kw: Any) -> RunnerRecord:
+    record = env.seed(github_runner_id=AGENT_ID, **kw)
+    env.client.runners[_key(OWNER, REPO)] = [remote(AGENT_ID, record.name, "online")]
+    return record
+
+
+def test_record_stop_without_process_is_used(env: Env) -> None:
+    record = online_runner(env)
+    env.manager.record_stop(Path(record.path), forced=True, at=NOW - timedelta(seconds=30))
+    (row,) = env.manager.statuses()
+    assert row.local.last_stop_forced
+    assert row.local.stopped_at == NOW - timedelta(seconds=30)
+    assert row.display.state is DisplayState.SESSION_LINGERING
+    assert row.display.detail is not None and "最多约 210 秒" in row.display.detail
+
+
+def test_record_stop_defaults_to_the_manager_clock(env: Env) -> None:
+    record = online_runner(env)
+    env.manager.record_stop(record.path, forced=True)
+    assert env.marks.get(record.path, now=NOW) == StopMark(NOW, True)
+
+
+def test_graceful_stop_record_hides_github_lag(env: Env) -> None:
+    record = online_runner(env)
+    env.manager.record_stop(record.path, forced=False, at=NOW - timedelta(seconds=40))
+    (row,) = env.manager.statuses()
+    assert row.display.state is DisplayState.STOPPED
+    assert row.display.detail == DETAIL_OFFLINE_LAG
+
+
+def test_expired_stop_record_no_longer_counts(env: Env) -> None:
+    record = online_runner(env)
+    env.manager.record_stop(record.path, forced=True, at=NOW - timedelta(seconds=300))
+    (row,) = env.manager.statuses()
+    assert row.display.state is DisplayState.EXTERNAL
+    assert not row.local.last_stop_forced and row.local.stopped_at is None
+
+
+def test_newer_process_stop_wins_over_an_older_record(env: Env) -> None:
+    record = online_runner(env)
+    env.manager.record_stop(record.path, forced=True, at=NOW - timedelta(seconds=60))
+    proc = FakeRunnerProcess(
+        LocalState.STOPPED, False, last_stop_forced=False, stopped_at=NOW - timedelta(seconds=10)
+    )
+    (row,) = env.manager.statuses({record.id: proc})  # type: ignore[dict-item]
+    assert not row.local.last_stop_forced
+    assert row.local.stopped_at == NOW - timedelta(seconds=10)
+    assert row.display.state is DisplayState.STOPPED
+    assert row.display.detail == DETAIL_OFFLINE_LAG
+
+
+def test_newer_record_wins_over_an_older_process_stop(env: Env) -> None:
+    record = online_runner(env)
+    proc = FakeRunnerProcess(
+        LocalState.STOPPED, False, last_stop_forced=False, stopped_at=NOW - timedelta(seconds=200)
+    )
+    env.manager.record_stop(record.path, forced=True, at=NOW - timedelta(seconds=20))
+    (row,) = env.manager.statuses({record.id: proc})  # type: ignore[dict-item]
+    assert row.local.last_stop_forced
+    assert row.local.stopped_at == NOW - timedelta(seconds=20)
+    assert row.display.state is DisplayState.SESSION_LINGERING
+
+
+def test_never_started_process_uses_the_record(env: Env) -> None:
+    record = online_runner(env)
+    env.manager.record_stop(record.path, forced=True, at=NOW - timedelta(seconds=5))
+    proc = FakeRunnerProcess(LocalState.STOPPED, False)  # stopped_at None: never ran here
+    (row,) = env.manager.statuses({record.id: proc})  # type: ignore[dict-item]
+    assert row.display.state is DisplayState.SESSION_LINGERING
+
+
+def test_running_process_ignores_stop_records(env: Env) -> None:
+    record = online_runner(env)
+    env.manager.record_stop(record.path, forced=True, at=NOW - timedelta(seconds=5))
+    proc = FakeRunnerProcess(LocalState.IDLE, True, state_since=NOW - timedelta(seconds=1))
+    (row,) = env.manager.statuses({record.id: proc})  # type: ignore[dict-item]
+    assert row.local.running and not row.local.last_stop_forced
+    assert row.display.state is DisplayState.IDLE
+
+
+def test_record_stop_never_raises(env: Env, caplog: pytest.LogCaptureFixture) -> None:
+    class Broken(StopMarks):
+        def record(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("bug")
+
+    manager = RunnerManager(env.store, env.factory, stop_marks=Broken(env.tmp / "x"))
+    with caplog.at_level(logging.ERROR, logger="runnerdeck.core.manager"):
+        manager.record_stop(env.root / "a", forced=True)
+    assert "recording the stop" in caplog.text
+
+
+def test_remove_runner_clears_the_stop_record(env: Env) -> None:
+    record = seed_runner(env)
+    env.manager.record_stop(record.path, forced=True)
+    env.manager.remove_runner(record.id)
+    assert not env.marks.path_for(record.path).exists()
+
+
+# --- auto_start / forget ----------------------------------------------------------------------
+
+
+def test_add_runner_auto_start(env: Env) -> None:
+    plan = env.manager.plan_add(OWNER, REPO)
+    record = env.manager.add_runner(plan, auto_start=True)
+    assert record.auto_start
+    assert env.config().runners[0].auto_start
+
+
+def test_add_runner_auto_start_defaults_off(env: Env) -> None:
+    record = env.manager.add_runner(env.manager.plan_add(OWNER, REPO))
+    assert not record.auto_start
+
+
+def test_import_runner_auto_start_only_for_new_records(env: Env) -> None:
+    path = make_runner_dir(env.root / "manual")
+    env.client.runners[_key(OWNER, REPO)] = [remote(AGENT_ID, DEFAULT_NAME)]
+    record = env.manager.import_runner(path, auto_start=True)
+    assert record.auto_start and env.config().runners[0].auto_start
+    env.manager.set_auto_start(record.id, False)
+    again = env.manager.import_runner(path, auto_start=True)  # same path: returned as it is
+    assert again.id == record.id and not again.auto_start
+
+
+def test_set_auto_start(env: Env) -> None:
+    record = env.seed()
+    on = env.manager.set_auto_start(record.id, True)
+    assert on.auto_start and on.id == record.id
+    assert env.config().get(record.id).auto_start  # type: ignore[union-attr]
+    assert env.manager.set_auto_start(record.id, True) == on  # unchanged: no rewrite needed
+    assert not env.manager.set_auto_start(record.id, False).auto_start
+    assert env.factory_calls == 0
+
+
+def test_set_auto_start_unknown_record(env: Env) -> None:
+    with pytest.raises(RunnerNotFoundError, match="可能已被移除"):
+        env.manager.set_auto_start("0" * 32, True)
+
+
+def test_forget_runner_only_deletes_the_record(env: Env) -> None:
+    path = make_runner_dir(env.root / "mine")
+    record = env.seed(path=str(path), github_runner_id=AGENT_ID)
+    before = sorted(p.relative_to(path) for p in path.rglob("*"))
+    runner_file_bytes = (path / ".runner").read_bytes()
+    forgotten = env.manager.forget_runner(record.id)
+    assert forgotten == record
+    assert env.config().runners == []
+    assert sorted(p.relative_to(path) for p in path.rglob("*")) == before
+    assert (path / ".runner").read_bytes() == runner_file_bytes
+    assert env.factory_calls == 0 and env.client.calls == [] and env.cmd.calls == []
+    assert env.manager.scan_unregistered() == [path]  # can be imported again later
+
+
+def test_forget_runner_unknown_record(env: Env) -> None:
+    with pytest.raises(RunnerNotFoundError):
+        env.manager.forget_runner("f" * 32)
+
+
+# --- discover / is_service ----------------------------------------------------------------------
+
+
+def test_is_service(env: Env) -> None:
+    path = make_runner_dir(env.root / "svc")
+    assert not RunnerManager.is_service(path)
+    assert not manager_mod.is_service(env.root / "missing")
+    (path / ".service").write_text("actions.runner.octo-demo.svc", encoding="utf-8")
+    assert RunnerManager.is_service(path)
+    assert env.manager.is_service(str(path))
+
+
+def test_is_service_stat_failure(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    def denied(self: Path) -> bool:
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(Path, "is_file", denied)
+    assert not manager_mod.is_service(env.root / "x")
+
+
+def test_discover(env: Env) -> None:
+    recorded = make_runner_dir(env.root / "recorded")
+    env.seed(path=str(recorded))
+    unregistered = make_runner_dir(env.root / "unregistered")
+    stray = make_runner_dir(env.root / "stray")
+    (stray / ".service").write_text("svc", encoding="utf-8")
+    half = make_runner_dir(env.root / "half", agent_id=None)  # extracted, never configured
+    env.running[str(recorded)] = [SimpleNamespace(pid=10)]  # ours: not a stray
+    env.running[str(stray)] = [SimpleNamespace(pid=21), SimpleNamespace(pid=20)]
+    env.running[str(half)] = [SimpleNamespace(pid=30)]
+    env.elsewhere = [RunnerProcessInfo(40, str(env.tmp / "other" / "bin" / "Runner.Listener.exe"))]
+
+    found = env.manager.discover()
+    assert found.root == env.root
+    assert found.unregistered == (stray, unregistered)  # stray is configured and unrecorded too
+    assert found.strays == (
+        StrayRunner(path=half, pids=(30,), configured=False, service=False),
+        StrayRunner(path=stray, pids=(20, 21), configured=True, service=True),
+    )
+    assert not found.empty
+    assert env.scans == 1
+    assert env.factory_calls == 0
+
+
+def test_discover_skips_a_child_that_holds_a_recorded_runner(env: Env) -> None:
+    # D:\\runners\\team\\repo1 is recorded (and may be running under RunnerDeck): its
+    # processes must not make D:\\runners\\team look like a stray that "结束" would kill.
+    nested = make_runner_dir(env.root / "team" / "repo1")
+    env.seed(path=str(nested))
+    env.running[str(nested)] = [SimpleNamespace(pid=50)]
+    assert env.manager.discover().strays == ()
+
+
+def test_kill_stray_refuses_a_dir_holding_a_recorded_runner(env: Env) -> None:
+    nested = make_runner_dir(env.root / "team" / "repo1")
+    env.seed(path=str(nested))
+    with pytest.raises(InvalidInputError, match="下有已登记的 runner"):
+        env.manager.kill_stray(env.root / "team")
+    assert env.stopped == []
+
+
+def test_discover_nothing(env: Env) -> None:
+    found = env.manager.discover()  # root does not even exist
+    assert found == Discovery(root=env.root)
+    assert found.empty
+    env.root.mkdir()
+    env.elsewhere = [RunnerProcessInfo(1, str(env.tmp / "far" / "Runner.Listener.exe"))]
+    assert env.manager.discover().empty
+
+
+def test_discover_scan_failure_finds_no_strays(env: Env) -> None:
+    unregistered = make_runner_dir(env.root / "u")
+    env.running[str(unregistered)] = [SimpleNamespace(pid=1)]
+    env.scan_error = OSError("process list unavailable")
+    found = env.manager.discover()
+    assert found.unregistered == (unregistered,)
+    assert found.strays == ()
+
+
+def test_discover_unreadable_root(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    make_runner_dir(env.root / "u")
+    env.running[str(env.root / "u")] = [SimpleNamespace(pid=1)]
+    monkeypatch.setattr(manager_mod.runner_file, "scan_runner_dirs", lambda root: [])
+    real_iterdir = Path.iterdir
+
+    def iterdir(self: Path) -> Any:
+        if self == env.root:
+            raise PermissionError(13, "拒绝访问")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    with pytest.raises(RunnerDeckError, match="无法读取目录"):
+        env.manager.discover()
+
+
+def test_discover_legacy_finder(env: Env) -> None:
+    stray = make_runner_dir(env.root / "stray")
+    env.running[str(env.root)] = [SimpleNamespace(pid=5)]  # finder(root): something is there
+    env.running[str(stray)] = [SimpleNamespace(pid=5)]
+    manager = RunnerManager(env.store, env.factory, find_processes=env.finder, stop_marks=env.marks)
+    assert manager.discover().strays == (
+        StrayRunner(path=stray, pids=(5,), configured=True, service=False),
+    )
+    assert env.scans == 0
+
+
+# --- kill_external / kill_stray ----------------------------------------------------------------
+
+
+def test_kill_external_records_a_forced_stop(env: Env) -> None:
+    record = online_runner(env, path=str(make_runner_dir(env.root / "ext")))
+    env.stop_results[record.path] = ExternalStop([11, 12], [])
+    outcome = env.manager.kill_external(record.id)
+    assert outcome == ExternalStop([11, 12], [])
+    assert env.stopped == [Path(record.path)]
+    assert env.marks.get(record.path, now=NOW) == StopMark(NOW, True)
+    (row,) = env.manager.statuses()  # GitHub still says online: the session lingers
+    assert row.display.state is DisplayState.SESSION_LINGERING
+
+
+def test_kill_external_nothing_running_records_nothing(env: Env) -> None:
+    record = env.seed()
+    assert env.manager.kill_external(record.id) == ExternalStop([], [])
+    assert env.marks.get(record.path, now=NOW) is None
+
+
+def test_kill_external_partial_still_records(env: Env) -> None:
+    record = env.seed()
+    env.stop_results[record.path] = ExternalStop([11], [12])
+    outcome = env.manager.kill_external(record.id)
+    assert not outcome.ok
+    assert env.marks.get(record.path, now=NOW) == StopMark(NOW, True)
+
+
+def test_kill_external_refuses_service_mode(env: Env) -> None:
+    path = make_runner_dir(env.root / "svc")
+    (path / ".service").write_text("svc", encoding="utf-8")
+    record = env.seed(path=str(path))
+    with pytest.raises(InvalidInputError, match="Windows 服务"):
+        env.manager.kill_external(record.id)
+    assert env.stopped == []
+
+
+def test_kill_external_errors(env: Env) -> None:
+    record = env.seed()
+    with pytest.raises(RunnerNotFoundError):
+        env.manager.kill_external("e" * 32)
+    env.stop_results[record.path] = ProcessError("无法检查 runner 进程：拒绝访问")
+    with pytest.raises(ProcessError, match="拒绝访问"):
+        env.manager.kill_external(record.id)
+    env.stop_results[record.path] = psutil.AccessDenied(pid=4)
+    with pytest.raises(ProcessError, match="无法结束"):
+        env.manager.kill_external(record.id)
+    assert env.marks.get(record.path, now=NOW) is None
+
+
+def test_kill_stray(env: Env) -> None:
+    stray = make_runner_dir(env.root / "stray")
+    env.stop_results[str(stray)] = ExternalStop([7], [])
+    assert env.manager.kill_stray(str(stray / ".." / "stray")) == ExternalStop([7], [])
+    assert env.stopped == [stray]
+    assert env.marks.get(stray, now=NOW) == StopMark(NOW, True)
+
+
+@pytest.mark.parametrize("where", ["root", "nested", "outside"])
+def test_kill_stray_only_direct_children_of_the_root(env: Env, where: str) -> None:
+    target = {
+        "root": env.root,
+        "nested": env.root / "a" / "b",
+        "outside": env.tmp / "elsewhere",
+    }[where]
+    with pytest.raises(InvalidInputError, match="不在 runner 根目录"):
+        env.manager.kill_stray(target)
+    assert env.stopped == []
+
+
+def test_kill_stray_refuses_recorded_and_service_dirs(env: Env) -> None:
+    recorded = env.seed(path=str(env.root / "recorded"))
+    with pytest.raises(InvalidInputError, match="已登记为 runner"):
+        env.manager.kill_stray(recorded.path)
+    svc = make_runner_dir(env.root / "svc")
+    (svc / ".service").write_text("svc", encoding="utf-8")
+    with pytest.raises(InvalidInputError, match="Windows 服务"):
+        env.manager.kill_stray(svc)
+    assert env.stopped == []
