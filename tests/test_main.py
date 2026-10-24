@@ -124,9 +124,13 @@ class FakeApp(QObject):
         self.calls = calls
         self.during_exec = during_exec
         self.quit_on_last_window_closed: bool | None = None
+        self.native_filters: list[object] = []
 
     def setQuitOnLastWindowClosed(self, value: bool) -> None:  # noqa: N802 - Qt naming
         self.quit_on_last_window_closed = value
+
+    def installNativeEventFilter(self, event_filter: object) -> None:  # noqa: N802 - Qt naming
+        self.native_filters.append(event_filter)  # Windows only (app/session_end.install)
 
     def exec_(self) -> int:
         self.calls.append("exec")

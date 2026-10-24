@@ -291,4 +291,11 @@ def run_elevated(op: str, payload: dict, *, timeout_s: float = 300) -> ElevatedR
 - `emergency_stop_all` 记下这次发了停止信号的 runner；`resume_after_cancelled_logoff()` 用 500 ms 定时器等它们真正停下（最多 120 s，执行中的 job 先被取消）再逐个 `start`，返回数量；托盘提示“注销已取消，正在重新启动 N 个 runner”。服务 runner 本来就不受注销影响。
 - D2（Qt 能否收到 `WM_ENDSESSION(FALSE)`）没有单独写 spike 脚本：SSH 会话和桌面不是同一个会话，发不了窗口消息；直接用产品在桌面验收里验证。
 
-（第 6 步起继续填写）
+**第 6 步（打包与发布）**
+- Inno Setup 6.7.1 官方安装里没有简体中文：`packaging/ChineseSimplified.isl` 取自 jrsoftware/issrc `Files/Languages/Unofficial`（tag is-6_7_1），加了 UTF-8 BOM（没有 BOM 时 Inno 按 LanguageCodePage 读）；`.iss` 本身含中文，也带 BOM。
+- 开始菜单快捷方式直接放在 `{userprograms}\RunnerDeck.lnk`（不建程序组）；卸载完成时（非静默）提示保留了哪些数据。
+- CI build job 在 windows-latest 上静默安装 -> 已安装的 CLI `--version`、`RunnerDeck.exe --smoke-test` -> 静默卸载 -> 轮询直到安装目录里的 exe、开始菜单快捷方式、HKCU 卸载键都消失（首次就通过）。
+- release.yml：`SHA256SUMS.txt`（Git Bash 的 sha256sum）、`actions/attest-build-provenance@v4`（zip + setup.exe），三个文件一起上传。
+- test_main 的 `FakeApp` 要有 `installNativeEventFilter`（只在 Windows 上走到，macOS 本地发现不了）。
+
+（第 7 步起继续填写）

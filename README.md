@@ -2,27 +2,44 @@
 
 Windows 桌面应用：用一个 PAT 把本机注册成多个个人仓库的 GitHub Actions self-hosted runner，并统一启停、查看状态和日志。
 
-> 开发中。方案见 [docs/PLAN.md](docs/PLAN.md)，进度见 [docs/PROGRESS.md](docs/PROGRESS.md)。
+方案见 [docs/PLAN.md](docs/PLAN.md)，进度见 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
-## 下载与运行
+## 下载与安装
 
-1. 到 [Releases](https://github.com/nablejohne/RunnerDeck/releases) 下载 `RunnerDeck-<版本>-win-x64.zip`。
-2. 解压到任意目录（不要放在需要管理员权限的位置），双击 `RunnerDeck.exe`。
-   同目录下的 `runnerdeck-helper.exe`（优雅停止 runner 用，必需）和 `runnerdeck-cli.exe`（排障用）不要删。
-3. 首次启动会弹出登录框，粘贴你的 PAT（见下文权限）。
+到 [Releases](https://github.com/nablejohne/RunnerDeck/releases) 下载其中一种：
 
-**SmartScreen 提示“未知发布者”属正常**：程序没有代码签名证书。点“更多信息 → 仍要运行”即可。想留存校验值，可在 PowerShell 里计算 zip 的 SHA256（`SHA256SUMS.txt` 和构建来源证明从 v1.0.0 起随 Release 发布）：
+- **安装包** `RunnerDeck-<版本>-setup.exe`（推荐）：装到 `%LOCALAPPDATA%\Programs\RunnerDeck`，不需要管理员权限；开始菜单里有快捷方式，在“设置 → 应用”里可以卸载。升级时直接运行新版安装包（先退出 RunnerDeck）。
+- **免安装** `RunnerDeck-<版本>-win-x64.zip`：解压到任意目录（不要放在需要管理员权限的位置），双击 `RunnerDeck.exe`。同目录下的 `runnerdeck-helper.exe`（优雅停止 runner 用，必需）和 `runnerdeck-cli.exe`（命令行、服务模式的管理员操作用）不要删。
+
+首次启动会弹出登录框，粘贴你的 PAT（见下文权限）。
+
+**卸载会保留什么**：设置（`%APPDATA%\RunnerDeck`）、runner 目录、凭据管理器里的 PAT 都保留；以 Windows 服务运行的 runner 不依赖 RunnerDeck，卸载后仍在运行。要彻底清理，先在 RunnerDeck 里“移除”不需要的 runner 再卸载。
+
+**SmartScreen 提示“未知发布者”属正常**：程序没有代码签名证书，点“更多信息 → 仍要运行”即可。运行前可以校验文件：
 
 ```powershell
-Get-FileHash .\RunnerDeck-<版本>-win-x64.zip -Algorithm SHA256
+Get-FileHash .\RunnerDeck-<版本>-setup.exe -Algorithm SHA256   # 与 Release 里的 SHA256SUMS.txt 对照
+```
+
+```bash
+gh attestation verify RunnerDeck-<版本>-setup.exe -R nablejohne/RunnerDeck   # 构建来源证明：确认文件由本仓库的 GitHub Actions 构建
 ```
 
 ## PAT 权限
 
-- **Fine-grained token**（推荐）：Repository access 选中要注册 runner 的仓库；Repository permissions 里 **Administration: Read and write**。
+- **Fine-grained token**（推荐）：Repository access 选中要注册 runner 的仓库；Repository permissions 里 **Administration: Read and write**（必需）。想在详情页看 workflow 标签匹配和最近运行，再加 **Contents: Read**、**Actions: Read**（可选）。
 - **Classic token**：勾选 `repo`。
 
 PAT 只保存在 Windows 凭据管理器，不写入文件和日志。
+
+## 进程模式与服务模式
+
+- **进程**（默认）：RunnerDeck 启动 runner，退出 RunnerDeck 时优雅停止它们；job 以你的账号运行，能用你的用户目录、PATH 和系统代理。
+- **Windows 服务**：添加时勾选“以 Windows 服务运行”，或对已停止的 runner 用“转为服务…”（会重新注册，GitHub 上的 runner id 会变）。需要一次管理员授权（UAC），之后启停不再弹窗。服务以 `NT AUTHORITY\NETWORK SERVICE` 运行：开机即运行、不需要登录，退出或卸载 RunnerDeck 都不影响它。注意：
+  - job 看不到你的用户目录，也拿不到用户级 PATH（例如装在用户目录里的 Python、uv）；需要的工具请装到系统级位置。
+  - 服务不使用你的系统代理：设置里的代理会写进 runner 目录的 `.env`，对两种模式都生效。
+  - runner 根目录不能在用户目录里（NETWORK SERVICE 无法列出它的上级目录，服务会启动失败）。
+  - 导入的服务 runner（别处装的）第一次启停前可以用“授权启停…”授权一次。
 
 ## 功能概览
 
@@ -30,7 +47,8 @@ PAT 只保存在 Windows 凭据管理器，不写入文件和日志。
 - 概览页为每个 runner 显示状态（本地进程 + GitHub 端，自动轮询）和当前 job，可单个或全部启停、打开目录、移除；点卡片进详情页看实时输出和诊断日志。
 - 常驻托盘、开机自启、随 RunnerDeck 自动启动 runner、job 失败通知。
 - 导入已有的 runner 目录；发现不归 RunnerDeck 管的 runner 进程时可以结束或接管。
-- 设置页：runner 根目录、默认标签、代理、轮询间隔、启动与托盘、通知、主题、更换 PAT / 退出登录。
+- 详情页的 Workflow 页签：仓库里哪些 job 会用到这台 runner，标签不匹配（job 会一直排队）时直接指出；最近运行记录。
+- 设置页：runner 根目录（可一键加固权限）、默认标签、代理、轮询间隔、启动与托盘、通知、主题、检查更新、更换 PAT / 退出登录。
 
 ## 托盘
 
