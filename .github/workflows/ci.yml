@@ -87,9 +87,42 @@ jobs:
           Write-Host "RunnerDeck.exe --smoke-test -> exit $($p.ExitCode)"
           Get-Content smoke-stdout.txt, smoke-stderr.txt
           if ($p.ExitCode -ne 0) { throw "RunnerDeck.exe --smoke-test exited $($p.ExitCode)" }
+      - name: Install, run and uninstall the setup.exe (per-user, silent)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = (uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])").Trim()
+          $setup = Join-Path $PWD "dist\RunnerDeck-$expected-setup.exe"
+          if (-not (Test-Path $setup)) { throw "missing $setup (Inno Setup not found on the runner?)" }
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LOG=install.log' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content install.log; throw "setup exited $($p.ExitCode)" }
+
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\RunnerDeck'
+          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\RunnerDeck.lnk'
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F2B6C1E-5D3A-4B7E-9C21-6A4E2D9F0B13}_is1'
+          foreach ($path in "$app\RunnerDeck.exe", "$app\runnerdeck-cli.exe", "$app\runnerdeck-helper.exe", "$app\unins000.exe", $lnk, $key) {
+            if (-not (Test-Path $path)) { throw "not installed: $path" }
+          }
+          $out = (& "$app\runnerdeck-cli.exe" --version | Out-String).Trim()
+          Write-Host "installed runnerdeck-cli --version -> '$out'"
+          if ($out -notlike "*$expected*") { throw "installed CLI is not $expected" }
+          $p = Start-Process -FilePath "$app\RunnerDeck.exe" -ArgumentList '--smoke-test' -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput installed-smoke-stdout.txt -RedirectStandardError installed-smoke-stderr.txt
+          if ($p.ExitCode -ne 0) { Get-Content installed-smoke-stderr.txt; throw "installed RunnerDeck.exe --smoke-test exited $($p.ExitCode)" }
+
+          # The uninstaller copies itself to %TEMP% and returns at once: poll for the result.
+          Start-Process -FilePath "$app\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          $deadline = (Get-Date).AddSeconds(90)
+          while ((Test-Path "$app\RunnerDeck.exe") -or (Test-Path $lnk) -or (Test-Path $key)) {
+            if ((Get-Date) -gt $deadline) { throw "uninstall left files or registry entries behind" }
+            Start-Sleep -Seconds 1
+          }
+          Write-Host "installed to $app and uninstalled cleanly"
       - uses: actions/upload-artifact@v4
         with:
           name: RunnerDeck-win-x64
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
           if-no-files-found: error
           retention-days: 7

@@ -1,7 +1,8 @@
 name: Release
 
 # Push a tag `vX.Y.Z` (after bumping pyproject.toml and CHANGELOG.md on main, see
-# docs/PLAN.md "版本与发布") and this builds the zip and publishes a GitHub Release.
+# docs/PLAN.md "版本与发布") and this builds the zip and the setup.exe, writes SHA256SUMS.txt,
+# attests their build provenance and publishes a GitHub Release with all three.
 # Hosted runners only (CLAUDE.md): never `runs-on: self-hosted` in this repo.
 
 on:
@@ -21,6 +22,8 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: write
+      id-token: write  # actions/attest-build-provenance
+      attestations: write
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
@@ -70,6 +73,8 @@ jobs:
           }
           $zip = Join-Path $PWD "dist\RunnerDeck-$expected-win-x64.zip"
           if (-not (Test-Path $zip)) { throw "missing $zip" }
+          $setup = Join-Path $PWD "dist\RunnerDeck-$expected-setup.exe"
+          if (-not (Test-Path $setup)) { throw "missing $setup" }
 
           $out = (& (Join-Path $dist 'runnerdeck-cli.exe') --version | Out-String).Trim()
           Write-Host "runnerdeck-cli --version -> '$out' (exit $LASTEXITCODE)"
@@ -89,6 +94,20 @@ jobs:
           Get-Content smoke-stdout.txt, smoke-stderr.txt
           if ($p.ExitCode -ne 0) { throw "RunnerDeck.exe --smoke-test exited $($p.ExitCode)" }
 
+      - name: Write SHA256SUMS.txt
+        shell: bash
+        run: |
+          cd dist
+          sha256sum RunnerDeck-*-win-x64.zip RunnerDeck-*-setup.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Build provenance (SLSA), verifiable with: gh attestation verify <file> -R nablejohne/RunnerDeck
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/RunnerDeck-*-win-x64.zip
+            dist/RunnerDeck-*-setup.exe
+
       - name: Extract release notes from CHANGELOG.md
         shell: bash
         env:
@@ -106,7 +125,7 @@ jobs:
         run: |
           extra=()
           if [ "$PRERELEASE" = "true" ]; then extra+=(--prerelease); fi
-          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*-setup.exe dist/SHA256SUMS.txt \
             --verify-tag \
             --title "RunnerDeck $GITHUB_REF_NAME" \
             --notes-file notes.md \

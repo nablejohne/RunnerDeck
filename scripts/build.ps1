@@ -5,13 +5,19 @@
 
 .DESCRIPTION
     uv sync --locked  ->  pyinstaller RunnerDeck.spec  ->  dist/RunnerDeck-<version>-win-x64.zip
+    ->  (Inno Setup found) dist/RunnerDeck-<version>-setup.exe (packaging/RunnerDeck.iss).
     The zip root holds RunnerDeck.exe, runnerdeck-helper.exe, runnerdeck-cli.exe and _internal/.
     Works under Windows PowerShell 5.1 and PowerShell 7; any failure exits 1.
-    The last line of output is the zip path.
+    The last lines of output are the zip path and, when built, the setup path.
+
+.PARAMETER NoInstaller
+    Skip the installer even when ISCC.exe is available.
 #>
 
 [CmdletBinding()]
-param()
+param(
+    [switch] $NoInstaller
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -85,8 +91,32 @@ try {
     if (-not (Test-Path -LiteralPath $zipPath)) {
         throw "zip was not created: $zipPath"
     }
+    $setupPath = $null
+    if (-not $NoInstaller) {
+        $iscc = (Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue).Source
+        if (-not $iscc) {
+            foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles, (Join-Path $env:LOCALAPPDATA 'Programs'))) {
+                if (-not $base) { continue }
+                $candidate = Join-Path $base 'Inno Setup 6\ISCC.exe'
+                if (Test-Path -LiteralPath $candidate) { $iscc = $candidate; break }
+            }
+        }
+        if (-not $iscc) {
+            Write-Host 'Inno Setup (ISCC.exe) not found: skipping the installer'
+        } else {
+            $script = Join-Path $repoRoot 'packaging\RunnerDeck.iss'
+            Invoke-Native "iscc $script" {
+                & $iscc /Q "/DAppVersion=$version" "/DSourceDir=$bundleDir" "/DOutputDir=$distDir" $script
+            } | Out-Null
+            $setupPath = Join-Path $distDir "RunnerDeck-$version-setup.exe"
+            if (-not (Test-Path -LiteralPath $setupPath)) {
+                throw "installer was not created: $setupPath"
+            }
+        }
+    }
     Write-Host 'build finished'
     Write-Output $zipPath
+    if ($setupPath) { Write-Output $setupPath }
 } catch {
     Write-Host "build failed: $($_.Exception.Message)" -ForegroundColor Red
     exit 1
