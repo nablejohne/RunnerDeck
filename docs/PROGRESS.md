@@ -6,11 +6,11 @@
 
 - [x] M0 技术验证 + 工程地基（spike 脚本、stdout 样本、停止方式结论、pyproject/ruff/pytest、ci.yml 首次跑绿）
 - [x] M1 core 层 + CLI（架构守卫、覆盖率门槛）
-- [ ] M2 UI 最小可用 + 打包 + release.yml → v0.1.0
+- [x] M2 UI 最小可用 + 打包 + release.yml → v0.1.0（2026-10-24 发布，预发布）
 - [ ] M3 日常可用（托盘、自启、Poller、导入）→ v0.2.0
 - [ ] M4 增强与发布（服务模式、Inno Setup、来源证明）→ v1.0.0
 
-## 当前：M2（代码完成，等真机 GUI 验收和发布 v0.1.0）
+## M2：已完成（2026-10-24，v0.1.0 预发布）
 
 接口与实现后的修订见 `docs/m2-design.md`（§10 以代码为准）。
 
@@ -24,8 +24,8 @@
 - [x] CI（windows-latest，3c30a81）：1837 passed、覆盖率 97.9%；build job 打包并冒烟三个 exe 通过，zip 作为 artifact 上传
 - [x] 真机运行 CI 打包产物：三个 exe 在 XM 上可运行（GUI 验收即用此包）；XM 上本地 `build.ps1` 未复跑（CI windows-latest 已覆盖）
 - [x] **真机 GUI 验收（2026-10-24，XM 桌面，CI 产物 zip）**：登录（Ctrl+V）→ 向导给 `runnerdeck-sandbox`、`runnerdeck-sandbox2`（新建的私有仓库）各添加一个 runner（下载、校验、ACL、`.env` 执行策略、注册、启动）→ 两个 workflow 并行成功，PowerShell 步骤 `policy=RemoteSigned` → 界面全程不卡 → 关窗“停止并退出”：两个 runner 都是 helper 转发 Ctrl+Break 的优雅停止（并行，约 1.2 s），无残留进程，GitHub 上均 offline
-  - 插曲：两个 runner 注册时没有 `runnerdeck-spike` 标签（向导标签栏为空），测试 job 排队；用 API 补标签后，已排队的 job 不会重新匹配，取消重派才跑通。标签栏是否被填过待用户确认
-- [ ] 发布 `v0.1.0`（预发布）：CHANGELOG `[Unreleased]` 改成 `[0.1.0] - 日期`、pyproject 版本、推 tag，Release 页面出现 zip
+  - 插曲：两个 runner 注册时没有 `runnerdeck-spike` 标签（用户确认向导标签栏没填，属正常行为），测试 job 排队；用 API 补标签后，已排队的 job 不会重新匹配，取消重派才跑通
+- [x] 发布 `v0.1.0`（预发布）：https://github.com/nablejohne/RunnerDeck/releases/tag/v0.1.0 ，资产 `RunnerDeck-0.1.0-win-x64.zip`（67.8 MB，sha256 df3507fa…c0c01ae6）；release 工作流重跑 lint/1837 测试/打包/冒烟全过；`release.yml` 改为 `v0.*` 一律标记预发布
 
 ## M1：已验收（2026-10-23，Windows 真机，通过 SSH）
 
@@ -60,6 +60,13 @@ uv run pytest
 
 ## 已完成
 
+### 2026-10-24 M2 收尾与 v0.1.0
+
+- 修 CI：冒烟测试和 release.yml 读版本号用错 TOML 键（`['project']['version']`）
+- 真机 GUI 验收通过（两个仓库、并行 workflow、关窗优雅停止无残留）；新建私有测试仓库 `runnerdeck-sandbox2`
+- 发布 v0.1.0 预发布版
+
+
 ### 2026-10-23 M1 真机验收 + M0 第 2 轮
 
 - 真机发现并修复：runner 在 GitHub 被删除后自己清配置并以 0 退出（改判 ERROR）；job 中停止 15 s 不够导致强杀和僵尸 job（改为 90 s）；DELETE 遇僵尸 job 返回 422（给 force-cancel 提示）；SSH 会话无法用凭据管理器（提示 RUNNERDECK_PAT）；状态文案
@@ -81,6 +88,9 @@ uv run pytest
 - 创建公开仓库 https://github.com/nablejohne/RunnerDeck，许可证 GPLv3
 
 ## 决策与坑
+
+- GitHub 只在 job 入队时按标签匹配 runner；之后再给 runner 加标签，已排队的 job 不会被分配，要取消重派
+- 发布：`v0.*` 自动标记预发布（SemVer 0.x = 初始开发）；版本号只读 `[project].version`
 
 - M2 托盘应用的停止方案：helper 进程（CREATE_NO_WINDOW，自带隐藏控制台）转发 Ctrl+Break，真机 0.9 s 优雅退出
 - 执行 job 时停止要等 runner 取消 job（约 15 s 起），超时 90 s；强杀会留下僵尸 job（runner busy、不能删除，只有 force-cancel 能解）
