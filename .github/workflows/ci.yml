@@ -114,6 +114,9 @@ jobs:
           foreach ($path in "$app\RunnerDeck.exe", "$app\runnerdeck-cli.exe", "$app\runnerdeck-helper.exe", "$app\unins000.exe", $lnk, $key) {
             if (-not (Test-Path $path)) { throw "not installed: $path" }
           }
+          # Launch on login as RunnerDeck writes it, plus a foreign value the uninstaller must keep.
+          $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          Set-ItemProperty -Path $run -Name 'RunnerDeck' -Value "`"$app\RunnerDeck.exe`" --autostart"
           $out = (& "$app\runnerdeck-cli.exe" --version | Out-String).Trim()
           Write-Host "installed runnerdeck-cli --version -> '$out'"
           if ($out -notlike "*$expected*") { throw "installed CLI is not $expected" }
@@ -128,6 +131,19 @@ jobs:
             if ((Get-Date) -gt $deadline) { throw "uninstall left files or registry entries behind" }
             Start-Sleep -Seconds 1
           }
+          if (Get-ItemProperty -Path $run -Name 'RunnerDeck' -ErrorAction SilentlyContinue) { throw "uninstall kept its own Run value" }
+          # A Run value pointing at another copy (e.g. the zip) survives an uninstall.
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "second setup exited $($p.ExitCode)" }
+          Set-ItemProperty -Path $run -Name 'RunnerDeck' -Value '"D:\elsewhere\RunnerDeck.exe" --autostart'
+          Start-Process -FilePath "$app\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          $deadline = (Get-Date).AddSeconds(90)
+          while (Test-Path "$app\RunnerDeck.exe") {
+            if ((Get-Date) -gt $deadline) { throw "second uninstall did not finish" }
+            Start-Sleep -Seconds 1
+          }
+          if (-not (Get-ItemProperty -Path $run -Name 'RunnerDeck' -ErrorAction SilentlyContinue)) { throw "uninstall removed another copy's Run value" }
+          Remove-ItemProperty -Path $run -Name 'RunnerDeck'
           Write-Host "installed to $app and uninstalled cleanly"
       - uses: actions/upload-artifact@v4
         with:

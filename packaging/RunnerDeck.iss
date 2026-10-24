@@ -1,7 +1,7 @@
 ﻿; RunnerDeck per-user installer (docs/m4-design.md §9): %LOCALAPPDATA%\Programs\RunnerDeck,
 ; no administrator rights. Built by scripts/build.ps1 after PyInstaller:
 ;   ISCC.exe /DAppVersion=1.0.0 /DSourceDir=<repo>\dist\RunnerDeck /DOutputDir=<repo>\dist RunnerDeck.iss
-; Uninstalling keeps the user's data (settings, runner directories, the PAT in Credential
+; Uninstalling removes the launch-on-login entry only if it points here, keeps the user's data (settings, runner directories, the PAT in Credential
 ; Manager) and never touches service-mode runners: they do not depend on RunnerDeck.
 
 #ifndef AppVersion
@@ -69,16 +69,28 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 Name: "{userprograms}\RunnerDeck"; Filename: "{app}\RunnerDeck.exe"
 Name: "{userdesktop}\RunnerDeck"; Filename: "{app}\RunnerDeck.exe"; Tasks: desktopicon
 
-[Registry]
-; RunnerDeck writes this value itself (launch on login); the uninstaller only removes it.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "RunnerDeck"; Flags: uninsdeletevalue dontcreatekey
-
 [Run]
 Filename: "{app}\RunnerDeck.exe"; Description: "{cm:LaunchProgram,RunnerDeck}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+const
+  RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+
+{ RunnerDeck writes HKCU\...\Run\RunnerDeck itself (launch on login). Remove it only when it
+  starts this installation: a zip copy elsewhere keeps its own entry. }
+procedure RemoveOwnRunValue();
+var
+  Command: String;
+begin
+  if RegQueryStringValue(HKCU, RunKey, 'RunnerDeck', Command) and
+     (Pos(Lowercase(ExpandConstant('{app}\RunnerDeck.exe')), Lowercase(Command)) > 0) then
+    RegDeleteValue(HKCU, RunKey, 'RunnerDeck');
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
+  if CurUninstallStep = usUninstall then
+    RemoveOwnRunValue();
   if (CurUninstallStep = usPostUninstall) and not UninstallSilent then
     MsgBox(CustomMessage('KeptData'), mbInformation, MB_OK);
 end;
