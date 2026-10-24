@@ -22,8 +22,9 @@
 - [x] CI：Windows 离屏 Qt 测试 + `build` job（打包并冒烟三个 exe）；`release.yml`（`v*` tag 发布 zip）
 - [x] 修复：CI / release.yml 读版本号用错 TOML 键（`['project']['version']`），build job 首次因此失败
 - [x] CI（windows-latest，3c30a81）：1837 passed、覆盖率 97.9%；build job 打包并冒烟三个 exe 通过，zip 作为 artifact 上传
-- [ ] XM 真机复跑 `build.ps1` + exe `--smoke-test`（2026-10-23 主机离线，SSH 超时，未跑）
-- [ ] **真机 GUI 验收（用户桌面）**：从零给两个仓库各添加一个 runner、各跑通一次 workflow、界面全程不卡、关窗优雅停止（GitHub 上 runner 很快 offline、无残留进程）
+- [x] 真机运行 CI 打包产物：三个 exe 在 XM 上可运行（GUI 验收即用此包）；XM 上本地 `build.ps1` 未复跑（CI windows-latest 已覆盖）
+- [x] **真机 GUI 验收（2026-10-24，XM 桌面，CI 产物 zip）**：登录（Ctrl+V）→ 向导给 `runnerdeck-sandbox`、`runnerdeck-sandbox2`（新建的私有仓库）各添加一个 runner（下载、校验、ACL、`.env` 执行策略、注册、启动）→ 两个 workflow 并行成功，PowerShell 步骤 `policy=RemoteSigned` → 界面全程不卡 → 关窗“停止并退出”：两个 runner 都是 helper 转发 Ctrl+Break 的优雅停止（并行，约 1.2 s），无残留进程，GitHub 上均 offline
+  - 插曲：两个 runner 注册时没有 `runnerdeck-spike` 标签（向导标签栏为空），测试 job 排队；用 API 补标签后，已排队的 job 不会重新匹配，取消重派才跑通。标签栏是否被填过待用户确认
 - [ ] 发布 `v0.1.0`（预发布）：CHANGELOG `[Unreleased]` 改成 `[0.1.0] - 日期`、pyproject 版本、推 tag，Release 页面出现 zip
 
 ## M1：已验收（2026-10-23，Windows 真机，通过 SSH）
