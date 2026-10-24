@@ -387,3 +387,7 @@ class SingleInstance(QObject):
 - 登录框不叠在另一个模态框上（有 `activeModalWidget` 时 500 ms 后再试）。
 - `StopMarks.get` 不再删除过期文件（读后删可能删掉 CLI 刚写的新记录；下次 `record` 覆盖即可）。
 - **未修（已知限制）**：注销被用户取消（“仍要注销 / 取消”选了取消）时，`commitDataRequest` 已经让 runner 停止，不会自动重启也没有提示；要靠原生 `WM_ENDSESSION(wParam=0)` 过滤器，留到 M4。真机验收第 7 项一并观察。
+
+**真机（XM）**
+- `diag.list_diag_logs` 用 `os.stat(path)` 而不是 `DirEntry.stat()`：Windows 上正在被 Listener 写的日志，目录项里的大小 / 修改时间是旧的（0 B、创建时刻），见 spike-notes §11。
+

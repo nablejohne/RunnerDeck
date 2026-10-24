@@ -67,7 +67,10 @@ def list_diag_logs(runner_dir: Path) -> list[DiagLog]:
         try:
             if not entry.is_file():
                 continue
-            st = entry.stat()
+            # os.stat, not entry.stat(): on Windows the scandir data is the directory entry's,
+            # which for the log the running Listener writes still says 0 B and the creation
+            # time (real XM spike, m3-design §10).
+            st = os.stat(entry.path)
         except OSError as e:
             log.debug("skipping %s: %s", entry.path, e)
             continue

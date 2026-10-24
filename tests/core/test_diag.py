@@ -85,12 +85,10 @@ def test_list_skips_entries_that_cannot_be_stat_ed(
             self.path = entry.path
 
         def is_file(self) -> bool:
-            return self._entry.is_file()
-
-        def stat(self) -> os.stat_result:
+            is_file = self._entry.is_file()
             if "gone" in self.name:
-                raise FileNotFoundError(2, "deleted meanwhile")
-            return self._entry.stat()
+                os.remove(self.path)  # deleted between the listing and the stat
+            return is_file
 
     class Scan:
         def __init__(self, path: Path) -> None:

@@ -211,3 +211,14 @@ The runner no longer exists on the server. Cleaning up local configuration.
 - **凭据管理器**：SSH（密钥登录）会话里 keyring 报 Win32 1312（“指定的登录会话不存在”），桌面会话应正常；CLI 已提示改用 `RUNNERDECK_PAT`。桌面会话下 `login` / `whoami` / `logout` 已验证通过（2026-10-23）。传统控制台（powershell.exe 窗口）里 Ctrl+V 对 getpass 只产生 U+0016、不会粘贴，已由 `secret_input` 处理。
 - **关闭终端会结束前台 runner**（控制台关闭事件发给所有进程），算一次强杀；托盘应用不受影响。
 - 目录 ACL：`harden_runner_dir` 生效（只剩 Administrators、SYSTEM、当前用户），runner 注册、运行、移除都正常；`D:\runners` 根目录仍继承 Authenticated Users: 修改（已知缺口）。
+
+## 11. M3 spike（2026-10-24，`ssh XM`，runner 2.338.1）
+
+脚本只在 XM 上临时运行（`D:\tmp\spike_m3.py`），用 M2 注册的 `runnerdeck-sandbox` runner。
+
+- **`_diag` 运行中可读**：Listener 空闲时 `diag.list_diag_logs` / `read_tail(4 KB)` / `read_tail(1 MB)` / 普通 `open(..., "rb")` 都成功，Listener 不会独占日志文件。
+- **正在写的日志，`os.scandir` 给的元数据是旧的**：列表里显示 0 B、修改时间停在创建时刻（实际已有 11 KB）。Windows 的目录项缓存要等句柄刷新 / 关闭才更新；`os.stat(path)` 打开文件取到的是实时值。`diag.list_diag_logs` 已改用 `os.stat`，复测显示 12473 B 和当前时间。
+- **CLI 从另一个进程 `stop`（强杀）后 `status` 显示“GitHub 会话未过期”**：+13 s / +36 s / +58 s 三次 `status` 都是 SESSION_LINGERING，剩余秒数 238 → 215 → 193，GitHub 端一直在线。M1 遗留的“强杀信息只在内存里”缺口确认已由 `stop_marks` 补上。被强杀的那个进程在原 RunnerProcess 里记为 ERROR（不是我们主动停的），符合预期。
+- 强杀约 1 分钟后重新启动：显示 RECONNECTING（等待旧会话过期），Ctrl+Break 优雅停止正常（`graceful=True`）。
+- 真机 `pytest`：2328 passed、12 skipped（SSH 会话有控制台，真实 helper / Ctrl+Break 用例都执行了）。**坑**：cmd 里 `set X=v & ...` 会把 `&` 前的空格写进值（`QT_QPA_PLATFORM="offscreen "` -> Qt 找不到插件、进程静默退出、输出为空），要写成 `set "X=v"`。
+

@@ -22,7 +22,7 @@
 - [x] 整合：全量 2215 passed（macOS 离屏）、smoke 退出 0、FakeController 与真实 controller 一致性测试、真实 controller + manager 接线脚本检查
 - [x] 独立评审（1 个 reviewer）9 条 → 修 8 条（卡片在确认框期间被重建删除、残留进程误判会杀自己的 runner、状态窗口按快照时间算、ERROR 让位 EXTERNAL、无窗口时的 MessageBox 崩溃、设置过期副本覆盖、登录框叠模态、停止记录读后删）；取消注销后不自动恢复留 M4；全量 2300 passed、smoke 0
 - [x] CI（windows-latest，0f8df5e）绿：lint、test 2329 passed（core 覆盖率 98%）、build 打包并冒烟三个 exe。前两轮失败都在测试侧：同线程命名管道写不出（改成真实第二进程发送）、离屏下 qframelesswindow 的 GetWindowPlacement 报 1400（`ui/compat.tolerate_offscreen_window_handles`）、import/forget 测试与随后的 discover() 竞态
-- [ ] XM：真机 pytest、`_diag` 运行中可读 spike、CLI stop 后显示“GitHub 会话未过期”
+- [x] XM：真机 pytest 2328 passed；`_diag` 运行中可读（列表元数据改用 `os.stat`，否则正在写的日志显示 0 B）；CLI 强杀后 `status` 显示“GitHub 会话未过期”并倒数（spike-notes §11）
 - [ ] 桌面验收（m3-design §9 七项）
 - [ ] 发布 v0.2.0
 
