@@ -303,7 +303,7 @@ runnerdeck/
 **版本与发布（`.github/workflows/release.yml`）**
 
 - 版本号：SemVer，唯一来源是 `pyproject.toml` 的 `version`；运行时用 `importlib.metadata.version("runnerdeck")` 读取，设置页“关于”和 `--version` 都显示它。
-- 0.x 阶段：M2 结束发 `v0.1.0`（预发布），M3 结束发 `v0.2.0`，M4 结束发 `v1.0.0`。tag 带 `-alpha` / `-beta` / `-rc` 后缀时自动标记为 pre-release。
+- 0.x 阶段：M2 结束发 `v0.1.0`（预发布），M3 结束发 `v0.2.0`，M4 结束发 `v1.0.0`。主版本号为 0（`v0.*`）或 tag 带 `-alpha` / `-beta` / `-rc` 后缀时自动标记为 pre-release。
 - 发布步骤（本机）：
   1. 改 `pyproject.toml` 版本号，`uv lock`；把 `CHANGELOG.md` 的 `Unreleased` 段落改成新版本号和日期。
   2. 提交 `chore(release): vX.Y.Z`，推到 `main`，等 CI 绿。

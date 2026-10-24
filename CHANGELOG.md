@@ -5,6 +5,14 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-24
+
+First pre-release: a Windows desktop app that registers and runs repo-level GitHub Actions
+self-hosted runners. Download `RunnerDeck-0.1.0-win-x64.zip`, unzip it anywhere and run
+`RunnerDeck.exe`; sign in with a fine-grained PAT that selects your repositories and grants
+Administration: Read and write. The exe is not code-signed yet, so SmartScreen may warn about an
+unknown publisher; compare the zip's SHA-256 with the release page before running it.
+
 ### Added
 - M0 spike scripts for the GitHub REST API and runner lifecycle (`scripts/spike_*.py`).
 - Real runner stdout and config samples under `tests/fixtures/`.
@@ -27,3 +35,6 @@ All notable changes to this project are documented here. Format follows
 - CI: offscreen Qt tests on Windows plus a `build` job that packages and smoke-tests the
   exes; `release.yml` publishes the zip as a GitHub Release on `v*` tags with notes taken
   from this file (`scripts/changelog_section.py`).
+
+[Unreleased]: https://github.com/nablejohne/RunnerDeck/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/nablejohne/RunnerDeck/releases/tag/v0.1.0

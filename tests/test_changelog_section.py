@@ -109,7 +109,16 @@ def test_main_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
     assert "用法" in capsys.readouterr().err
 
 
-def test_repo_changelog_has_unreleased_section() -> None:
-    """The real file must stay parseable: release.yml depends on it."""
+def test_repo_changelog_has_a_section_for_the_project_version() -> None:
+    """The real file must stay parseable: release.yml extracts the notes for this version.
+
+    Between releases the version still names the last release (or 0.0.0 before the first),
+    whose section must exist; `## [Unreleased]` may be empty right after a release.
+    """
+    import tomllib
+
     text = DEFAULT_CHANGELOG.read_text(encoding="utf-8")
-    assert extract_section(text, "Unreleased")
+    pyproject = DEFAULT_CHANGELOG.parent / "pyproject.toml"
+    version = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert "## [Unreleased]" in text
+    assert extract_section(text, version if version != "0.0.0" else "Unreleased")

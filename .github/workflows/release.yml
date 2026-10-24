@@ -40,8 +40,10 @@ jobs:
             exit 1
           fi
           echo "version=$PROJECT_VERSION" >> "$GITHUB_OUTPUT"
+          # 0.x is initial development (SemVer), so v0.1.0 / v0.2.0 ship as pre-releases;
+          # v1.0.0 and later only when the tag carries an -alpha / -beta / -rc suffix.
           case "$GITHUB_REF_NAME" in
-            *-alpha*|*-beta*|*-rc*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            v0.*|*-alpha*|*-beta*|*-rc*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
             *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
           esac
 

@@ -1,6 +1,6 @@
 [project]
 name = "runnerdeck"
-version = "0.0.0"
+version = "0.1.0"
 description = "Windows tray app for managing repo-level GitHub Actions self-hosted runners"
 readme = "README.md"
 license = "GPL-3.0-or-later"
