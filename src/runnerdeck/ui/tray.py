@@ -15,12 +15,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
-from PyQt5.QtCore import QObject, QRectF, Qt
+from PyQt5.QtCore import QObject, QRectF, Qt, QTimer
 from PyQt5.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QSystemTrayIcon
 from qfluentwidgets import Action, SystemTrayMenu
 from qfluentwidgets import FluentIcon as FIF
 
+from runnerdeck.core import job_log
 from runnerdeck.core.models import Discovery, DisplayState, LocalState
 from runnerdeck.core.status import DisplayStatus, TrayLevel, is_job_failure, tray_level
 from runnerdeck.ui.components.runner_card import confirm_stop
@@ -49,6 +50,9 @@ TOOLTIP_MAX = 127
 TITLE_MAX = 63
 MESSAGE_MAX = 255
 MESSAGE_MS = 10000
+# A failed job's notification waits this long for the failed step from GitHub (the
+# controller's follow-up), then goes out without it.
+FAILURE_WAIT_MS = 30_000
 JOB_RESULT_TEXT: Mapping[str, str] = MappingProxyType(
     {
         "succeeded": "成功",
@@ -127,6 +131,8 @@ class TrayIcon(QSystemTrayIcon):
         controller.display_changed.connect(self._on_display_changed)
         controller.config_changed.connect(self._on_config_changed)
         controller.runner_job_finished.connect(self._on_job_finished)
+        controller.job_summarized.connect(self._on_job_summarized)
+        self._pending_failures: dict[str, tuple[str, str]] = {}  # record id -> (job, result)
         controller.discovery_updated.connect(self._on_discovery_updated)
 
         self._states = {rid: d.state for rid, d in controller.all_displays().items()}
@@ -254,9 +260,29 @@ class TrayIcon(QSystemTrayIcon):
         failure = is_job_failure(result)
         if mode == "off" or (mode == "failed" and not failure):
             return
+        if failure and self._controller.is_logged_in:
+            # wait for the failed step (controller.job_summarized), at most FAILURE_WAIT_MS
+            self._pending_failures[record_id] = (job, result)
+            QTimer.singleShot(FAILURE_WAIT_MS, lambda: self._flush_failure(record_id))
+            return
+        self._notify_job(record_id, job, result, None)
+
+    def _on_job_summarized(self, record_id: str, snapshot: object) -> None:
+        pending = self._pending_failures.pop(record_id, None)
+        if pending is not None:
+            summary = job_log.summary_line(snapshot) if snapshot is not None else None
+            self._notify_job(record_id, *pending, summary)  # type: ignore[arg-type]
+
+    def _flush_failure(self, record_id: str) -> None:
+        pending = self._pending_failures.pop(record_id, None)
+        if pending is not None:
+            self._notify_job(record_id, *pending, None)
+
+    def _notify_job(self, record_id: str, job: str, result: str, summary: str | None) -> None:
+        failure = is_job_failure(result)
         self.notify(
             truncate(f"{self._name_of(record_id)}：job {job_result_text(result)}", TITLE_MAX),
-            job or "（job 名字未知）",
+            summary or job or "（job 名字未知）",
             QSystemTrayIcon.Critical if failure else QSystemTrayIcon.Information,
         )
 

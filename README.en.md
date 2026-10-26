@@ -16,7 +16,7 @@ Sign in with one PAT, register a runner in a few steps; start, stop, status, log
 
 [简体中文](README.md) · **English**
 
-[Quick start](#quick-start) · [Features](#features) · [How it works](#how-it-works) · [Process vs service](#modes) · [PAT permissions](#pat) · [FAQ](#faq)
+[Quick start](#quick-start) · [Use in a repo](#use-in-github) · [Features](#features) · [How it works](#how-it-works) · [Process vs service](#modes) · [PAT permissions](#pat) · [FAQ](#faq)
 
 </div>
 
@@ -38,6 +38,9 @@ Sign in with one PAT, register a runner in a few steps; start, stop, status, log
 | 🖥️ **Lives in the tray** | The icon colour is the status (grey stopped · green idle · blue running a job · red needs attention); launch on login, start runners with RunnerDeck, job success / failure notifications |
 | 🛡️ **Service mode** | Run a runner as a Windows service: starts with Windows, no sign-in needed, keeps running when RunnerDeck quits; one UAC prompt, then start / stop without prompts |
 | 🔍 **Workflow check** | The detail page lists the repository's jobs that would use this runner and points out labels that do not match (such a job stays queued forever); recent runs too |
+| ⚡ **pip mirror** | Pick the PyPI mirror pip uses in CI (written into the runner's `.env`) and speed-test every mirror with one click |
+| 🧾 **Job progress and failures** | The detail page's Job tab shows the steps live; a failed job shows the failed step, the error lines and the whole log, and the card and notification name the failed step |
+| 📝 **Edit environment variables** | Edit a runner's `.env` (proxy, git settings, …) right from its card, with save and restart |
 | 📜 **Live output and logs** | Live output and the runner's `_diag` logs (redacted); import existing runner directories, take over a runner another process runs |
 | 📦 **Install and verify** | Per-user installer, no administrator rights; every release ships `SHA256SUMS.txt` and GitHub build provenance; update check in settings |
 
@@ -50,6 +53,32 @@ Sign in with one PAT, register a runner in a few steps; start, stop, status, log
 3. Click "添加 runner" (add runner), pick a repository, enter labels and, if you like, tick "以 Windows 服务运行" (run as a Windows service).
 
 <img src="docs/assets/add-service.png" alt="Add wizard, step 2: name, labels, run as a Windows service, and the summary of what will happen" />
+
+<a id="use-in-github"></a>
+
+## 📘 Using it from a GitHub repository
+
+Once the runner is added, point a workflow's jobs at it with `runs-on`:
+
+```yaml
+name: CI
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: [self-hosted, Windows, X64, my-label]   # my-label: the label you gave the runner
+    steps:
+      - uses: actions/checkout@v4
+      - run: python --version
+```
+
+- **Labels**: the runner adds `self-hosted`, `Windows` and `X64` itself. A job goes to a runner that has every label in `runs-on`; add a label of your own and the job only goes to this machine. The detail page's Workflow tab lists which jobs can use the runner and which label is missing.
+- **Unlike GitHub-hosted runners**: tools such as Python, Node or PowerShell 7 must be installed on this machine; the default shell is PowerShell; `_work` is kept between runs; one runner runs one job at a time, the rest wait.
+- **Environment variables**: the proxy and the pip mirror are set in settings and written into every runner's `.env`; anything else goes in the runner card's "⋯ → 编辑环境变量（.env）" (edit environment variables). Restart the runner for changes to apply.
+- **Public repositories**: anyone's fork PR may run code on your machine. Turn on "Require approval for fork pull request workflows" in the repository's Settings → Actions → General, and trigger self-hosted workflows only on `push` / `workflow_dispatch`.
 
 <a id="how-it-works"></a>
 
@@ -92,7 +121,7 @@ RunnerDeck relies on two things only: the GitHub REST API (registration tokens, 
 | --- | --- | --- |
 | Administration: Read and write | ✅ | Registering and removing runners, runner status |
 | Contents: Read | Optional | Reading workflows for the label check |
-| Actions: Read | Optional | Recent runs on the detail page |
+| Actions: Read | Optional | Recent runs and the Job tab (steps and log) on the detail page; the failed step in notifications |
 
 Select the repositories under Repository access on a fine-grained token; a classic token needs `repo`.
 
@@ -149,6 +178,62 @@ RunnerDeck's own logs are in `%LOCALAPPDATA%\RunnerDeck\logs` (open them from se
 <summary><b>Organisation or enterprise runners?</b></summary>
 
 Only repository-level runners for now.
+</details>
+
+### CI troubleshooting
+
+<details>
+<summary><b>A job stays at "Waiting for a runner"?</b></summary>
+
+- Check that the runner is online in RunnerDeck (green or blue).
+- Check that it has every label in `runs-on`: detail page → Workflow tab names the missing one.
+- If you added the label later: GitHub matches runners only when a job is queued, so cancel the queued job and run it again.
+</details>
+
+<details>
+<summary><b>checkout fails with <code>unable to access 'https://github.com/...': Connection was reset</code>?</b></summary>
+
+The machine cannot reach github.com directly. A browser works because it uses the system proxy, but git and the runner do not read it. Enter the proxy in Settings → 代理 (proxy), e.g. a local proxy app's `http://127.0.0.1:10808`; it goes into every runner's `.env` and applies after a restart of the runner.
+</details>
+
+<details>
+<summary><b>Steps with <code>shell: pwsh</code> cannot find pwsh?</b></summary>
+
+Windows ships Windows PowerShell 5.1; `pwsh` is PowerShell 7 and has to be installed (machine-wide MSI, or `winget install --id Microsoft.PowerShell`). Afterwards **quit RunnerDeck from the tray and start it again**: process-mode runners inherit RunnerDeck's PATH, so restarting only the runner does not see the new program. For a service runner, restart the service.
+</details>
+
+<details>
+<summary><b><code>actions/setup-python</code> fails the first time it installs Python?</b></summary>
+
+On a self-hosted Windows runner, setup-python needs administrator rights the first time it installs a Python version, and a process-mode runner has none. Install it once as administrator; later runs use the cache and need no rights:
+
+1. Download `python-<version>-win32-x64.zip` from [actions/python-versions](https://github.com/actions/python-versions/releases) and unzip it into an empty folder.
+2. In an **administrator** PowerShell, go to that folder, point the tool cache at the runner's `_work\_tool` and run `setup.ps1`:
+
+   ```powershell
+   $env:RUNNER_TOOL_CACHE = "D:\runners\<runner folder>\_work\_tool"
+   .\setup.ps1
+   ```
+
+3. It is done when `_work\_tool\Python\<version>\x64.complete` exists.
+</details>
+
+<details>
+<summary><b>checkout ends with <code>EBUSY: resource busy or locked, rmdir '…\_work\_temp\…'</code>?</b></summary>
+
+Git on this machine has `core.fsmonitor` on (an option of the Git for Windows installer): the fsmonitor daemon started during checkout holds its temporary folder. Add these lines in the runner card's "⋯ → 编辑环境变量（.env）" to turn fsmonitor off for this runner's jobs only (your own git is not affected), save, and restart the runner:
+
+```
+GIT_CONFIG_COUNT=1
+GIT_CONFIG_KEY_0=core.fsmonitor
+GIT_CONFIG_VALUE_0=false
+```
+</details>
+
+<details>
+<summary><b>pip installs dependencies very slowly?</b></summary>
+
+PyPI mirrors throttle some networks hard (measured on one machine: Aliyun 0.4 MB/s, Tencent 28 MB/s). In Settings → pip 镜像源 (pip mirror), click 测速 (speed test) and pick the fastest; it is written into every runner's `.env` as `PIP_INDEX_URL`, which pip prefers over the machine's `pip.ini`, and applies after a restart of the runner.
 </details>
 
 ## 🛠️ Development

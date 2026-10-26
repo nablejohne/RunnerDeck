@@ -62,10 +62,12 @@ from runnerdeck.core.errors import (
     RunnerDeckError,
 )
 from runnerdeck.core.models import (
+    DownloadSample,
     GitHubUser,
     RemoteRunner,
     Repo,
     RunnerToken,
+    WorkflowJob,
     WorkflowRun,
     validate_owner_repo,
 )
@@ -80,6 +82,7 @@ CONNECT_RETRIES = 2
 PER_PAGE = 100
 MAX_PAGES = 50  # 5000 items; a longer Link chain is treated as broken
 DOWNLOAD_CHUNK = 64 * 1024
+JOB_LOG_MAX_BYTES = 8 * 1024 * 1024  # a job log beyond this keeps its end
 
 _RUNNER_RELEASES = "/repos/actions/runner/releases"
 _VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+)")
@@ -560,6 +563,45 @@ class GitHubClient:
             raise self._bad_payload(resp, "GET", path)
         return [self._model(WorkflowRun, item, resp, "GET", path) for item in runs]
 
+    def list_run_jobs(self, owner: str, repo: str, run_id: int) -> list[WorkflowJob]:
+        """The jobs of one workflow run (latest attempt). 403 -> PermissionDeniedError."""
+        path = self._repo_path(owner, repo) + f"/actions/runs/{run_id}/jobs"
+        try:
+            resp = self._request("GET", path, params={"per_page": 100})
+        except PermissionDeniedError as e:
+            raise _needs(e, "Actions: Read（读取 job）") from e
+        data = self._json(resp, "GET", path)
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        if not isinstance(jobs, list):
+            raise self._bad_payload(resp, "GET", path)
+        return [self._model(WorkflowJob, item, resp, "GET", path) for item in jobs]
+
+    def get_job(self, owner: str, repo: str, job_id: int) -> WorkflowJob:
+        """One job with its steps (they update while it runs). 403 -> PermissionDeniedError."""
+        path = self._repo_path(owner, repo) + f"/actions/jobs/{job_id}"
+        try:
+            resp = self._request("GET", path, not_found=f"job {job_id} 不存在")
+        except PermissionDeniedError as e:
+            raise _needs(e, "Actions: Read（读取 job）") from e
+        return self._model(WorkflowJob, self._json(resp, "GET", path), resp, "GET", path)
+
+    def download_job_log(self, owner: str, repo: str, job_id: int) -> str | None:
+        """A completed job's plain-text log (the redirect to the log store is followed without
+        Authorization). None when GitHub has no log for it (yet): while a job runs the
+        redirect leads to a 404 (spike-notes §13). Longer logs keep their last
+        JOB_LOG_MAX_BYTES."""
+        path = self._repo_path(owner, repo) + f"/actions/jobs/{job_id}/logs"
+        try:
+            resp = self._request("GET", path, ok_statuses=frozenset({404}))
+        except PermissionDeniedError as e:
+            raise _needs(e, "Actions: Read（读取 job 日志）") from e
+        if resp.status_code == 404:
+            return None
+        content = resp.content
+        if len(content) > JOB_LOG_MAX_BYTES:
+            content = content[-JOB_LOG_MAX_BYTES:]
+        return content.decode("utf-8-sig", errors="replace")
+
     def get_latest_release(self, owner: str, repo: str) -> dict[str, Any] | None:
         """Raw JSON of the repo's latest (non pre-release) release; None when it has none."""
         path = self._repo_path(owner, repo) + "/releases/latest"
@@ -635,6 +677,47 @@ class GitHubClient:
             raise
         log.info("GET %s -> %d bytes (%.2fs)", target, done, _since(started))
         return digest.hexdigest()
+
+    def measure_download(self, url: str, *, max_bytes: int, max_seconds: float) -> DownloadSample:
+        """A download-speed sample: GET `url` like download() (no Authorization, same proxy
+        settings, redirects followed) and stop after `max_bytes` or `max_seconds` of body.
+        The clock starts when the response headers arrive, so connection setup and a slow
+        redirect do not count. HTTP error status -> GitHubError, transport failure ->
+        NetworkError."""
+        try:
+            parsed = httpx.URL(url)
+        except (httpx.InvalidURL, ValueError) as e:
+            raise InvalidInputError("测速地址不合法") from e
+        if parsed.scheme not in ("http", "https") or not parsed.host:
+            raise InvalidInputError(
+                f"测速地址必须是 http(s) 链接（{parsed.scheme}://{parsed.host}）"
+            )
+        target = f"{parsed.host}{parsed.path}"
+        client = self._new_client(
+            headers={"User-Agent": USER_AGENT}, follow_redirects=True, for_download=True
+        )
+        received = 0
+        seconds = 0.0
+        try:
+            with client, client.stream("GET", parsed) as resp:
+                if resp.is_error:
+                    raise GitHubError(
+                        f"测速失败（GET {target} -> {resp.status_code}）",
+                        status=resp.status_code,
+                        method="GET",
+                        path=target,
+                    )
+                started = time.monotonic()
+                for chunk in resp.iter_raw(DOWNLOAD_CHUNK):
+                    received += len(chunk)
+                    seconds = time.monotonic() - started
+                    if received >= max_bytes or seconds >= max_seconds:
+                        break
+        except httpx.HTTPError as e:
+            log.warning("speed test GET %s failed: %s", target, type(e).__name__)
+            raise _network_error(e, "GET", target, "镜像源") from e
+        log.info("speed test GET %s -> %d bytes in %.2fs", target, received, seconds)
+        return DownloadSample(received, seconds)
 
     # --- internals
 

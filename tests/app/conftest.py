@@ -363,6 +363,8 @@ class FakeManager:
         self.store = store
         self.client_factory = client_factory
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.env_texts: dict[str, str] = {}  # read_env / write_env
+        self.job_snapshots: list[Any] = []  # job_snapshot answers, in order (last repeats)
         self.threads: list[threading.Thread] = []
         self.errors: dict[str, Exception] = {}
         self.service_states: dict[str, LocalSnapshot] = {}  # service_locals() answers
@@ -523,6 +525,14 @@ class FakeManager:
     def grant_service_control(self, record_id: str) -> None:
         self._call("grant_service_control", record_id=record_id)
 
+    def job_snapshot(self, record_id: str, job_id: int | None = None) -> Any:
+        from runnerdeck.core.models import JobSnapshot
+
+        self._call("job_snapshot", record_id=record_id, job_id=job_id)
+        if not self.job_snapshots:
+            return JobSnapshot()
+        return self.job_snapshots.pop(0) if len(self.job_snapshots) > 1 else self.job_snapshots[0]
+
     def repo_insights(self, record_id: str) -> Any:
         from runnerdeck.core.models import RepoInsights
 
@@ -531,6 +541,18 @@ class FakeManager:
 
     def apply_proxy(self, old: str | None, new: str | None) -> ProxyApplyResult:
         self._call("apply_proxy", old=old, new=new)
+        return ProxyApplyResult(updated=("r1",))
+
+    def read_env(self, key: str) -> str:
+        self._call("read_env", key=key)
+        return self.env_texts.get(key, "")
+
+    def write_env(self, key: str, text: str) -> None:
+        self._call("write_env", key=key, text=text)
+        self.env_texts[key] = text
+
+    def apply_pip_index(self, old: str | None, new: str | None) -> ProxyApplyResult:
+        self._call("apply_pip_index", old=old, new=new)
         return ProxyApplyResult(updated=("r1",))
 
     def harden_runners_root(self) -> Path:

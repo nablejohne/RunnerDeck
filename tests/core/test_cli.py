@@ -1982,6 +1982,7 @@ def test_settings_show(h: Harness) -> None:
     assert "default_labels   无" in result.out
     assert "poll_interval_s  30" in result.out
     assert "未设置" in result.out
+    assert "pip_index_url    不设置" in result.out
     assert str(h.store.path) in result.out
 
 
@@ -1994,6 +1995,19 @@ def test_settings_show(h: Harness) -> None:
         ("proxy", "127.0.0.1:7890", "http://127.0.0.1:7890", "= http://127.0.0.1:7890"),
         ("proxy", "https://proxy.example:8443", "https://proxy.example:8443", "8443"),
         ("proxy", "none", None, "= 未设置"),
+        (
+            "pip_index_url",
+            "tencent",
+            "https://mirrors.cloud.tencent.com/pypi/simple/",
+            "（腾讯云）",
+        ),
+        (
+            "pip_index_url",
+            "https://pypi.example.com/simple/",
+            "https://pypi.example.com/simple/",
+            "自定义（pypi.example.com）",
+        ),
+        ("pip_index_url", "none", None, "不设置"),
     ],
 )
 def test_settings_set(h: Harness, key: str, value: str, stored: Any, printed: str) -> None:
@@ -2021,6 +2035,8 @@ def test_settings_set_runners_root_is_absolute(h: Harness) -> None:
         ("proxy", "http://", "代理地址不合法"),
         ("default_labels", "bad label!", "标签不合法"),
         ("runners_root", "  ", "不能为空"),
+        ("pip_index_url", "ftp://pypi.example.com/simple/", "http(s)"),
+        ("pip_index_url", "https://u:p@pypi.example.com/simple/", "用户名或密码"),
     ],
 )
 def test_settings_set_rejects_bad_values(h: Harness, key: str, value: str, needle: str) -> None:

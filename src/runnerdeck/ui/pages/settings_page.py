@@ -25,6 +25,7 @@ from qfluentwidgets import (
     LineEdit,
     MessageBox,
     PrimaryPushSettingCard,
+    PushButton,
     PushSettingCard,
     ScrollArea,
     SettingCard,
@@ -35,10 +36,17 @@ from qfluentwidgets import (
 from qfluentwidgets import FluentIcon as FIF
 
 from runnerdeck import __version__
-from runnerdeck.core import paths
+from runnerdeck.core import paths, pip_mirror
 from runnerdeck.core.account import TOKEN_KIND_LABELS, format_expiry
-from runnerdeck.core.models import AppSettings, AutostartState, ProxyApplyResult, UpdateInfo
+from runnerdeck.core.models import (
+    AppSettings,
+    AutostartState,
+    MirrorSpeed,
+    ProxyApplyResult,
+    UpdateInfo,
+)
 from runnerdeck.ui.components.login_dialog import LoginDialog
+from runnerdeck.ui.components.mirror_speed_dialog import MirrorSpeedDialog, format_speed
 from runnerdeck.ui.theme import THEME_LABELS
 
 if TYPE_CHECKING:
@@ -54,6 +62,10 @@ NOTIFY_OPTIONS: tuple[tuple[str, str], ...] = (
     ("failed", "仅失败"),
     ("off", "关闭"),
 )
+PIP_MIRROR_TEXT = (
+    "CI 里 pip 下载依赖用的源，写入每个 runner 的 .env（PIP_INDEX_URL）；不设置则用本机的 pip 配置"
+)
+PIP_TEST_TEXT = "测速"
 HARDEN_ROOT_TEXT = "只允许管理员、SYSTEM 和你修改根目录；其他用户只能看到目录名"
 HARDEN_ROOT_CONFIRM = (
     "将改写这个目录的权限：管理员、SYSTEM 和你完全控制（子目录继承），其他用户只能列出目录名，"
@@ -83,6 +95,11 @@ def launch_text(state: AutostartState) -> str:
     if not state.matches:
         return LAUNCH_MISMATCH_TEXT
     return LAUNCH_ON_TEXT
+
+
+def _spaced(what: str) -> str:
+    """A space before a term that starts with Latin text, after Chinese (写入 pip 镜像源失败)."""
+    return f" {what}" if what[:1].isascii() else what
 
 
 def validate_proxy(text: str) -> str | None:
@@ -146,7 +163,8 @@ class SwitchCard(SwitchSettingCard):
 
 
 class ComboSettingCard(SettingCard):
-    """SettingCard with a ComboBox on the right (no qconfig); emits `selected(value)`."""
+    """SettingCard with a ComboBox on the right (no qconfig); emits `selected(value)`.
+    With `button_text`, a PushButton (`button`) follows the ComboBox."""
 
     selected = pyqtSignal(object)
 
@@ -157,11 +175,17 @@ class ComboSettingCard(SettingCard):
         content: str | None,
         options: Sequence[tuple[object, str]],
         parent: QWidget | None = None,
+        button_text: str | None = None,
     ) -> None:
         super().__init__(icon, title, content, parent)
         self.comboBox = ComboBox(self)
         self.comboBox.setMinimumWidth(160)
         self.hBoxLayout.addWidget(self.comboBox, 0, Qt.AlignRight)
+        self.button: PushButton | None = None
+        if button_text is not None:
+            self.button = PushButton(button_text, self)
+            self.hBoxLayout.addSpacing(8)
+            self.hBoxLayout.addWidget(self.button, 0, Qt.AlignRight)
         self.hBoxLayout.addSpacing(16)
         self._syncing = False
         self.set_options(options)
@@ -255,6 +279,14 @@ class SettingsPage(ScrollArea):
             "http://127.0.0.1:7890",
             self.runnerGroup,
         )
+        self.pipMirrorCard = ComboSettingCard(
+            FIF.DOWNLOAD,
+            "pip 镜像源",
+            PIP_MIRROR_TEXT,
+            pip_mirror.options(controller.config.settings.pip_index_url),
+            self.runnerGroup,
+            button_text=PIP_TEST_TEXT,
+        )
         self.pollCard = ComboSettingCard(
             FIF.SYNC,
             "轮询间隔",
@@ -266,6 +298,7 @@ class SettingsPage(ScrollArea):
         self.runnerGroup.addSettingCard(self.hardenRootCard)
         self.runnerGroup.addSettingCard(self.labelsCard)
         self.runnerGroup.addSettingCard(self.proxyCard)
+        self.runnerGroup.addSettingCard(self.pipMirrorCard)
         self.runnerGroup.addSettingCard(self.pollCard)
 
         # startup & tray
@@ -344,6 +377,8 @@ class SettingsPage(ScrollArea):
         self.hardenRootCard.clicked.connect(self.ask_harden_root)
         self.labelsCard.committed.connect(self._on_labels_committed)
         self.proxyCard.committed.connect(self._on_proxy_committed)
+        self.pipMirrorCard.selected.connect(lambda value: self._save(pip_index_url=value))
+        self.pip_test_button.clicked.connect(self.test_pip_mirrors)
         self.pollCard.selected.connect(lambda value: self._save(poll_interval_s=value))
         self.launchCard.checkedChanged.connect(self._on_launch_switched)
         self.startMinimizedCard.checkedChanged.connect(
@@ -367,6 +402,8 @@ class SettingsPage(ScrollArea):
         controller.logged_out.connect(self._on_logged_out)
         controller.autostart_state_loaded.connect(self._on_autostart_state_loaded)
         controller.proxy_applied.connect(self._on_proxy_applied)
+        controller.pip_index_applied.connect(self._on_pip_index_applied)
+        controller.pip_mirrors_tested.connect(self._on_pip_mirrors_tested)
         controller.runners_root_hardened.connect(self._on_root_hardened)
         controller.failed.connect(self._on_failed)
 
@@ -402,6 +439,8 @@ class SettingsPage(ScrollArea):
         self.rootCard.setContent(settings.runners_root)
         self.labelsCard.set_value(", ".join(settings.default_labels))
         self.proxyCard.set_value(settings.proxy or "")
+        self.pipMirrorCard.set_options(pip_mirror.options(settings.pip_index_url))
+        self.pipMirrorCard.set_value(pip_mirror.option_value(settings.pip_index_url))
         self.pollCard.set_options(poll_options(settings.poll_interval_s))
         self.pollCard.set_value(settings.poll_interval_s)
         self.notifyCard.set_value(settings.notify_jobs)
@@ -531,21 +570,27 @@ class SettingsPage(ScrollArea):
         )  # fmt: skip
 
     def _on_proxy_applied(self, result: ProxyApplyResult) -> None:
+        self._show_env_applied(result, "代理")
+
+    def _on_pip_index_applied(self, result: ProxyApplyResult) -> None:
+        self._show_env_applied(result, "pip 镜像源")
+
+    def _show_env_applied(self, result: ProxyApplyResult, what: str) -> None:
         if result.updated:
             InfoBar.success(
-                "代理已写入 runner",
+                f"{what}已写入 runner",
                 f"已更新 {len(result.updated)} 个 runner 的 .env；正在运行的 runner 重启后生效",
                 parent=self, position=InfoBarPosition.TOP, duration=6000,
             )  # fmt: skip
         if result.custom:
             InfoBar.warning(
-                "保留了自定义代理",
-                f"{'、'.join(result.custom)} 的 .env 里有你自己写的代理，没有改动",
+                f"保留了自定义{_spaced(what)}",
+                f"{'、'.join(result.custom)} 的 .env 里有你自己写的{_spaced(what)}，没有改动",
                 parent=self, position=InfoBarPosition.TOP, duration=8000,
             )  # fmt: skip
         if result.failed:
             InfoBar.error(
-                "写入代理失败",
+                f"写入{_spaced(what)}失败",
                 "；".join(f"{name}：{reason}" for name, reason in result.failed),
                 parent=self, position=InfoBarPosition.TOP, duration=10000,
             )  # fmt: skip
@@ -574,6 +619,42 @@ class SettingsPage(ScrollArea):
                 self._controller.load_autostart_state()
         elif op == "account":
             self.accountCard.setContent("读取 token 信息失败，详情见上方提示")
+        elif op == "pip_mirror_test":
+            self._reset_pip_test_button()
+            self.pipMirrorCard.setContent("测速失败，详情见上方提示")
+
+    # --- pip mirror ------------------------------------------------------------------------
+
+    @property
+    def pip_test_button(self) -> PushButton:
+        assert self.pipMirrorCard.button is not None
+        return self.pipMirrorCard.button
+
+    def test_pip_mirrors(self) -> None:
+        self.pip_test_button.setEnabled(False)
+        self.pip_test_button.setText("测速中…")
+        self.pipMirrorCard.setContent(
+            f"正在逐个测速 {len(pip_mirror.candidates(self.settings.pip_index_url))} 个镜像源…"
+        )
+        self._controller.test_pip_mirrors()
+
+    def _reset_pip_test_button(self) -> None:
+        self.pip_test_button.setEnabled(True)
+        self.pip_test_button.setText(PIP_TEST_TEXT)
+
+    def _on_pip_mirrors_tested(self, results: list[MirrorSpeed]) -> None:
+        self._reset_pip_test_button()
+        ranked = pip_mirror.ranked(results)
+        if ranked and ranked[0].mb_per_s is not None:
+            self.pipMirrorCard.setContent(
+                f"上次测速：{ranked[0].label} 最快（{format_speed(ranked[0])}）"
+            )
+        else:
+            self.pipMirrorCard.setContent("上次测速：所有镜像源都失败了")
+        settings = self.settings
+        dialog = MirrorSpeedDialog(results, settings.pip_index_url, settings.proxy, self.window())
+        if dialog.exec() and dialog.best_url is not None:
+            self._save(pip_index_url=dialog.best_url)
 
     # --- about -------------------------------------------------------------------------
 

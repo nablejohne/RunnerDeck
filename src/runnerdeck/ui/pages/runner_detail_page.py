@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import html
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PyQt5.QtCore import QPoint, Qt, QUrl, pyqtSignal
+from PyQt5.QtCore import QPoint, Qt, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import QGridLayout, QHBoxLayout, QStackedWidget, QVBoxLayout, QWidget
 from qfluentwidgets import (
@@ -34,9 +35,11 @@ from qfluentwidgets import (
 )
 from qfluentwidgets import FluentIcon as FIF
 
+from runnerdeck.core import job_log
 from runnerdeck.core.models import (
     DiagLog,
     DisplayState,
+    JobSnapshot,
     LocalState,
     MatchKind,
     RepoInsights,
@@ -62,7 +65,8 @@ if TYPE_CHECKING:
     from runnerdeck.app.controller import RunnerController
 
 EMPTY_TEXT = "没有选中的 runner（可能已被移除或取消登记），请返回概览选择一个"
-TAB_OUTPUT, TAB_DIAG, TAB_WORKFLOW = "output", "diag", "workflow"
+TAB_OUTPUT, TAB_DIAG, TAB_WORKFLOW, TAB_JOB = "output", "diag", "workflow", "job"
+JOB_POLL_MS = 10_000  # Job tab refresh while the runner works on a job
 CONCLUSION_TEXT = {
     "success": "成功",
     "failure": "失败",
@@ -125,6 +129,48 @@ def insights_html(insights: RepoInsights) -> str:
     return "".join(parts)
 
 
+def job_html(snapshot: JobSnapshot, now: datetime | None = None) -> str:
+    """The Job tab: the job, its steps, and once it failed the errors and what led to them."""
+    esc = html.escape
+    if snapshot.error:
+        return f"<p>无法读取 job：{esc(snapshot.error)}</p>"
+    job = snapshot.job
+    if job is None:
+        return f"<p>最近 {JOB_SEARCH_RUNS_TEXT} 次运行里没有这台 runner 接过的 job。</p>"
+    title = esc(f"{job.workflow_name} → {job.name}" if job.workflow_name else job.name)
+    link = f'<a href="{esc(job.html_url)}">{title}</a>' if job.html_url else title
+    if job.done:
+        state = CONCLUSION_TEXT.get(job.conclusion or "", job.conclusion or "已结束")
+    else:
+        state = STATUS_TEXT.get(job.status, job.status)
+    took = job_log.duration(job.started_at, job.completed_at, now)
+    branch = f" · {esc(job.head_branch)}" if job.head_branch else ""
+    parts = [f"<h4>{link}</h4><p>{esc(state)}{f' · {took}' if took else ''}{branch}</p>"]
+    if job.steps:
+        parts.append("<table cellspacing='0' cellpadding='3'>")
+        for icon, step in job_log.step_states(job.steps):
+            spent = job_log.duration(step.started_at, step.completed_at, now)
+            name = esc(step.name)
+            if step.conclusion == "failure":
+                name = f"<b>{name}</b>"
+            parts.append(f"<tr><td>{icon}</td><td>{name}</td><td>{esc(spent)}</td></tr>")
+        parts.append("</table>")
+    if not job.done:
+        parts.append(
+            "<p>运行中只能看到步骤状态；日志在 job 结束后显示（GitHub 不提供运行中的日志）。</p>"
+        )
+    elif snapshot.log_pending:
+        parts.append("<p>GitHub 还没提供这个 job 的日志，稍后点刷新。</p>")
+    if snapshot.errors:
+        parts.append("<h4>错误</h4><ul>")
+        parts.extend(f"<li>{esc(error)}</li>" for error in snapshot.errors)
+        parts.append("</ul>")
+    if snapshot.excerpt:
+        parts.append(f"<h4>出错前的输出</h4><pre>{esc(chr(10).join(snapshot.excerpt))}</pre>")
+    return "".join(parts)
+
+
+JOB_SEARCH_RUNS_TEXT = "10"  # manager.JOB_SEARCH_RUNS (ui/ may not import core.manager)
 OUTPUT_MAX_LINES = 5000  # the controller keeps 2000; room for what arrives while open
 DIAG_DIR = "_diag"  # same name as core/diag.DIAG_DIR (ui/ may not import core.diag)
 DIAG_KIND_LABELS = {"runner": "Runner", "worker": "Worker", "other": "其他"}
@@ -212,6 +258,7 @@ class RunnerDetailPage(QWidget):
         # tabs
         self.segmented = SegmentedWidget(self.content)
         self.segmented.addItem(TAB_OUTPUT, "实时输出")
+        self.segmented.addItem(TAB_JOB, "Job")
         self.segmented.addItem(TAB_DIAG, "诊断日志")
         self.segmented.addItem(TAB_WORKFLOW, "Workflow")
         self.tabStack = QStackedWidget(self.content)
@@ -239,9 +286,33 @@ class RunnerDetailPage(QWidget):
         workflow_layout.addLayout(workflow_bar)
         workflow_layout.addWidget(self.workflowView, 1)
         self._insights_for: str | None = None  # record id the Workflow tab shows / loads
+        self.jobPanel = QWidget(self.content)
+        self.jobRefreshButton = PushButton(FIF.SYNC, "刷新", self.jobPanel)
+        self.jobGithubButton = PushButton(FIF.GITHUB, "在 GitHub 打开", self.jobPanel)
+        self.jobGithubButton.setEnabled(False)
+        self.jobStatusLabel = CaptionLabel("", self.jobPanel)
+        self.jobView = TextBrowser(self.jobPanel)
+        self.jobView.setOpenExternalLinks(True)
+        self.jobLogView = LogView(self.jobPanel)
+        self.jobLogView.hide()
+        job_layout = QVBoxLayout(self.jobPanel)
+        job_layout.setContentsMargins(0, 0, 0, 0)
+        job_bar = QHBoxLayout()
+        job_bar.addWidget(self.jobRefreshButton)
+        job_bar.addWidget(self.jobGithubButton)
+        job_bar.addWidget(self.jobStatusLabel, 1)
+        job_layout.addLayout(job_bar)
+        job_layout.addWidget(self.jobView, 2)
+        job_layout.addWidget(self.jobLogView, 3)
+        self._job_for: str | None = None  # record id the Job tab shows / loads
+        self._job_snapshot: JobSnapshot | None = None
+        self.jobTimer = QTimer(self)
+        self.jobTimer.setInterval(JOB_POLL_MS)
+        self.jobTimer.timeout.connect(self.reload_job)
         self.tabStack.addWidget(self.outputView)
         self.tabStack.addWidget(self.diagPanel)
         self.tabStack.addWidget(self.workflowPanel)
+        self.tabStack.addWidget(self.jobPanel)
         self.segmented.setCurrentItem(TAB_OUTPUT)
 
         self._build_layout()
@@ -267,6 +338,9 @@ class RunnerDetailPage(QWidget):
         controller.diag_text_loaded.connect(self._on_diag_text_loaded)
         controller.repo_insights_loaded.connect(self._on_insights_loaded)
         self.workflowRefreshButton.clicked.connect(lambda: self.reload_insights(force=True))
+        self.jobRefreshButton.clicked.connect(self.reload_job)
+        self.jobGithubButton.clicked.connect(self.open_job_on_github)
+        controller.job_snapshot_loaded.connect(self._on_job_loaded)
         controller.failed.connect(self._on_failed)
 
         self.show_record(None)
@@ -369,6 +443,7 @@ class RunnerDetailPage(QWidget):
             self.detailLabel.hide()
             self.outputView.clear()
             self._reset_diag()
+            self._reset_job()
             return
         self._fill_facts(record)
         state, job = self._controller.local_state(record.id)
@@ -384,6 +459,9 @@ class RunnerDetailPage(QWidget):
                 self.reload_diag_logs()
             elif self.current_tab == TAB_WORKFLOW:
                 self.reload_insights()
+            self._reset_job()
+            if self.current_tab == TAB_JOB:
+                self.reload_job()
 
     def _fill_facts(self, record: RunnerRecord) -> None:
         self.nameLabel.setText(record.name)
@@ -439,9 +517,13 @@ class RunnerDetailPage(QWidget):
     def _on_runner_state(self, record_id: str, state: object, job: object) -> None:
         if record_id != self.record_id:
             return
+        started = self._state is not LocalState.BUSY and LocalState(state) is LocalState.BUSY
         self._state = LocalState(state)
         self._job = job if isinstance(job, str) else None
         self._refresh_buttons()
+        if started and self.current_tab == TAB_JOB:
+            self.reload_job()  # a new job: find it
+        self._sync_job_timer()
 
     def _on_display_changed(self, record_id: str, display: object) -> None:
         if record_id == self.record_id and isinstance(display, DisplayStatus):
@@ -581,13 +663,85 @@ class RunnerDetailPage(QWidget):
         self.workflowView.setHtml(insights_html(insights))
 
     def _on_tab_changed(self, key: str) -> None:
-        panels = {TAB_DIAG: self.diagPanel, TAB_WORKFLOW: self.workflowPanel}
+        panels = {
+            TAB_DIAG: self.diagPanel,
+            TAB_WORKFLOW: self.workflowPanel,
+            TAB_JOB: self.jobPanel,
+        }
         self.tabStack.setCurrentWidget(panels.get(key, self.outputView))
         record = self._record
         if key == TAB_WORKFLOW and record is not None and self._insights_for != record.id:
             self.reload_insights()
         if key == TAB_DIAG and record is not None and self._diag_loaded_for != record.id:
             self.reload_diag_logs()
+        if key == TAB_JOB and record is not None:
+            self.reload_job()
+        self._sync_job_timer()
+
+    # --- Job tab (spike-notes §13) -----------------------------------------------------
+
+    def reload_job(self) -> None:
+        record = self._record
+        if record is None:
+            return
+        self._job_for = record.id
+        if self._job_snapshot is None:
+            self.jobStatusLabel.setText("正在从 GitHub 读取这台 runner 的 job…")
+        self._controller.load_job(record.id)
+
+    def _reset_job(self) -> None:
+        self._job_for = None
+        self._job_snapshot = None
+        self.jobView.clear()
+        self.jobLogView.clear()
+        self.jobLogView.hide()
+        self.jobStatusLabel.setText("")
+        self.jobGithubButton.setEnabled(False)
+        self._sync_job_timer()
+
+    def _on_job_loaded(self, record_id: str, snapshot: object) -> None:
+        if record_id != self._job_for or not isinstance(snapshot, JobSnapshot):
+            return
+        self._job_snapshot = snapshot
+        self.jobView.setHtml(job_html(snapshot, datetime.now(UTC)))
+        self.jobLogView.setVisible(bool(snapshot.log))
+        if snapshot.log:
+            self.jobLogView.set_lines(snapshot.log)
+        job = snapshot.job
+        self.jobGithubButton.setEnabled(job is not None and bool(job.html_url))
+        when = datetime.now().strftime("%H:%M:%S")
+        live = job is not None and not job.done
+        self.jobStatusLabel.setText(f"{when} 读取" + ("，job 运行中每 10 秒刷新" if live else ""))
+        self._sync_job_timer()
+
+    def _job_live(self) -> bool:
+        job = self._job_snapshot.job if self._job_snapshot is not None else None
+        return self._state is LocalState.BUSY or (job is not None and not job.done)
+
+    def _sync_job_timer(self) -> None:
+        wanted = (
+            self._record is not None
+            and self.current_tab == TAB_JOB
+            and self.isVisible()
+            and self._job_live()
+        )
+        if wanted and not self.jobTimer.isActive():
+            self.jobTimer.start()
+        elif not wanted and self.jobTimer.isActive():
+            self.jobTimer.stop()
+
+    def open_job_on_github(self) -> None:
+        job = self._job_snapshot.job if self._job_snapshot is not None else None
+        if job is not None and job.html_url:
+            QDesktopServices.openUrl(QUrl(job.html_url))
+
+    def showEvent(self, event: object) -> None:  # noqa: N802 (Qt override)
+        super().showEvent(event)  # type: ignore[arg-type]
+        self._sync_job_timer()
+
+    def hideEvent(self, event: object) -> None:  # noqa: N802 (Qt override)
+        super().hideEvent(event)  # type: ignore[arg-type]
+        self._sync_job_timer()
 
     def switch_tab(self, key: str) -> None:
         """Select 实时输出 / 诊断日志 (TAB_OUTPUT / TAB_DIAG) as if the user clicked it."""

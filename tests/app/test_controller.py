@@ -13,7 +13,7 @@ import dataclasses
 import os
 import sys
 import threading
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -795,6 +795,80 @@ def test_save_settings_without_proxy_change_does_not_apply(
     with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
         h.controller.save_settings(settings)
     assert all(name != "apply_proxy" for name, _ in h.manager.calls)
+
+
+def test_save_settings_applies_a_changed_pip_index(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller(account="octo")
+    url = "https://mirrors.cloud.tencent.com/pypi/simple/"
+    settings = h.controller.config.settings.model_copy(update={"pip_index_url": url})
+    with qtbot.waitSignal(h.controller.pip_index_applied, timeout=WAIT_MS) as blocker:
+        h.controller.save_settings(settings)
+    assert blocker.args[0].updated == ("r1",)
+    assert ("apply_pip_index", {"old": None, "new": url}) in h.manager.calls
+    assert all(name != "apply_proxy" for name, _ in h.manager.calls)
+
+
+class _MirrorClient:
+    def __init__(self, speeds: dict[str, Any]) -> None:
+        self.speeds = speeds
+        self.asked: list[tuple[str, int, float]] = []
+        self.closed = False
+
+    def measure_download(self, url: str, *, max_bytes: int, max_seconds: float) -> Any:
+        from runnerdeck.core.models import DownloadSample
+
+        self.asked.append((url, max_bytes, max_seconds))
+        value = next((v for host, v in self.speeds.items() if host in url), 1)
+        if isinstance(value, Exception):
+            raise value
+        return DownloadSample(value * 1024 * 1024, 1.0)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_test_pip_mirrors_measures_every_candidate_through_the_proxy(
+    make_controller: Any, qtbot: Any
+) -> None:
+    from runnerdeck.core import pip_mirror
+
+    h = make_controller()
+    custom = "https://pypi.example.com/simple/"
+    settings = h.controller.config.settings.model_copy(
+        update={"proxy": "http://127.0.0.1:10808", "pip_index_url": custom}
+    )
+    with qtbot.waitSignal(h.controller.config_changed, timeout=WAIT_MS):
+        h.controller.save_settings(settings)
+    proxies: list[str | None] = []
+    client = _MirrorClient({"tencent": 29, "aliyun": RunnerDeckError("连接被重置")})
+
+    def factory(proxy: str | None) -> _MirrorClient:
+        proxies.append(proxy)
+        return client
+
+    h.controller._mirror_client = factory
+    with qtbot.waitSignal(h.controller.pip_mirrors_tested, timeout=WAIT_MS) as blocker:
+        h.controller.test_pip_mirrors()
+    (results,) = blocker.args
+    assert proxies == ["http://127.0.0.1:10808"] and client.closed
+    assert [r.index_url for r in results] == pip_mirror.candidates(custom)
+    assert {(m, s) for _, m, s in client.asked} == {
+        (pip_mirror.PROBE_MAX_BYTES, pip_mirror.PROBE_MAX_SECONDS)
+    }
+    by_label = {r.label: r for r in results}
+    assert by_label["腾讯云"].mb_per_s == pytest.approx(29)
+    assert by_label["阿里云"].error == "连接被重置"
+
+
+def test_test_pip_mirrors_failure_reaches_failed(make_controller: Any, qtbot: Any) -> None:
+    h = make_controller()
+
+    def broken(_proxy: str | None) -> Any:
+        raise InvalidInputError("代理地址不合法")
+
+    h.controller._mirror_client = broken
+    op, message, _ = _wait_failed(qtbot, h, h.controller.test_pip_mirrors)
+    assert (op, message) == ("pip_mirror_test", "代理地址不合法")
 
 
 def test_harden_runners_root(make_controller: Any, qtbot: Any) -> None:
@@ -1866,6 +1940,61 @@ def test_check_updates(make_controller: Any, qtbot: Any) -> None:
     assert blocker.args[0].error == "网络不通"
 
 
+def test_save_env_of_a_stopped_runner(make_controller: Any, qtbot: Any) -> None:
+    a = record_model("a")
+    h = make_controller(records=[a])
+    h.manager.env_texts[a.id] = "A=1\n"
+    assert h.controller.read_env(a.id) == "A=1\n"
+    assert not h.controller.env_restart_allowed(a.id)  # not running
+    with qtbot.waitSignal(h.controller.env_saved, timeout=WAIT_MS) as blocker:
+        h.controller.save_env(a.id, "A=2\n", restart=True)
+    assert blocker.args == [a.id, False]
+    assert h.manager.env_texts[a.id] == "A=2\n"
+
+
+def test_save_env_rejects_bad_text_before_writing(make_controller: Any) -> None:
+    a = record_model("a")
+    h = make_controller(records=[a])
+    with pytest.raises(InvalidInputError, match="第 1 行"):
+        h.controller.save_env(a.id, "oops")
+    with pytest.raises(InvalidInputError, match="第 2 行"):
+        h.controller.check_env_text("A=1\n# x")
+    assert all(name != "write_env" for name, _ in h.manager.calls)
+    assert "PIP_INDEX_URL" in h.controller.managed_env_keys()
+
+
+def test_save_env_and_restart_an_idle_runner(make_controller: Any, qtbot: Any) -> None:
+    a = record_model("a")
+    h = _started(make_controller, qtbot, a)
+    first = h.process(a.id)
+    first.drive_state(LocalState.BUSY, "build")
+    qtbot.waitUntil(lambda: h.controller.local_state(a.id)[0] is LocalState.BUSY)
+    assert not h.controller.env_restart_allowed(a.id)  # a job would be cancelled
+    first.drive_state(LocalState.IDLE)
+    qtbot.waitUntil(lambda: h.controller.env_restart_allowed(a.id), timeout=WAIT_MS)
+    with qtbot.waitSignal(h.controller.env_saved, timeout=WAIT_MS) as blocker:
+        h.controller.save_env(a.id, "GIT_CONFIG_COUNT=1\n", restart=True)
+    assert blocker.args == [a.id, True]
+    first._running = False  # the runner exits after Ctrl+Break
+    qtbot.waitUntil(lambda: h.process(a.id) is not first, timeout=WAIT_MS)
+    _wait_idle(qtbot, h, a.id)
+    assert h.controller.is_running(a.id)
+    assert not h.controller._restart_pending
+
+
+def test_save_env_without_restart_leaves_a_running_runner_alone(
+    make_controller: Any, qtbot: Any
+) -> None:
+    a = record_model("a")
+    h = _started(make_controller, qtbot, a)
+    first = h.process(a.id)
+    with qtbot.waitSignal(h.controller.env_saved, timeout=WAIT_MS) as blocker:
+        h.controller.save_env(a.id, "A=1\n")
+    assert blocker.args == [a.id, False]
+    qtbot.wait(200)
+    assert h.process(a.id) is first and h.controller.is_running(a.id)
+
+
 def test_resume_after_cancelled_logoff(make_controller: Any, qtbot: Any) -> None:
     a, b = record_model("a", repo="one"), record_model("b", repo="two")
     h = _started(make_controller, qtbot, a, b)
@@ -1931,3 +2060,86 @@ def test_stopping_a_service_runner_ends_stopped_on_card_and_badge(
     assert h.controller.local_state(record.id)[0] is LocalState.STOPPED
     assert shown.state is DisplayState.STOPPED
     assert states.calls and states.calls[-1][1] is LocalState.STOPPED
+
+
+# --- Job tab (spike-notes §13) ---------------------------------------------------------------
+
+
+END = datetime(2026, 10, 26, 3, 11, 22, tzinfo=UTC)
+
+
+def _wjob(job_id: int, status: str = "completed", conclusion: str | None = "failure") -> Any:
+    from runnerdeck.core.models import JobStep, WorkflowJob
+
+    steps = [
+        JobStep(number=1, name="Install dependencies", status="completed", conclusion="failure")
+    ]
+    return WorkflowJob(
+        id=job_id, run_id=1, name="build", status=status, conclusion=conclusion,
+        runner_id=42, steps=steps if conclusion == "failure" else [],
+        started_at=datetime(2026, 10, 26, 3, 0, tzinfo=UTC),
+        completed_at=END if status == "completed" else None,
+    )  # fmt: skip
+
+
+def test_load_job_searches_then_rereads_a_running_job_by_id(
+    make_controller: Any, qtbot: Any
+) -> None:
+    from runnerdeck.core.models import JobSnapshot
+
+    a = record_model("a")
+    h = make_controller(account="octo", records=[a])
+    h.manager.job_snapshots = [JobSnapshot(job=_wjob(7, "in_progress", None))]
+    with qtbot.waitSignal(h.controller.job_snapshot_loaded, timeout=WAIT_MS) as blocker:
+        h.controller.load_job(a.id)
+    assert blocker.args[0] == a.id and blocker.args[1].job.id == 7
+    with qtbot.waitSignal(h.controller.job_snapshot_loaded, timeout=WAIT_MS):
+        h.controller.load_job(a.id)
+    asked = [kw["job_id"] for name, kw in h.manager.calls if name == "job_snapshot"]
+    assert asked == [None, 7]
+    assert h.controller.last_job(a.id).id == 7
+
+
+def test_finished_job_is_followed_until_github_has_it(
+    make_controller: Any, qtbot: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from runnerdeck.app import controller as controller_module
+    from runnerdeck.core.models import JobSnapshot
+
+    monkeypatch.setattr(controller_module, "JOB_FOLLOWUP_MS", 10)
+    a = record_model("a")
+    h = make_controller(account="octo", records=[a])
+    done = _wjob(7)
+    h.manager.job_snapshots = [
+        JobSnapshot(job=_wjob(7, "in_progress", None)),  # GitHub not done yet
+        JobSnapshot(job=done, log_pending=True),  # done, log not served yet
+        JobSnapshot(job=done, log=("x",), errors=("Process completed with exit code 1.",)),
+    ]
+    lines: list[str] = []
+    h.controller.runner_line.connect(lambda _rid, line: lines.append(line))
+    with qtbot.waitSignal(h.controller.job_summarized, timeout=WAIT_MS) as blocker:
+        h.controller._on_bridge_job(a.id, "build", "Failed")
+    assert blocker.args[1].errors == ("Process completed with exit code 1.",)
+    assert lines == [
+        "[RunnerDeck] job build 失败（Install dependencies，耗时 11m22s）："
+        "Process completed with exit code 1."
+    ]
+    assert len([n for n, _ in h.manager.calls if n == "job_snapshot"]) == 3
+
+
+def test_finished_job_follow_up_gives_up_on_an_error(
+    make_controller: Any, qtbot: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from runnerdeck.app import controller as controller_module
+    from runnerdeck.core.models import JobSnapshot
+
+    monkeypatch.setattr(controller_module, "JOB_FOLLOWUP_MS", 10)
+    a = record_model("a")
+    h = make_controller(account="octo", records=[a])
+    h.manager.job_snapshots = [JobSnapshot(error="缺少 Actions: Read")]
+    lines: list[str] = []
+    h.controller.runner_line.connect(lambda _rid, line: lines.append(line))
+    with qtbot.waitSignal(h.controller.job_summarized, timeout=WAIT_MS) as blocker:
+        h.controller._on_bridge_job(a.id, "build", "Failed")
+    assert blocker.args[1].error == "缺少 Actions: Read" and lines == []
+    assert len([n for n, _ in h.manager.calls if n == "job_snapshot"]) == 1

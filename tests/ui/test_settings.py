@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from PyQt5.QtGui import QDesktopServices
@@ -372,3 +373,117 @@ def test_check_updates_switch_saves(page: SettingsPage, fake: FakeController) ->
     assert page.checkUpdatesCard.isChecked()
     page.checkUpdatesCard.setChecked(False)
     assert fake.config.settings.check_updates is False
+
+
+# --- pip mirror ----------------------------------------------------------------------------
+
+TENCENT = "https://mirrors.cloud.tencent.com/pypi/simple/"
+ALIYUN = "https://mirrors.aliyun.com/pypi/simple/"
+
+
+def _speeds() -> list[Any]:
+    from runnerdeck.core.models import MirrorSpeed
+
+    mib = 1024 * 1024
+    return [
+        MirrorSpeed(TENCENT, "腾讯云", 29 * mib, 1.0),
+        MirrorSpeed("https://mirrors.ustc.edu.cn/pypi/simple/", "中国科学技术大学", error="超时"),
+        MirrorSpeed(ALIYUN, "阿里云", int(0.41 * mib), 1.0),
+    ]
+
+
+def test_pip_mirror_card_shows_and_saves_the_choice(
+    page: SettingsPage, fake: FakeController
+) -> None:
+    assert page.pipMirrorCard.value() is None
+    assert page.pipMirrorCard.comboBox.currentText().startswith("不设置")
+    page.pipMirrorCard.select(TENCENT)
+    assert fake.config.settings.pip_index_url == TENCENT
+    page.pipMirrorCard.select(None)
+    assert fake.config.settings.pip_index_url is None
+
+
+def test_pip_mirror_card_keeps_a_custom_value(qtbot: QtBot) -> None:
+    custom = "https://pypi.example.com/simple/"
+    fake = FakeController(AppConfig(account="octocat", settings=AppSettings(pip_index_url=custom)))
+    page = SettingsPage(fake)  # type: ignore[arg-type]
+    qtbot.addWidget(page)
+    assert page.pipMirrorCard.value() == custom
+    assert page.pipMirrorCard.comboBox.currentText() == "自定义（pypi.example.com）"
+    assert not _saved(fake)
+
+
+def test_pip_speed_test_offers_the_fastest_mirror(
+    page: SettingsPage, fake: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from runnerdeck.ui.pages import settings_page
+
+    fake.save_settings(fake.config.settings.model_copy(update={"pip_index_url": ALIYUN}))
+    dialogs: list[Any] = []
+
+    def accept(dialog: Any) -> bool:
+        dialogs.append(dialog)
+        return True
+
+    monkeypatch.setattr(settings_page.MirrorSpeedDialog, "exec", accept)
+    page.pip_test_button.click()
+    assert fake.calls_of("test_pip_mirrors") == [((), {})]
+    assert not page.pip_test_button.isEnabled() and page.pip_test_button.text() == "测速中…"
+
+    fake.pip_mirrors_tested.emit(_speeds())
+    assert page.pip_test_button.isEnabled() and page.pip_test_button.text() == "测速"
+    assert "腾讯云 最快（29.0 MB/s）" in page.pipMirrorCard.contentLabel.text()
+    (dialog,) = dialogs
+    assert dialog.rows == [
+        ("腾讯云", "29.0 MB/s"),
+        ("阿里云（当前）", "0.41 MB/s"),
+        ("中国科学技术大学", "失败：超时"),
+    ]
+    assert dialog.best_url == TENCENT and dialog.yesButton.text() == "使用腾讯云"
+    assert fake.config.settings.pip_index_url == TENCENT
+
+
+def test_pip_speed_test_closed_or_already_fastest_saves_nothing(
+    page: SettingsPage, fake: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from runnerdeck.ui.pages import settings_page
+
+    monkeypatch.setattr(settings_page.MirrorSpeedDialog, "exec", lambda _d: False)
+    fake.pip_mirrors_tested.emit(_speeds())
+    assert not _saved(fake)
+
+    fake.save_settings(fake.config.settings.model_copy(update={"pip_index_url": TENCENT}))
+    shown: list[Any] = []
+    monkeypatch.setattr(settings_page.MirrorSpeedDialog, "exec", lambda d: shown.append(d) or True)
+    fake.pip_mirrors_tested.emit(_speeds())
+    (dialog,) = shown
+    assert dialog.best_url is None and dialog.yesButton.isHidden()
+    assert [s.pip_index_url for s in _saved(fake)] == [TENCENT]
+
+
+def test_pip_speed_test_failure_restores_the_button(
+    page: SettingsPage, fake: FakeController
+) -> None:
+    page.pip_test_button.click()
+    fake.failed.emit("pip_mirror_test", "代理地址不合法")
+    assert page.pip_test_button.isEnabled() and page.pip_test_button.text() == "测速"
+    assert "测速失败" in page.pipMirrorCard.contentLabel.text()
+
+
+def test_pip_index_applied_shows_info_bars(
+    page: SettingsPage, fake: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from runnerdeck.ui.pages import settings_page
+
+    shown: list[tuple[str, str, str]] = []
+    for kind in ("success", "warning"):
+        monkeypatch.setattr(
+            settings_page.InfoBar,
+            kind,
+            lambda title, content, *a, _k=kind, **kw: shown.append((_k, title, content)),
+        )
+    fake.pip_index_applied.emit(ProxyApplyResult(updated=("a",), custom=("b",)))
+    assert [(k, t) for k, t, _ in shown] == [
+        ("success", "pip 镜像源已写入 runner"),
+        ("warning", "保留了自定义 pip 镜像源"),
+    ]

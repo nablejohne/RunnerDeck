@@ -40,10 +40,20 @@ from PyQt5.QtGui import QDesktopServices
 
 from runnerdeck import __version__
 from runnerdeck.app.workers import Task, submit
-from runnerdeck.core import account, diag, runner_file, secrets, update_check
+from runnerdeck.core import (
+    account,
+    diag,
+    installer,
+    job_log,
+    pip_mirror,
+    runner_file,
+    secrets,
+    update_check,
+)
 from runnerdeck.core.errors import ElevationRequiredError, InvalidInputError, RunnerDeckError
 from runnerdeck.core.github_client import GitHubClient
 from runnerdeck.core.manager import (
+    MANAGED_ENV_KEYS,
     POWERSHELL_POLICY_ENV,
     AddPlan,
     ClientFactory,
@@ -56,8 +66,11 @@ from runnerdeck.core.models import (
     AppSettings,
     AutostartState,
     DiagLog,
+    DownloadSample,
     GitHubUser,
+    JobSnapshot,
     LocalState,
+    MirrorSpeed,
     ProxyApplyResult,
     RemoteStatus,
     Repo,
@@ -65,6 +78,7 @@ from runnerdeck.core.models import (
     RunnerMode,
     RunnerRecord,
     UpdateInfo,
+    WorkflowJob,
 )
 from runnerdeck.core.process import (
     EventKind,
@@ -91,6 +105,10 @@ DIAG_DIR = "_diag"
 INSIGHTS_TTL = timedelta(minutes=10)
 RESUME_TIMEOUT = timedelta(seconds=120)  # a job is cancelled first (spike §10: ~15 s)
 RESUME_POLL_MS = 500
+# After a job ends: read it from GitHub once it is marked completed with its log there
+# (spike-notes §13: the log is served right after completion), retrying a few times.
+JOB_FOLLOWUP_MS = 4000
+JOB_FOLLOWUP_TRIES = 5
 NEEDS_GRANT_SUMMARY_MS = 300
 NEEDS_GRANT = "这些服务 runner 启停需要管理员授权，已跳过（可在菜单里“授权启停…”）："
 AUTOSTART_SKIPPED = "runner 目录下已有其他进程在运行，未自动启动："
@@ -282,6 +300,13 @@ class RunnerController(QObject):
     repo_insights_loaded = pyqtSignal(str, object)  # record id, RepoInsights
     update_checked = pyqtSignal(object)  # UpdateInfo (an error is inside, never `failed`)
     runners_root_hardened = pyqtSignal(str)  # runners root path
+    # pip mirror (core/pip_mirror.py)
+    pip_index_applied = pyqtSignal(object)  # ProxyApplyResult, after a pip mirror change
+    pip_mirrors_tested = pyqtSignal(object)  # list[MirrorSpeed] in test order
+    env_saved = pyqtSignal(str, bool)  # record id, restarting (stop + start under way)
+    # Job tab (spike-notes §13)
+    job_snapshot_loaded = pyqtSignal(str, object)  # record id, JobSnapshot
+    job_summarized = pyqtSignal(str, object)  # record id, JobSnapshot after a job ended
 
     def __init__(
         self,
@@ -336,6 +361,13 @@ class RunnerController(QObject):
         self._resume_timer.timeout.connect(self._on_resume_timer)
         # Anonymous client for the app's own release check (the PAT is not needed there).
         self._release_client = release_client or (lambda proxy: GitHubClient(None, proxy=proxy))
+        self._restart_pending: set[str] = set()  # saved `.env`: start again once stopped
+        self._jobs: dict[str, WorkflowJob] = {}  # the job each runner last showed
+        self._job_followups: dict[str, int] = {}  # record id -> tries after its job ended
+        # The same for the pip mirror speed test, with a short timeout per mirror.
+        self._mirror_client: Callable[[str | None], GitHubClient] = lambda proxy: GitHubClient(
+            None, proxy=proxy, timeout=pip_mirror.PROBE_TIMEOUT_S
+        )
         self._service_polling = False
         self._service_poll_again = False
         self._remotes: dict[str, RemoteSnapshot] = {}  # last row.remote of a remote refresh
@@ -730,7 +762,7 @@ class RunnerController(QObject):
             self._do_stop,
             proc,
             on_finished=lambda result: self._stop_done(record_id, result),
-            on_failed=lambda _m, _e: self._release(record_id),
+            on_failed=lambda _m, _e: self._stop_failed(record_id),
         )
 
     def _do_stop(self, proc: RunnerProcess, timeout: float | None = None) -> StopResult:
@@ -743,6 +775,13 @@ class RunnerController(QObject):
         self._release(record_id)
         self.runner_stopped.emit(record_id, result)
         self._refresh_displays([record_id])
+        if record_id in self._restart_pending:
+            self._restart_pending.discard(record_id)
+            self.start(record_id)
+
+    def _stop_failed(self, record_id: str) -> None:
+        self._restart_pending.discard(record_id)
+        self._release(record_id)
 
     def start_all(self) -> None:
         """Every stopped runner; services only where no UAC prompt is needed."""
@@ -902,7 +941,7 @@ class RunnerController(QObject):
             service_log.seen = True
             machine.feed(event)
             if event.kind is EventKind.COMPLETED and event.detail and not follow.catch_up:
-                self.runner_job_finished.emit(record_id, event.detail, event.result or "")
+                self._job_finished(record_id, event.detail, event.result or "")
 
     def _emit_service_states(self, record_ids: Iterable[str]) -> None:
         """`runner_state` for service runners whose live state (SCM + Runner log) changed:
@@ -1182,9 +1221,10 @@ class RunnerController(QObject):
 
     def _do_save_settings(
         self, changes: dict[str, Any]
-    ) -> tuple[AutostartState | None, ProxyApplyResult | None]:  # worker
+    ) -> tuple[AutostartState | None, ProxyApplyResult | None, ProxyApplyResult | None]:  # worker
         config = self._store.load()
         old_proxy = config.settings.proxy
+        old_pip_index = config.settings.pip_index_url
         state: AutostartState | None = None
         wanted = changes.get("launch_on_login")
         if (
@@ -1199,17 +1239,23 @@ class RunnerController(QObject):
         if "proxy" in changes and changes["proxy"] != old_proxy:
             # Into every runner's .env (m4-design §3); running ones pick it up on restart.
             applied = self._manager.apply_proxy(old_proxy, changes["proxy"])
-        return state, applied
+        pip_applied = None
+        if "pip_index_url" in changes and changes["pip_index_url"] != old_pip_index:
+            pip_applied = self._manager.apply_pip_index(old_pip_index, changes["pip_index_url"])
+        return state, applied, pip_applied
 
     def _settings_saved(
-        self, result: tuple[AutostartState | None, ProxyApplyResult | None]
+        self,
+        result: tuple[AutostartState | None, ProxyApplyResult | None, ProxyApplyResult | None],
     ) -> None:
-        state, applied = result
+        state, applied, pip_applied = result
         if state is not None:
             self.autostart_state_loaded.emit(state)
         self._reload_config("settings")
         if applied is not None:
             self.proxy_applied.emit(applied)
+        if pip_applied is not None:
+            self.pip_index_applied.emit(pip_applied)
 
     def harden_runners_root(self) -> None:
         """Restrict the runners root's ACL on a worker (manager.harden_runners_root);
@@ -1267,6 +1313,84 @@ class RunnerController(QObject):
         with closing(self._release_client(proxy)) as client:
             release = client.get_latest_release(*update_check.APP_REPO)
         return update_check.compare(__version__, release)
+
+    # --- runner `.env` (the card's 编辑环境变量) ---------------------------------------------
+
+    def read_env(self, record_id: str) -> str:
+        """The runner's `.env` text (main thread: a small local file). Raises
+        RunnerDeckError."""
+        return self._manager.read_env(record_id)
+
+    @staticmethod
+    def check_env_text(text: str) -> None:
+        """InvalidInputError naming the first bad line (the editor validates before saving)."""
+        installer.parse_env_text(text)
+
+    @staticmethod
+    def managed_env_keys() -> tuple[str, ...]:
+        return MANAGED_ENV_KEYS
+
+    def env_restart_allowed(self, record_id: str) -> bool:
+        """保存并重启 is offered for an idle process runner only: a job would be cancelled,
+        and a service's state comes from the SCM poll (restart it from the card)."""
+        record = self._config.get(record_id)
+        return (
+            record is not None
+            and record.mode is RunnerMode.PROCESS
+            and not self.is_busy(record_id)
+            and self.local_state(record_id)[0] is LocalState.IDLE
+        )
+
+    def save_env(self, record_id: str, text: str, *, restart: bool = False) -> None:
+        """Check `text` right away (InvalidInputError), write it on a worker, then
+        `env_saved(record_id, restarting)`. restart: an idle process runner is stopped and
+        started again so the Listener reads the new `.env`."""
+        installer.parse_env_text(text)
+        if self._record_for("env", record_id) is None:
+            return
+        self._submit(
+            "env",
+            self._manager.write_env,
+            record_id,
+            text,
+            on_finished=lambda _none: self._env_saved(record_id, restart),
+        )
+
+    def _env_saved(self, record_id: str, restart: bool) -> None:
+        restarting = restart and self.env_restart_allowed(record_id)
+        if restarting:
+            self._restart_pending.add(record_id)
+            self.stop(record_id)
+            if not self.is_busy(record_id):  # the stop was refused: nothing to restart
+                self._restart_pending.discard(record_id)
+                restarting = False
+        self.env_saved.emit(record_id, restarting)
+
+    def test_pip_mirrors(self) -> None:
+        """Measure every preset pip mirror (plus a custom current one) on a worker, through
+        settings.proxy like the runners' pip; `pip_mirrors_tested(results)`."""
+        settings = self._config.settings
+        self._submit(
+            "pip_mirror_test",
+            self._do_test_pip_mirrors,
+            settings.proxy,
+            pip_mirror.candidates(settings.pip_index_url),
+            on_finished=self.pip_mirrors_tested.emit,
+        )
+
+    def _do_test_pip_mirrors(
+        self, proxy: str | None, index_urls: list[str]
+    ) -> list[MirrorSpeed]:  # worker
+        with closing(self._mirror_client(proxy)) as client:
+
+            def measure(url: str) -> DownloadSample:
+                return client.measure_download(
+                    url,
+                    max_bytes=pip_mirror.PROBE_MAX_BYTES,
+                    max_seconds=pip_mirror.PROBE_MAX_SECONDS,
+                )
+
+            return pip_mirror.measure_mirrors(index_urls, measure)
 
     def runner_version(self, record_id: str) -> str | None:
         """The runner version installed in the record's directory (cached by the exe's
@@ -1484,7 +1608,59 @@ class RunnerController(QObject):
             self._remerge_timer.stop()
 
     def _on_bridge_job(self, record_id: str, job: str, result: str) -> None:
+        self._job_finished(record_id, job, result)
+
+    # --- Job tab (spike-notes §13) -------------------------------------------------------
+
+    def _job_finished(self, record_id: str, job: str, result: str) -> None:
         self.runner_job_finished.emit(record_id, job, result)
+        if self.is_logged_in:
+            self._job_followups[record_id] = 0
+            QTimer.singleShot(JOB_FOLLOWUP_MS, lambda: self.load_job(record_id))
+
+    def last_job(self, record_id: str) -> WorkflowJob | None:
+        return self._jobs.get(record_id)
+
+    def load_job(self, record_id: str) -> None:
+        """The runner's current or newest job on a worker; `job_snapshot_loaded`. A job seen
+        running is re-read by id (one request); once it completed and the runner is busy
+        again, the new job is searched for among the repo's newest runs."""
+        if self._config.get(record_id) is None:
+            self._job_followups.pop(record_id, None)
+            return
+        known = self._jobs.get(record_id)
+        job_id = None
+        if known is not None and (
+            not known.done or self.local_state(record_id)[0] is not LocalState.BUSY
+        ):
+            job_id = known.id
+        self._submit(
+            "job",
+            self._manager.job_snapshot,
+            record_id,
+            job_id,
+            on_finished=lambda snapshot: self._job_loaded(record_id, snapshot),
+            on_failed=lambda _m, _e: self._job_followups.pop(record_id, None),
+            quiet=True,
+        )
+
+    def _job_loaded(self, record_id: str, snapshot: JobSnapshot) -> None:
+        if snapshot.job is not None:
+            self._jobs[record_id] = snapshot.job
+        self.job_snapshot_loaded.emit(record_id, snapshot)
+        tries = self._job_followups.get(record_id)
+        if tries is None:
+            return
+        settled = snapshot.job is not None and snapshot.job.done and not snapshot.log_pending
+        if not settled and snapshot.error is None and tries + 1 < JOB_FOLLOWUP_TRIES:
+            self._job_followups[record_id] = tries + 1
+            QTimer.singleShot(JOB_FOLLOWUP_MS, lambda: self.load_job(record_id))
+            return
+        del self._job_followups[record_id]
+        line = job_log.summary_line(snapshot) if settled else None
+        if line:
+            self.runner_line.emit(record_id, f"[RunnerDeck] {line}")
+        self.job_summarized.emit(record_id, snapshot)
 
     # --- helpers --------------------------------------------------------------------------------
 

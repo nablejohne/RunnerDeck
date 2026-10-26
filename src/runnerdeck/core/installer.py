@@ -621,6 +621,62 @@ def write_env_file(runner_dir: Path, updates: Mapping[str, str | None]) -> None:
     log.info("updated %s: %s", path, sorted(updates))  # keys only, values may be secrets
 
 
+def read_env_text(runner_dir: Path) -> str:
+    """`<runner_dir>/.env` as text for the editor ("" when there is none); unreadable ->
+    InstallError."""
+    path = runner_dir / ENV_FILE
+    try:
+        return path.read_bytes().decode("utf-8-sig")
+    except FileNotFoundError:
+        return ""
+    except (OSError, UnicodeDecodeError) as e:
+        raise InstallError(f"无法读取 {path}：{e}") from e
+
+
+def parse_env_text(text: str) -> list[tuple[str, str]]:
+    """Edited `.env` text -> [(key, value)] in order. Runner.Listener reads every line as
+    KEY=VALUE, split at the first "=" and nothing trimmed, and has no comments; so each
+    non-blank line must be exactly that, with a valid key that appears once (keys are
+    case-insensitive on Windows). InvalidInputError names the first bad line."""
+    pairs: list[tuple[str, str]] = []
+    seen: dict[str, int] = {}
+    for number, line in enumerate(_LINE_SPLIT_RE.split(text), start=1):
+        if not line.strip():
+            continue
+        if line.lstrip().startswith("#"):
+            raise InvalidInputError(f"第 {number} 行：.env 不支持注释，runner 会把它当成变量")
+        key, sep, value = line.partition("=")
+        if not sep:
+            raise InvalidInputError(f"第 {number} 行：应为 KEY=VALUE")
+        if not _ENV_KEY_RE.fullmatch(key):
+            raise InvalidInputError(
+                f"第 {number} 行：变量名 {key!r} 不合法（字母、数字、下划线，不能以数字开头）"
+            )
+        first = seen.setdefault(key.casefold(), number)
+        if first != number:
+            raise InvalidInputError(f"第 {number} 行：{key} 和第 {first} 行重复")
+        pairs.append((key, value))
+    return pairs
+
+
+def replace_env_file(runner_dir: Path, text: str) -> None:
+    """Replace `<runner_dir>/.env` with edited text (parse_env_text rules; blank lines are
+    dropped). Nothing left -> the file is deleted. Written atomically."""
+    pairs = parse_env_text(text)
+    if not runner_dir.is_dir():
+        raise InstallError(f"runner 目录不存在：{runner_dir}")
+    path = runner_dir / ENV_FILE
+    if not pairs:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            raise InstallError(f"无法删除 {path}：{e}") from e
+        log.info("removed %s (edited to empty)", path)
+        return
+    _atomic_write_text(path, "".join(f"{key}={value}\n" for key, value in pairs))
+    log.info("replaced %s: %s", path, [key for key, _ in pairs])  # keys only
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     fd, tmp = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
     try:

@@ -15,6 +15,8 @@ from PyQt5.QtWidgets import QFileDialog, QFrame, QHBoxLayout, QVBoxLayout, QWidg
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
+    InfoBar,
+    InfoBarPosition,
     MessageBox,
     PrimaryPushButton,
     PushButton,
@@ -25,8 +27,11 @@ from qfluentwidgets import (
 )
 from qfluentwidgets import FluentIcon as FIF
 
+from runnerdeck.core import job_log
+from runnerdeck.core.errors import RunnerDeckError
 from runnerdeck.core.models import Discovery, DisplayState, LocalState, RunnerRecord, StrayRunner
 from runnerdeck.core.status import Bucket, DisplayStatus, bucket
+from runnerdeck.ui.components.env_dialog import EnvEditDialog
 from runnerdeck.ui.components.runner_card import RunnerCard, confirm_stop
 
 if TYPE_CHECKING:
@@ -173,6 +178,7 @@ class DashboardPage(QWidget):
     """objectName "dashboard"; rebuilt from controller.records on every config_changed."""
 
     detail_requested = pyqtSignal(str)  # record id; the window opens the detail page
+    job_requested = pyqtSignal(str)  # record id; the window opens the detail page's Job tab
 
     def __init__(self, controller: RunnerController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -224,6 +230,8 @@ class DashboardPage(QWidget):
         controller.runner_imported.connect(self._on_runner_imported)
         controller.external_stopped.connect(self._on_external_stopped)
         controller.failed.connect(self._on_failed)
+        controller.env_saved.connect(self._on_env_saved)
+        controller.job_summarized.connect(self._on_job_summarized)
 
         self.rebuild()
 
@@ -286,6 +294,9 @@ class DashboardPage(QWidget):
         card.stop_requested.connect(controller.stop)
         card.remove_requested.connect(self._on_remove_requested)
         card.open_dir_requested.connect(controller.open_dir)
+        card.edit_env_requested.connect(self.edit_env)
+        card.job_requested.connect(self.job_requested)
+        card.set_last_job(job_log.failure_hint(controller.last_job(record.id)))
         card.detail_requested.connect(self.detail_requested)
         card.take_over_requested.connect(controller.take_over)
         card.kill_requested.connect(controller.kill_external)
@@ -372,6 +383,49 @@ class DashboardPage(QWidget):
 
     def _on_remove_requested(self, record_id: str, keep_work: bool) -> None:
         self._controller.remove(record_id, keep_work=keep_work)
+
+    def edit_env(self, record_id: str) -> None:
+        record = self._controller.config.get(record_id)
+        if record is None:
+            return
+        try:
+            text = self._controller.read_env(record_id)
+        except RunnerDeckError as e:
+            InfoBar.error(
+                "无法读取 .env", str(e), parent=self, position=InfoBarPosition.TOP, duration=8000
+            )
+            return
+        dialog = EnvEditDialog(
+            record.name,
+            Path(record.path) / ".env",
+            text,
+            self._controller.managed_env_keys(),
+            can_restart=self._controller.env_restart_allowed(record_id),
+            check=self._controller.check_env_text,
+            parent=self.window(),
+        )
+        if dialog.exec():
+            self._controller.save_env(record_id, dialog.text(), restart=dialog.restart)
+
+    def _on_job_summarized(self, record_id: str, snapshot: object) -> None:
+        card = self.cards.get(record_id)
+        job = getattr(snapshot, "job", None)
+        if card is not None and job is not None:
+            card.set_last_job(job_log.failure_hint(job))
+
+    def _on_env_saved(self, record_id: str, restarting: bool) -> None:
+        record = self._controller.config.get(record_id)
+        name = record.name if record is not None else record_id
+        if restarting:
+            content = "正在重启 runner，重启后生效"
+        elif self._controller.is_running(record_id):
+            content = "runner 重启后生效"
+        else:
+            content = "下次启动 runner 时生效"
+        InfoBar.success(
+            f"已保存 {name} 的 .env", content,
+            parent=self, position=InfoBarPosition.TOP, duration=5000,
+        )  # fmt: skip
 
     def choose_import(self) -> None:
         chosen = QFileDialog.getExistingDirectory(

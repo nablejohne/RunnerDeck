@@ -1,0 +1,35 @@
+﻿2026-10-26T03:29:45.7028124Z Current runner version: '2.338.1'
+2026-10-26T03:29:45.7035408Z Runner name: 'TESTPC-runnerdeck-sandbox'
+2026-10-26T03:29:45.7036064Z Runner group name: 'Default'
+2026-10-26T03:29:45.7036688Z Machine name: 'TESTPC'
+2026-10-26T03:29:45.7039143Z ##[group]GITHUB_TOKEN Permissions
+2026-10-26T03:29:45.7041472Z Contents: read
+2026-10-26T03:29:45.7041895Z Metadata: read
+2026-10-26T03:29:45.7042339Z Packages: read
+2026-10-26T03:29:45.7042752Z ##[endgroup]
+2026-10-26T03:29:45.7044776Z Secret source: Actions
+2026-10-26T03:29:45.7045460Z Cache mode: write
+2026-10-26T03:29:45.7046242Z Runner is running behind proxy server 'http://127.0.0.1:10808' for all HTTP requests.
+2026-10-26T03:29:45.7047234Z Runner is running behind proxy server 'http://127.0.0.1:10808' for all HTTPS requests.
+2026-10-26T03:29:45.7048007Z Prepare workflow directory
+2026-10-26T03:29:45.7365792Z Prepare all required actions
+2026-10-26T03:29:45.7463022Z Complete job name: spike
+2026-10-26T03:29:45.8983013Z ##[group]Run echo spike job start on %RUNNER_NAME%
+2026-10-26T03:29:45.8983829Z [36;1mecho spike job start on %RUNNER_NAME%[0m
+2026-10-26T03:29:45.8984304Z [36;1mping -n 40 127.0.0.1 > nul[0m
+2026-10-26T03:29:45.8984718Z [36;1mecho spike job done[0m
+2026-10-26T03:29:45.9018858Z shell: C:\WINDOWS\system32\cmd.EXE /D /E:ON /V:OFF /S /C "CALL "{0}""
+2026-10-26T03:29:45.9019519Z ##[endgroup]
+2026-10-26T03:29:46.0179995Z spike job start on TESTPC-runnerdeck-sandbox
+2026-10-26T03:30:25.1170940Z spike job done
+2026-10-26T03:30:25.1664551Z ##[group]Run Write-Host "powershell ok, policy=$(Get-ExecutionPolicy) env=$env:PSExecutionPolicyPreference"
+2026-10-26T03:30:25.1665266Z [36;1mWrite-Host "powershell ok, policy=$(Get-ExecutionPolicy) env=$env:PSExecutionPolicyPreference"[0m
+2026-10-26T03:30:25.1815655Z shell: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.EXE -command ". '{0}'"
+2026-10-26T03:30:25.1816044Z ##[endgroup]
+2026-10-26T03:30:25.6322187Z powershell ok, policy=RemoteSigned env=RemoteSigned
+2026-10-26T03:30:25.7161846Z ##[group]Run exit 1
+2026-10-26T03:30:25.7162251Z [36;1mexit 1[0m
+2026-10-26T03:30:25.7192188Z shell: C:\WINDOWS\system32\cmd.EXE /D /E:ON /V:OFF /S /C "CALL "{0}""
+2026-10-26T03:30:25.7192528Z ##[endgroup]
+2026-10-26T03:30:25.7508820Z ##[error]Process completed with exit code 1.
+2026-10-26T03:30:25.7626553Z Cleaning up orphan processes

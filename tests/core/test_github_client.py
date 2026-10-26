@@ -1246,6 +1246,53 @@ def test_download_transport_error(
         client.download(DL_URL, tmp_path / "a.zip")
 
 
+MIRROR_URL = "https://mirror.example/pypi/packages/aa/bb/x.whl"
+
+
+def test_measure_download_stops_at_max_bytes_without_authorization(
+    mock: respx.MockRouter, client: GitHubClient
+) -> None:
+    chunk = gc.DOWNLOAD_CHUNK
+    route = mock.get(MIRROR_URL).respond(200, content=iter([b"a" * chunk] * 10))
+    sample = client.measure_download(MIRROR_URL, max_bytes=chunk + 1, max_seconds=60)
+    assert sample.received == 2 * chunk  # stops after the chunk that crosses the limit
+    assert sample.seconds >= 0
+    request = route.calls.last.request
+    assert "authorization" not in request.headers
+    assert request.headers["user-agent"].startswith("RunnerDeck/")
+
+
+def test_measure_download_stops_at_max_seconds(
+    mock: respx.MockRouter, client: GitHubClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    clock = iter([100.0, 101.0, 103.0, 106.0, 110.0])
+    monkeypatch.setattr(gc, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    chunk = gc.DOWNLOAD_CHUNK
+    mock.get(MIRROR_URL).respond(200, content=iter([b"x" * chunk] * 10))
+    sample = client.measure_download(MIRROR_URL, max_bytes=10**9, max_seconds=5)
+    assert (sample.received, sample.seconds) == (3 * chunk, 6.0)
+
+
+def test_measure_download_reads_the_whole_body_when_it_is_small(
+    mock: respx.MockRouter, client: GitHubClient
+) -> None:
+    mock.get(MIRROR_URL).respond(200, content=b"tiny")
+    assert client.measure_download(MIRROR_URL, max_bytes=10**6, max_seconds=60).received == 4
+
+
+def test_measure_download_errors(mock: respx.MockRouter, client: GitHubClient) -> None:
+    mock.get(MIRROR_URL).respond(404)
+    with pytest.raises(GitHubError, match="测速失败.*404"):
+        client.measure_download(MIRROR_URL, max_bytes=1, max_seconds=1)
+    mock.get(MIRROR_URL).mock(side_effect=httpx.ConnectError("refused"))
+    with pytest.raises(NetworkError, match="无法连接到镜像源"):
+        client.measure_download(MIRROR_URL, max_bytes=1, max_seconds=1)
+    with pytest.raises(InvalidInputError, match="http"):
+        client.measure_download("ftp://mirror.example/x.whl", max_bytes=1, max_seconds=1)
+
+
 def test_download_progress_callback_can_abort(
     mock: respx.MockRouter, client: GitHubClient, tmp_path: Path
 ) -> None:
@@ -1364,3 +1411,50 @@ def test_anonymous_client_and_latest_release(mock: respx.MockRouter) -> None:
         route.respond(404, json={"message": "Not Found"})
         assert anonymous.get_latest_release("nablejohne", "RunnerDeck") is None
     assert "authorization" not in route.calls.last.request.headers
+
+
+# --- jobs and job logs (detail page Job tab, spike-notes §13) -------------------------------
+
+JOBS_JSON = json.loads(
+    (Path(__file__).resolve().parents[1] / "fixtures" / "api" / "run_jobs.json").read_text()
+)
+LOG_BLOB = "https://productionresultssa0.blob.core.windows.net/actions-results/x/job.log?sig=1"
+
+
+def test_list_run_jobs_and_get_job(mock: respx.MockRouter, client: GitHubClient) -> None:
+    jobs_route = mock.get(api("/repos/octo/demo/actions/runs/40264339523/jobs"))
+    jobs_route.respond(200, json=JOBS_JSON)
+    (job,) = client.list_run_jobs("octo", "demo", 40264339523)
+    assert (job.id, job.runner_id, job.conclusion, len(job.steps)) == (
+        121383315166,
+        28,
+        "failure",
+        6,
+    )
+    assert jobs_route.calls.last.request.url.params["per_page"] == "100"
+    mock.get(api("/repos/octo/demo/actions/jobs/121383315166")).respond(
+        200, json=JOBS_JSON["jobs"][0]
+    )
+    assert client.get_job("octo", "demo", 121383315166).failed_steps[0].name == "Fail on request"
+    jobs_route.respond(403, json={"message": "Resource not accessible by personal access token"})
+    with pytest.raises(PermissionDeniedError, match="Actions: Read"):
+        client.list_run_jobs("octo", "demo", 40264339523)
+
+
+def test_download_job_log_follows_the_redirect_without_authorization(
+    mock: respx.MockRouter, client: GitHubClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs = mock.get(api("/repos/octo/demo/actions/jobs/5/logs"))
+    logs.respond(302, headers={"Location": LOG_BLOB})
+    blob = mock.get(LOG_BLOB)
+    blob.respond(200, content="\ufeff2026-10-26T03:29:45.1Z hello\n".encode())
+    assert client.download_job_log("octo", "demo", 5) == "2026-10-26T03:29:45.1Z hello\n"
+    assert "authorization" not in blob.calls.last.request.headers
+    blob.respond(404)  # while the job runs (spike-notes §13)
+    assert client.download_job_log("octo", "demo", 5) is None
+    monkeypatch.setattr(gc, "JOB_LOG_MAX_BYTES", 4)
+    blob.respond(200, content=b"0123456789")
+    assert client.download_job_log("octo", "demo", 5) == "6789"  # the end is kept
+    logs.respond(403, json={"message": "Resource not accessible by personal access token"})
+    with pytest.raises(PermissionDeniedError, match="Actions: Read"):
+        client.download_job_log("octo", "demo", 5)

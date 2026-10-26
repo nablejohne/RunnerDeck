@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from PyQt5.QtGui import QDesktopServices
@@ -247,6 +248,7 @@ def test_menu_actions(
     assert set(actions) == {
         "详情",
         "打开目录",
+        "编辑环境变量（.env）",
         "在 GitHub 打开",
         "随 RunnerDeck 启动",
         "转为服务…",
@@ -527,3 +529,129 @@ def test_service_card_menu_and_badge(
     assert "随 RunnerDeck 启动" not in actions and "转为服务…" not in actions
     actions["授权启停…"].trigger()
     assert fake.calls_of("grant_service_control") == [((record.id,), {})]
+
+
+# --- .env editor (card menu → 编辑环境变量) -----------------------------------------------
+
+
+def _env_dialogs(monkeypatch: pytest.MonkeyPatch, answer: Any) -> list[Any]:
+    from runnerdeck.ui.pages import dashboard_page
+
+    shown: list[Any] = []
+
+    def exec_(dialog: Any) -> bool:
+        shown.append(dialog)
+        return answer(dialog) if callable(answer) else answer
+
+    monkeypatch.setattr(dashboard_page.EnvEditDialog, "exec", exec_)
+    return shown
+
+
+def test_card_menu_opens_the_env_editor_and_saves(
+    page: DashboardPage, fake_with_records: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = fake_with_records
+    record = fake.records[0]
+    fake.env_texts[record.id] = "https_proxy=http://p:1\n"
+
+    def edit(dialog: Any) -> bool:
+        dialog.editor.setPlainText("https_proxy=http://p:1\nGIT_CONFIG_COUNT=1\n")
+        return True
+
+    shown = _env_dialogs(monkeypatch, edit)
+    actions = {a.text(): a for a in page.cards[record.id].build_menu().actions() if a.text()}
+    actions["编辑环境变量（.env）"].trigger()
+
+    (dialog,) = shown
+    assert dialog.titleLabel.text() == f"{record.name} 的环境变量"
+    assert dialog.pathLabel.text().endswith(".env")
+    assert "PIP_INDEX_URL" in dialog.managedLabel.text()
+    assert dialog.restartButton is None  # not offered unless the controller allows it
+    assert fake.calls_of("save_env") == [
+        ((record.id, "https_proxy=http://p:1\nGIT_CONFIG_COUNT=1\n"), {"restart": False})
+    ]
+
+
+def test_env_editor_cancel_and_unreadable(
+    page: DashboardPage,
+    fake_with_records: FakeController,
+    monkeypatch: pytest.MonkeyPatch,
+    no_infobars: list[tuple[str, str, str]],
+) -> None:
+    fake = fake_with_records
+    first, second = (r.id for r in fake.records)
+    shown = _env_dialogs(monkeypatch, False)
+    page.edit_env(first)
+    assert len(shown) == 1 and not fake.calls_of("save_env")
+    fake.env_texts[second] = "<unreadable>"
+    page.edit_env(second)
+    assert len(shown) == 1  # no dialog
+    assert any("无法读取" in title for _k, title, _c in no_infobars)
+
+
+def test_env_editor_validates_and_offers_save_and_restart(
+    page: DashboardPage, fake_with_records: FakeController
+) -> None:
+    from runnerdeck.ui.components.env_dialog import EnvEditDialog
+
+    dialog = EnvEditDialog(
+        "r1",
+        Path("D:/runners/r1/.env"),
+        "A=1\n",
+        ("https_proxy",),
+        can_restart=True,
+        check=fake_with_records.check_env_text,
+        parent=page,
+    )
+    accepted: list[bool] = []
+    # accept() would start the close animation outside exec(): record the call instead
+    dialog.accept = lambda: accepted.append(True)  # type: ignore[method-assign]
+    dialog.editor.setPlainText("A=1\n# note\n")  # the page owns (and deletes) it
+    assert not dialog.validate()
+    assert "第 2 行" in dialog.errorLabel.text() and not dialog.errorLabel.isHidden()
+    assert dialog.restartButton is not None
+    dialog.restartButton.click()  # still invalid: stays open
+    assert not dialog.restart
+    dialog.editor.setPlainText("A=2\n")
+    dialog.restartButton.click()
+    assert dialog.restart and dialog.text() == "A=2\n" and dialog.errorLabel.isHidden()
+    assert accepted == [True]
+
+
+def test_env_saved_info_bar(
+    page: DashboardPage,
+    fake_with_records: FakeController,
+    no_infobars: list[tuple[str, str, str]],
+) -> None:
+    fake = fake_with_records
+    rid = fake.records[0].id
+    fake.env_saved.emit(rid, True)
+    fake.env_saved.emit(rid, False)
+    contents = [c for _k, _t, c in no_infobars]
+    assert contents[-2:] == ["正在重启 runner，重启后生效", "下次启动 runner 时生效"]
+    assert all(f"{fake.records[0].name} 的 .env" in t for _k, t, _c in no_infobars[-2:])
+
+
+def test_card_shows_the_last_failed_job_and_opens_the_job_tab(
+    page: DashboardPage, fake_with_records: FakeController
+) -> None:
+    from runnerdeck.core.models import JobSnapshot, JobStep, WorkflowJob
+
+    fake = fake_with_records
+    rid = fake.records[0].id
+    card = page.cards[rid]
+    assert card.jobLabel.isHidden()
+    step = JobStep(number=5, name="Install dependencies", status="completed", conclusion="failure")
+    failed = WorkflowJob(
+        id=1, run_id=1, name="build", status="completed", conclusion="failure", steps=[step]
+    )
+    fake.job_summarized.emit(rid, JobSnapshot(job=failed))
+    assert not card.jobLabel.isHidden()
+    assert "上次 job build 失败：Install dependencies" in card.jobLabel.text()
+    asked: list[str] = []
+    page.job_requested.connect(asked.append)
+    card.jobLabel.linkActivated.emit("job")
+    assert asked == [rid]
+    ok = failed.model_copy(update={"conclusion": "success", "steps": []})
+    fake.job_summarized.emit(rid, JobSnapshot(job=ok))
+    assert card.jobLabel.isHidden()

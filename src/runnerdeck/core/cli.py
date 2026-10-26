@@ -49,6 +49,7 @@ from runnerdeck.core import (
     elevated,
     logs,
     paths,
+    pip_mirror,
     process,
     runner_file,
     secret_input,
@@ -104,7 +105,7 @@ STOP_POLL_S = 0.1  # `start` stop phase: how often to look for finished stops / 
 # `start` stop phase: how long to wait beyond stop_timeout_s (kill wait, pipe drain, psutil
 # scans in RunnerProcess.stop) before listing the runners that did not stop.
 STOP_GRACE_S = 30.0
-SETTINGS_KEYS = ("runners_root", "default_labels", "poll_interval_s", "proxy")
+SETTINGS_KEYS = ("runners_root", "default_labels", "poll_interval_s", "proxy", "pip_index_url")
 _PROXY_OFF = frozenset({"", "none", "off", "-"})
 _SHOWN_AUTO_LABELS = ("self-hosted", "Windows", "X64")  # added by the runner (AUTO_LABELS)
 _BAD_PROXY = "代理地址不合法：只支持 http:// 或 https:// 代理，例如 http://127.0.0.1:7890"
@@ -346,7 +347,11 @@ def build_parser(console: Console) -> argparse.ArgumentParser:
     s.set_defaults(handler=_cmd_settings_show)
     s = settings_sub.add_parser("set", help="修改一项设置", description="修改一项设置")
     s.add_argument("key", choices=SETTINGS_KEYS, help="、".join(SETTINGS_KEYS))
-    s.add_argument("value", help="新值；proxy 写 none 表示清除，default_labels 写空串表示清空")
+    s.add_argument(
+        "value",
+        help="新值；proxy / pip_index_url 写 none 表示清除，default_labels 写空串表示清空；"
+        "pip_index_url 也可以写 " + "、".join(m.key for m in pip_mirror.PIP_MIRRORS),
+    )
     s.set_defaults(handler=_cmd_settings_set)
     return parser
 
@@ -1232,11 +1237,18 @@ def _cmd_settings_show(ctx: _Context, args: argparse.Namespace) -> int:
         ("default_labels", labels),
         ("poll_interval_s", str(settings.poll_interval_s)),
         ("proxy", proxy),
+        ("pip_index_url", _pip_index_text(settings.pip_index_url)),
     ):
         console.print(f"{key:<16} {value}")
     console.print(f"配置文件：{ctx.store.path}")
     console.print(f"日志目录：{paths.log_dir()}")
     return EXIT_OK
+
+
+def _pip_index_text(index_url: str | None) -> str:
+    if not index_url:
+        return pip_mirror.NOT_SET_LABEL
+    return f"{index_url}（{pip_mirror.label_for(index_url)}）"
 
 
 def _parse_setting(key: str, raw: str) -> object:
@@ -1252,6 +1264,8 @@ def _parse_setting(key: str, raw: str) -> object:
             return int(value)
         except ValueError:
             raise InvalidInputError("poll_interval_s 必须是整数（秒）") from None
+    if key == "pip_index_url":
+        return pip_mirror.normalize_index_url(value)
     # proxy
     if value.casefold() in _PROXY_OFF:
         return None
@@ -1284,6 +1298,8 @@ def _cmd_settings_set(ctx: _Context, args: argparse.Namespace) -> int:
         shown = ", ".join(settings.default_labels) or "无"
     elif args.key == "proxy":
         shown = _mask_proxy(settings.proxy) if settings.proxy else "未设置"
+    elif args.key == "pip_index_url":
+        shown = _pip_index_text(settings.pip_index_url)
     console.print(f"已设置 {args.key} = {shown}")
     return EXIT_OK
 

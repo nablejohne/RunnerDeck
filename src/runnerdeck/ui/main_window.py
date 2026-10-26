@@ -34,7 +34,7 @@ from runnerdeck.core.models import LocalState
 from runnerdeck.ui.components.login_dialog import LoginDialog
 from runnerdeck.ui.pages.add_wizard_page import AddWizardPage
 from runnerdeck.ui.pages.dashboard_page import DashboardPage
-from runnerdeck.ui.pages.runner_detail_page import RunnerDetailPage
+from runnerdeck.ui.pages.runner_detail_page import TAB_JOB, RunnerDetailPage
 from runnerdeck.ui.pages.settings_page import SettingsPage
 from runnerdeck.ui.theme import apply_theme
 from runnerdeck.ui.tray import TrayIcon
@@ -140,6 +140,7 @@ class MainWindow(FluentWindow):
 
         self.addPage.finished.connect(lambda: self.switchTo(self.dashboardPage))
         self.dashboardPage.detail_requested.connect(self.open_detail)
+        self.dashboardPage.job_requested.connect(self.open_job)
         self.detailPage.back_requested.connect(lambda: self.switchTo(self.dashboardPage))
         controller.failed.connect(self._on_failed)
         controller.logged_in.connect(self._on_logged_in)
@@ -165,6 +166,10 @@ class MainWindow(FluentWindow):
             self.showNormal()
         self.raise_()
         self.activateWindow()
+
+    def open_job(self, record_id: str) -> None:
+        self.open_detail(record_id)
+        self.detailPage.switch_tab(TAB_JOB)
 
     def open_detail(self, record_id: str) -> None:
         self.detailPage.show_record(record_id)

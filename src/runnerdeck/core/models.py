@@ -146,6 +146,8 @@ class AppSettings(BaseModel):
     notify_jobs: Literal["all", "failed", "off"] = "failed"
     # Look up RunnerDeck's latest release shortly after start (only shown, never installed).
     check_updates: bool = True
+    # PIP_INDEX_URL in every runner's `.env` (pip_mirror); None leaves pip to the machine.
+    pip_index_url: str | None = None
 
 
 CONFIG_SCHEMA_VERSION = 1
@@ -351,6 +353,46 @@ class WorkflowRun(BaseModel):
     html_url: str = ""
 
 
+class JobStep(BaseModel):
+    """One step of a workflow job (GET .../actions/jobs/{job_id})."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    number: int
+    name: str
+    status: str  # queued / in_progress / completed
+    conclusion: str | None = None  # success / failure / skipped / cancelled (None while running)
+    started_at: AwareDatetime | None = None
+    completed_at: AwareDatetime | None = None
+
+
+class WorkflowJob(BaseModel):
+    """A workflow job with its steps; `runner_id` is the runner that took it."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    run_id: int
+    name: str
+    workflow_name: str | None = None
+    head_branch: str | None = None
+    status: str
+    conclusion: str | None = None
+    started_at: AwareDatetime | None = None
+    completed_at: AwareDatetime | None = None
+    runner_id: int | None = None
+    html_url: str = ""
+    steps: list[JobStep] = Field(default_factory=list)
+
+    @property
+    def done(self) -> bool:
+        return self.status == "completed"
+
+    @property
+    def failed_steps(self) -> list[JobStep]:
+        return [step for step in self.steps if step.conclusion == "failure"]
+
+
 class MatchKind(StrEnum):
     """Whether a workflow job can be picked up by a runner (docs/m4-design.md §4)."""
 
@@ -407,12 +449,50 @@ class UpdateInfo:
 
 @dataclass(frozen=True)
 class ProxyApplyResult:
-    """Outcome of apply_proxy: runner names whose `.env` was rewritten, whose `.env` holds a
-    proxy the user set themselves (left alone), and (name, reason) for failures."""
+    """Outcome of apply_proxy / apply_pip_index: runner names whose `.env` was rewritten, whose
+    `.env` holds a value the user set themselves (left alone), and (name, reason) for failures."""
 
     updated: tuple[str, ...] = ()
     custom: tuple[str, ...] = ()
     failed: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class DownloadSample:
+    """GitHubClient.measure_download: body bytes received and the seconds they took."""
+
+    received: int
+    seconds: float
+
+
+@dataclass(frozen=True)
+class MirrorSpeed:
+    """One mirror's speed-test result (pip_mirror.measure_mirrors)."""
+
+    index_url: str
+    label: str
+    received: int = 0
+    seconds: float = 0.0
+    error: str | None = None
+
+    @property
+    def mb_per_s(self) -> float | None:
+        if self.error is not None or self.seconds <= 0:
+            return None
+        return self.received / self.seconds / (1024 * 1024)
+
+
+@dataclass(frozen=True)
+class JobSnapshot:
+    """The detail page's Job tab: a runner's current or newest job (manager.job_snapshot).
+    The log parts are filled once the job completed (GitHub serves no log while it runs)."""
+
+    job: WorkflowJob | None = None  # None: not found among the repo's newest runs
+    log: tuple[str, ...] = ()  # cleaned lines (job_log.clean_lines)
+    errors: tuple[str, ...] = ()  # the ##[error] messages
+    excerpt: tuple[str, ...] = ()  # the lines leading up to the first error
+    error: str | None = None  # why nothing could be fetched (e.g. no Actions: Read)
+    log_pending: bool = False  # completed, but GitHub did not serve the log yet
 
 
 @dataclass(frozen=True)

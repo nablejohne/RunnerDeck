@@ -101,12 +101,20 @@ class FakeController(QObject):
     service_granted = pyqtSignal(str)  # record id
     repo_insights_loaded = pyqtSignal(str, object)  # record id, RepoInsights
     update_checked = pyqtSignal(object)  # UpdateInfo
+    pip_index_applied = pyqtSignal(object)  # ProxyApplyResult
+    pip_mirrors_tested = pyqtSignal(object)  # list[MirrorSpeed]
+    env_saved = pyqtSignal(str, bool)  # record id, restarting
+    job_snapshot_loaded = pyqtSignal(str, object)  # record id, JobSnapshot
+    job_summarized = pyqtSignal(str, object)  # record id, JobSnapshot
 
     def __init__(self, config: AppConfig | None = None, *, logged_in: bool = True) -> None:
         super().__init__()
         self.config: AppConfig = config or AppConfig(account="octocat" if logged_in else None)
         self.is_logged_in = logged_in
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        self.env_texts: dict[str, str] = {}  # read_env; "<unreadable>" raises
+        self.env_restartable: set[str] = set()  # env_restart_allowed
+        self.last_jobs: dict[str, Any] = {}  # last_job
         self.states: dict[str, tuple[LocalState, str | None]] = {}
         self.busy: set[str] = set()
         self.outputs: dict[str, list[str]] = {}
@@ -283,6 +291,39 @@ class FakeController(QObject):
 
     def check_updates(self) -> None:
         self._record("check_updates")
+
+    def test_pip_mirrors(self) -> None:
+        self._record("test_pip_mirrors")
+
+    def read_env(self, record_id: str) -> str:
+        from runnerdeck.core.errors import InstallError
+
+        text = self.env_texts.get(record_id, "")
+        if text == "<unreadable>":
+            raise InstallError("无法读取 .env")
+        return text
+
+    @staticmethod
+    def check_env_text(text: str) -> None:
+        from runnerdeck.core.installer import parse_env_text
+
+        parse_env_text(text)
+
+    @staticmethod
+    def managed_env_keys() -> tuple[str, ...]:
+        return ("https_proxy", "http_proxy", "PIP_INDEX_URL", "PSExecutionPolicyPreference")
+
+    def env_restart_allowed(self, record_id: str) -> bool:
+        return record_id in self.env_restartable
+
+    def load_job(self, record_id: str) -> None:
+        self._record("load_job", record_id)
+
+    def last_job(self, record_id: str) -> Any:
+        return self.last_jobs.get(record_id)
+
+    def save_env(self, record_id: str, text: str, *, restart: bool = False) -> None:
+        self._record("save_env", record_id, text, restart=restart)
 
     def convert_to_service(self, record_id: str) -> None:
         self._record("convert_to_service", record_id)

@@ -224,6 +224,7 @@ def test_job_notifications_follow_settings(
     expected: list[str],
 ) -> None:
     fake = fake_with_records
+    fake.is_logged_in = False  # no GitHub follow-up: failures are notified right away
     _settings(fake, notify_jobs=mode)
     rid = fake.records[0].id
     fake.runner_job_finished.emit(rid, "build", "Succeeded")
@@ -239,6 +240,7 @@ def test_job_notifications_follow_settings(
 def test_abandoned_counts_as_failure(
     tray: TrayIcon, fake_with_records: FakeController, messages: list[Message]
 ) -> None:
+    fake_with_records.is_logged_in = False
     rid = fake_with_records.records[0].id
     fake_with_records.runner_job_finished.emit(rid, "deploy", "abandoned")
     assert messages == [("pc-alpha：job 已放弃", "deploy", QSystemTrayIcon.Critical)]
@@ -310,3 +312,42 @@ def test_external_runner_offers_take_over_via_the_detail_page(
     _action(tray, f"接管 {record.name}…").trigger()
     assert window.stackedWidget.currentWidget() is window.detailPage
     assert fake_with_records.calls_of("start") == []  # nothing happens without confirmation
+
+
+def test_failed_job_notification_waits_for_the_failed_step(
+    tray: TrayIcon,
+    fake_with_records: FakeController,
+    messages: list[Message],
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime
+
+    from runnerdeck.core.models import JobSnapshot, JobStep, WorkflowJob
+    from runnerdeck.ui import tray as tray_module
+
+    fake = fake_with_records
+    first, second = (r.id for r in fake.records)
+    step = JobStep(number=5, name="Install dependencies", status="completed", conclusion="failure")
+    start = datetime(2026, 10, 26, 3, 0, tzinfo=UTC)
+    job = WorkflowJob(
+        id=1, run_id=1, name="build", status="completed", conclusion="failure",
+        started_at=start, completed_at=start.replace(minute=2), steps=[step],
+    )  # fmt: skip
+    fake.runner_job_finished.emit(first, "build", "Failed")
+    assert messages == []  # waiting for GitHub
+    fake.job_summarized.emit(first, JobSnapshot(job=job, errors=("exit code 1",)))
+    assert messages == [
+        (
+            "pc-alpha：job 失败",
+            "job build 失败（Install dependencies，耗时 2m00s）：exit code 1",
+            QSystemTrayIcon.Critical,
+        )
+    ]
+    fake.job_summarized.emit(first, JobSnapshot(job=job))  # nothing pending: no repeat
+    assert len(messages) == 1
+
+    monkeypatch.setattr(tray_module, "FAILURE_WAIT_MS", 10)
+    fake.runner_job_finished.emit(second, "deploy", "Failed")
+    qtbot.waitUntil(lambda: len(messages) == 2, timeout=2000)
+    assert messages[-1][1] == "deploy"  # GitHub never answered: the job name alone

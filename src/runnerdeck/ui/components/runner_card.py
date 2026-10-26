@@ -10,10 +10,11 @@ The confirmation helpers at module level are shared with the detail page and the
 
 from __future__ import annotations
 
+import html
 from collections.abc import Callable, Sequence
 
 from PyQt5 import sip
-from PyQt5.QtCore import QPoint, QUrl, pyqtSignal
+from PyQt5.QtCore import QPoint, Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
@@ -192,6 +193,8 @@ class RunnerCard(CardWidget):
     stop_requested = pyqtSignal(str)
     remove_requested = pyqtSignal(str, bool)
     open_dir_requested = pyqtSignal(str)
+    edit_env_requested = pyqtSignal(str)
+    job_requested = pyqtSignal(str)  # the last job's hint was clicked
     detail_requested = pyqtSignal(str)
     take_over_requested = pyqtSignal(str)
     kill_requested = pyqtSignal(str)
@@ -224,6 +227,11 @@ class RunnerCard(CardWidget):
         self.detailLabel = CaptionLabel("", self)
         self.detailLabel.setWordWrap(True)
         self.detailLabel.hide()
+        self.jobLabel = CaptionLabel("", self)  # 上次 job 失败（a link to the Job tab）
+        self.jobLabel.setTextFormat(Qt.RichText)
+        self.jobLabel.setWordWrap(True)
+        self.jobLabel.linkActivated.connect(lambda _href: self.job_requested.emit(self.record.id))
+        self.jobLabel.hide()
 
         self.startButton = PrimaryPushButton("启动", self)
         self.stopButton = PushButton("停止", self)
@@ -259,6 +267,7 @@ class RunnerCard(CardWidget):
         left.addLayout(head)
         left.addWidget(self.repoLabel)
         left.addWidget(self.detailLabel)
+        left.addWidget(self.jobLabel)
         outer.addLayout(left, 1)
 
         outer.addWidget(self.spinner)
@@ -305,6 +314,11 @@ class RunnerCard(CardWidget):
         self.detailLabel.setText(display.detail or "")
         self.detailLabel.setVisible(bool(display.detail))
         self._refresh_buttons()
+
+    def set_last_job(self, text: str | None) -> None:
+        """The last job's failure (job_log.failure_hint), shown as a link; None hides it."""
+        self.jobLabel.setText(f'<a href="job">{html.escape(text)}</a>' if text else "")
+        self.jobLabel.setVisible(bool(text))
 
     def set_busy(self, busy: bool) -> None:
         """An operation (start / stop / remove / kill …) is in flight for this runner."""
@@ -402,9 +416,11 @@ class RunnerCard(CardWidget):
         detail.triggered.connect(lambda: self.detail_requested.emit(rid))
         open_dir = Action(FIF.FOLDER, "打开目录", self)
         open_dir.triggered.connect(lambda: self.open_dir_requested.emit(rid))
+        edit_env = Action(FIF.EDIT, "编辑环境变量（.env）", self)
+        edit_env.triggered.connect(lambda: self.edit_env_requested.emit(rid))
         github = Action(FIF.GITHUB, "在 GitHub 打开", self)
         github.triggered.connect(self.open_on_github)
-        menu.addActions([detail, open_dir, github])
+        menu.addActions([detail, open_dir, edit_env, github])
         if self.record.mode is RunnerMode.SERVICE:
             grant = Action(FIF.CERTIFICATE, "授权启停…", self)
             grant.setToolTip("让你不经管理员授权启停这个服务（导入的服务 runner 需要）")

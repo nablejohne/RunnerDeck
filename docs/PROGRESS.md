@@ -10,6 +10,42 @@
 - [x] M3 日常可用（托盘、自启、Poller、导入）：验收全部通过；不单独发 v0.2.0，随 v1.0.0 一起发布
 - [x] M4 增强与发布（服务模式、Inno Setup、来源证明）→ v1.0.0（2026-10-24），桌面验收后修复发布 v1.0.1、v1.0.2
 
+## M4 之后：pip 镜像源（2026-10-26，未发版）
+
+起因：AudioTestSystem3.0 在 XM 的自托管 runner 上跑 CI，“安装依赖”9 分钟，原因是 XM 的 pip.ini 用阿里云源，被限速到 0.4 MB/s；腾讯 / 华为约 28 MB/s。
+
+- [x] core：`pip_mirror`（预设源、URL 校验、测速文件地址、逐个测速）；`AppSettings.pip_index_url`；manager 把它作为 `PIP_INDEX_URL` 管理进 runner 的 `.env`（添加时写入、启动前补齐、改设置时迁移，规则同代理：用户自己写的值不动）；`GitHubClient.measure_download`（无 Authorization、同代理，读满 16 MB 或 5 s 即停）；CLI `settings set pip_index_url`
+- [x] app / ui：设置页“pip 镜像源”卡片（下拉 + 右侧“测速”按钮），测速结果对话框按速度排序、标出当前源、可一键换成最快的
+- [x] 测试：本机全量 2587 passed（core 覆盖率 94%）；XM 上相关测试 841 passed；XM 真机测速（经代理）：腾讯 28.5、华为 28.4、中科大 8.3、PyPI 7.1、清华 5.9、阿里云 0.24 MB/s，6 个源共约 16 s
+- [x] 桌面验收（2026-10-26，用户在 XM 上用开发版）：测速、选源（华为云）写进 `.env`，用户确认符合要求
+- [ ] 发版
+
+## Job 页签：步骤进度与失败原因（2026-10-26，未发版）
+
+起因：AudioTestSystem3.0 构建时 RunnerDeck 里看不到构建过程，失败了“实时输出”“诊断日志”都看不出原因（它们是 Listener 的 stdout 和 runner 自己的日志，job 的步骤输出直接上传 GitHub）。用户选方案 A（GitHub API）；方案 B（读 `_diag/pages` 做逐行实时输出）暂不做。
+
+- [x] spike（spike-notes §13）：jobs 接口实时给步骤状态和 runner_id；运行中日志 blob 404，完成后立即可下载；步骤时间戳只到秒，不按步骤切日志
+- [x] core：`WorkflowJob` / `JobStep` / `JobSnapshot`；`GitHubClient.list_run_jobs / get_job / download_job_log`（跟随跳转不带 Authorization、上限 8 MB）；纯模块 `job_log`（清洗日志、错误行、出错前 30 行、摘要行、卡片提示、耗时）；`manager.job_snapshot`（按 runner_id 在最新 10 次运行里找，已知 id 直接读）
+- [x] app：`load_job`（运行中按 id 重读，空闲后再搜新 job）、`job_snapshot_loaded`；job 结束后跟进（4 s 间隔最多 5 次，直到 GitHub 标完成且有日志）→ 实时输出追加 `[RunnerDeck] job … 失败（步骤，耗时）：错误`、`job_summarized`
+- [x] ui：详情页 Job 页签（步骤表、错误、出错前输出、完整日志、在 GitHub 打开；运行中且可见时每 10 s 刷新）；卡片“上次 job 失败：步骤（点此查看）”→ 打开 Job 页签；托盘失败通知最多等 30 s 带上失败步骤和错误
+- [x] 测试：本机全量 2644 passed（core 覆盖率 94%）；XM 相关 940 passed；用真实 API 读 sandbox 失败 job 并渲染 Job 页签核对
+- [ ] 桌面验收（XM 开发版：跑一次成功、一次失败的 job，看 Job 页签实时刷新、卡片提示、通知）与发版
+
+## runner `.env` 编辑 + README CI 文档（2026-10-26，未发版）
+
+用户决策：`.env` 跟着每台 runner，所以入口放在概述页 runner 卡片的“⋯”菜单，不放设置页；README FAQ 只收 6 条（不要“托管分钟数受限”和“PATH 继承”两条）。
+
+- [x] core：`installer.read_env_text / parse_env_text / replace_env_file`（逐行 KEY=VALUE、键合法且不重复（不分大小写）、不支持注释（Listener 不认）、空文件即删除、原子写）；manager `read_env / write_env`、`MANAGED_ENV_KEYS`
+- [x] app：controller `read_env`（主线程）、`check_env_text`、`save_env`（worker 写入，`env_saved`）、`env_restart_allowed`（只对空闲的进程模式 runner：跑 job 时重启会取消 job；服务的状态来自 SCM 轮询，不自动串接）；“保存并重启”= 写入后 stop，停下后自动 start
+- [x] ui：卡片菜单“编辑环境变量（.env）”、`EnvEditDialog`（路径、说明、等宽编辑区、托管键提示、行号报错、“保存并重启”）、概述页保存后的提示
+- [x] README 中英文：新增“在 GitHub 仓库里使用”一节（最小 workflow、标签规则、与托管 runner 的区别、环境变量、公开仓库安全）；FAQ 新增“CI 常见问题”6 条；功能表加两行
+- [x] 测试：本机全量 2612 passed（core 覆盖率 94%）；XM 相关 975 passed；XM 上读取并解析真实的 AudioTestSystem3.0 `.env`（7 个键，含开发版写入的 PIP_INDEX_URL），在副本上写入验证，原文件未动
+- [ ] 桌面验收（卡片菜单打开对话框、保存并重启）与发版
+
+坑：测试里直接调 MessageBoxBase 的 `accept()` 会在 exec() 之外启动关闭动画，后面别的测试随机段错误；测试里把 `accept` 换成记录调用。
+
+决策：只测预设源（加上当前的自定义源）；测速走 `settings.proxy`，和 runner 里 pip 的路线一致；顺序测而不并发（并发会分带宽）；PIP_INDEX_URL 只写 `.env`，不传给 config.cmd / run.cmd（它们不跑 pip）。
+
 ## M4：已完成（2026-10-24，v1.0.0 → 验收修复 v1.0.2）
 
 契约 `docs/m4-design.md`（§13 记 spike 与实现后的修订）。用户决策：服务模式完整支持（UAC 只提权单条命令；安装时给当前用户授启停权限；服务账号只用 NETWORK SERVICE）；安装包按用户安装到 `%LOCALAPPDATA%\Programs\RunnerDeck`；顺序实现 + 最后 1 个独立 reviewer；M3 不单独发版。

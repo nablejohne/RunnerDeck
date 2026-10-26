@@ -64,6 +64,8 @@ from runnerdeck.core.models import (
     RunnerRecord,
     RunnerToken,
     StrayRunner,
+    WorkflowJob,
+    WorkflowRun,
 )
 from runnerdeck.core.process import ExternalStop, RunnerProcessInfo
 from runnerdeck.core.redact import redact
@@ -124,6 +126,9 @@ class FakeClient:
         self.release_json: dict[str, Any] = {}
         self.download_bytes = b""
         self.closed = 0
+        self.workflow_runs: list[WorkflowRun] = []  # list_runs, newest first
+        self.run_jobs: dict[int, list[WorkflowJob]] = {}
+        self.job_logs: dict[int, str | None] = {}
 
     def _call(self, name: str, *args: Any) -> None:
         self.calls.append((name, *args))
@@ -172,6 +177,22 @@ class FakeClient:
         if exc is not None:
             raise exc
         return list(self.runners.get(_key(owner, repo), []))
+
+    def list_runs(self, owner: str, repo: str, per_page: int = 10) -> list[WorkflowRun]:
+        self._call("list_runs", owner, repo, per_page)
+        return self.workflow_runs[:per_page]
+
+    def list_run_jobs(self, owner: str, repo: str, run_id: int) -> list[WorkflowJob]:
+        self._call("list_run_jobs", owner, repo, run_id)
+        return self.run_jobs.get(run_id, [])
+
+    def get_job(self, owner: str, repo: str, job_id: int) -> WorkflowJob:
+        self._call("get_job", owner, repo, job_id)
+        return next(j for jobs in self.run_jobs.values() for j in jobs if j.id == job_id)
+
+    def download_job_log(self, owner: str, repo: str, job_id: int) -> str | None:
+        self._call("download_job_log", owner, repo, job_id)
+        return self.job_logs.get(job_id)
 
     def get_runner(self, owner: str, repo: str, runner_id: int) -> RemoteRunner | None:
         self._call("get_runner", owner, repo, runner_id)
@@ -2585,6 +2606,131 @@ def test_apply_proxy_cleared_removes_our_keys_only(env: Env) -> None:
     result = env.manager.apply_proxy("http://old:1", None)
     assert env_file(ours).splitlines() == ["http_proxy=http://mine:9"]
     assert result.updated == ("ours",) and result.custom == ("ours",)
+
+
+def set_pip_index(env: Env, index_url: str | None) -> None:
+    config = env.config()
+    config.settings.pip_index_url = index_url
+    env.store.save(config)
+
+
+def test_add_runner_writes_the_pip_index_into_env(env: Env) -> None:
+    set_proxy(env, "http://proxy:8080")
+    set_pip_index(env, "https://mirror.example/simple/")
+    plan = env.manager.plan_add(OWNER, REPO)
+    progress, report = collect()
+    env.manager.add_runner(plan, progress=report)
+    assert env_file(plan.target_dir).splitlines() == [
+        "https_proxy=http://proxy:8080",
+        "http_proxy=http://proxy:8080",
+        "PIP_INDEX_URL=https://mirror.example/simple/",
+    ]
+    assert Step.ENV not in steps_of(progress)  # written silently, like the proxy
+
+
+def test_process_for_adds_a_missing_pip_index_only(env: Env) -> None:
+    set_pip_index(env, "https://new.example/simple/")
+    mine = make_runner_dir(env.root / "mine")
+    (mine / ".env").write_text("pip_index_url=https://mine.example/simple/\n", encoding="utf-8")
+    bare = make_runner_dir(env.root / "bare")
+    env.manager.process_for(env.seed(name="mine", path=str(mine)))
+    env.manager.process_for(env.seed(name="bare", path=str(bare)))
+    assert env_file(mine).splitlines() == ["pip_index_url=https://mine.example/simple/"]
+    assert env_file(bare).splitlines() == ["PIP_INDEX_URL=https://new.example/simple/"]
+
+
+def test_process_for_does_not_pass_the_pip_index_to_run_cmd(env: Env) -> None:
+    set_pip_index(env, "https://new.example/simple/")
+    record = env.seed(path=str(make_runner_dir(env.root / "p")))
+    assert env.manager.process_for(record)._env is None  # .env only: run.cmd never runs pip
+
+
+def test_apply_pip_index(env: Env) -> None:
+    def runner(name: str, env_text: str | None) -> Path:
+        runner_dir = make_runner_dir(env.root / name)
+        if env_text is not None:
+            (runner_dir / ".env").write_text(env_text, encoding="utf-8")
+        env.seed(name=name, path=str(runner_dir))
+        return runner_dir
+
+    old, new = "https://old.example/simple/", "https://new.example/simple/"
+    ours = runner("ours", f"https_proxy=http://p:1\nPIP_INDEX_URL={old}\n")
+    bare = runner("bare", None)
+    mine = runner("mine", "PIP_INDEX_URL=https://mine.example/simple/\n")
+
+    result = env.manager.apply_pip_index(old, new)
+
+    assert env_file(ours).splitlines() == ["https_proxy=http://p:1", f"PIP_INDEX_URL={new}"]
+    assert env_file(bare).splitlines() == [f"PIP_INDEX_URL={new}"]
+    assert env_file(mine).splitlines() == ["PIP_INDEX_URL=https://mine.example/simple/"]
+    assert result.updated == ("ours", "bare") and result.custom == ("mine",)
+
+    cleared = env.manager.apply_pip_index(new, None)
+    assert env_file(ours).splitlines() == ["https_proxy=http://p:1"]
+    assert not env_file(bare).strip()
+    assert cleared.updated == ("ours", "bare") and cleared.custom == ("mine",)
+
+
+def test_read_and_write_env_by_record(env: Env) -> None:
+    from runnerdeck.core.manager import MANAGED_ENV_KEYS
+
+    runner_dir = make_runner_dir(env.root / "e")
+    record = env.seed(name="e", path=str(runner_dir))
+    assert env.manager.read_env(record.id) == ""
+    env.manager.write_env("e", "GIT_CONFIG_COUNT=1\nPIP_INDEX_URL=https://m/simple/\n")
+    assert env.manager.read_env(record.id) == (
+        "GIT_CONFIG_COUNT=1\nPIP_INDEX_URL=https://m/simple/\n"
+    )
+    with pytest.raises(InvalidInputError, match="第 1 行"):
+        env.manager.write_env(record.id, "nope")
+    assert MANAGED_ENV_KEYS == (
+        "https_proxy",
+        "http_proxy",
+        "PIP_INDEX_URL",
+        "PSExecutionPolicyPreference",
+    )
+
+
+def _job(job_id: int, runner_id: int | None, status: str = "completed", **kw: Any) -> WorkflowJob:
+    return WorkflowJob(
+        id=job_id, run_id=job_id // 10, name="build", status=status, runner_id=runner_id, **kw
+    )
+
+
+def test_job_snapshot_finds_the_runners_newest_job(env: Env) -> None:
+    record = env.seed(name="j", github_runner_id=42)
+    client = env.client
+    client.workflow_runs = [
+        WorkflowRun(id=3, status="queued"),
+        WorkflowRun(id=2, status="in_progress"),
+        WorkflowRun(id=1, status="completed"),
+    ]
+    client.run_jobs = {2: [_job(20, 7)], 1: [_job(10, 42, conclusion="failure")]}
+    client.job_logs = {10: "2026-10-26T03:30:25.7Z ##[error]boom\n"}
+
+    snapshot = env.manager.job_snapshot(record.id)
+
+    assert snapshot.job is not None and snapshot.job.id == 10
+    assert snapshot.errors == ("boom",)
+    assert [c for c in client.calls if c[0] == "list_run_jobs"] == [
+        ("list_run_jobs", OWNER, REPO, 2),
+        ("list_run_jobs", OWNER, REPO, 1),
+    ]  # the queued run has no runner yet
+
+    running = _job(30, 42, status="in_progress")
+    client.run_jobs[3] = [running]
+    snapshot = env.manager.job_snapshot(record.id, job_id=30)
+    assert snapshot.job == running and snapshot.log == ()
+    assert ("download_job_log", OWNER, REPO, 30) not in client.calls  # no log while running
+
+
+def test_job_snapshot_without_a_job_or_access(env: Env) -> None:
+    record = env.seed(name="j", github_runner_id=42)
+    assert env.manager.job_snapshot(record.id).job is None
+    env.client.failures["list_runs"] = PermissionDeniedError("缺少 Actions: Read")
+    assert env.manager.job_snapshot(record.id).error == "缺少 Actions: Read"
+    bare = env.seed(name="nobody", github_runner_id=None)
+    assert "没有 GitHub id" in (env.manager.job_snapshot(bare.id).error or "")
 
 
 def test_harden_runners_root(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:

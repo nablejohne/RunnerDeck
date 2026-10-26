@@ -42,6 +42,7 @@ import psutil
 from runnerdeck.core import (
     diag,
     installer,
+    job_log,
     process,
     release,
     runner_file,
@@ -67,7 +68,9 @@ from runnerdeck.core.github_client import GitHubClient
 from runnerdeck.core.installer import RunFn
 from runnerdeck.core.models import (
     AppConfig,
+    AppSettings,
     Discovery,
+    JobSnapshot,
     LocalState,
     ProxyApplyResult,
     RemoteRunner,
@@ -76,6 +79,7 @@ from runnerdeck.core.models import (
     RunnerMode,
     RunnerRecord,
     StrayRunner,
+    WorkflowJob,
     default_runner_name,
     normalize_labels,
     validate_owner_repo,
@@ -125,6 +129,13 @@ POWERSHELL_POLICY_ENV: Mapping[str, str] = MappingProxyType(
 # `.env` keys RunnerDeck manages for settings.proxy (m4-design §3): a service-mode runner does
 # not inherit our environment, and NETWORK SERVICE has no system proxy of its own.
 PROXY_ENV_KEYS: tuple[str, ...] = ("https_proxy", "http_proxy")
+# `.env` key RunnerDeck manages for settings.pip_index_url: pip in a job prefers it over the
+# machine's pip.ini, so CI can use a faster mirror (pip_mirror).
+PIP_ENV_KEYS: tuple[str, ...] = ("PIP_INDEX_URL",)
+# Job tab: how many of the repo's newest runs are searched for this runner's job.
+JOB_SEARCH_RUNS = 10
+# Shown in the `.env` editor: keys whose value follows a RunnerDeck setting.
+MANAGED_ENV_KEYS: tuple[str, ...] = (*PROXY_ENV_KEYS, *PIP_ENV_KEYS, *POWERSHELL_POLICY_ENV)
 
 
 class Step(StrEnum):
@@ -328,6 +339,17 @@ def _proxy_env(proxy: str | None) -> dict[str, str] | None:
     if "://" not in value:
         value = f"http://{value}"
     return {"https_proxy": value, "http_proxy": value}
+
+
+def _pip_env(index_url: str | None) -> dict[str, str] | None:
+    """`.env` entries for settings.pip_index_url (config.cmd / run.cmd themselves never run
+    pip, so unlike the proxy it is not passed to them)."""
+    value = (index_url or "").strip()
+    return {"PIP_INDEX_URL": value} if value else None
+
+
+def _managed_env(settings: AppSettings) -> dict[str, str]:
+    return (_proxy_env(settings.proxy) or {}) | (_pip_env(settings.pip_index_url) or {})
 
 
 # What the user is told was left alone when repo access could not be confirmed.
@@ -730,7 +752,8 @@ class RunnerManager:
             token = client.create_registration_token(plan.owner, plan.repo)
             secret = token.token.get_secret_value()
             register_secret(secret)
-            env_updates = dict(plan.runner_env) | dict(child_env or {})
+            pip_env = _pip_env(self._store.load().settings.pip_index_url)
+            env_updates = dict(plan.runner_env) | dict(child_env or {}) | dict(pip_env or {})
             service_name: str | None = None
             if plan.mode is RunnerMode.SERVICE:
                 # Before config.cmd: the service starts right away (spike-notes §12).
@@ -1628,6 +1651,42 @@ class RunnerManager:
                 client, record.owner, record.repo, labels, now=self._clock()
             )
 
+    def job_snapshot(self, record_id: str, job_id: int | None = None) -> JobSnapshot:
+        """Job `job_id`, else the runner's current or newest job among the repo's newest
+        runs (matched by GitHub runner id), with the log summary once it completed. GitHub
+        errors (e.g. a PAT without Actions: Read) come back in `error`."""
+        record = self._require_record(self._store.load(), record_id)
+        runner_id = record.github_runner_id
+        if runner_id is None:
+            return JobSnapshot(error="这台 runner 没有 GitHub id，无法查找它的 job")
+        try:
+            with closing(self._client_factory()) as client:
+                if job_id is not None:
+                    job: WorkflowJob | None = client.get_job(record.owner, record.repo, job_id)
+                else:
+                    job = self._find_runner_job(client, record, runner_id)
+                text = None
+                if job is not None and job.done:
+                    text = client.download_job_log(record.owner, record.repo, job.id)
+        except RunnerDeckError as e:
+            log.info("job of %s unavailable: %s", record.name, e)
+            return JobSnapshot(error=str(e))
+        return job_log.summarize(job, text)
+
+    @staticmethod
+    def _find_runner_job(
+        client: GitHubClient, record: RunnerRecord, runner_id: int
+    ) -> WorkflowJob | None:
+        for run in client.list_runs(record.owner, record.repo, per_page=JOB_SEARCH_RUNS):
+            if run.status == "queued":
+                continue  # no runner yet
+            found = job_log.runner_job(
+                client.list_run_jobs(record.owner, record.repo, run.id), runner_id
+            )
+            if found is not None:
+                return found
+        return None
+
     # --- service mode (docs/m4-design.md §2.5) ------------------------------------------
 
     def _service_name_of(self, record: RunnerRecord) -> str | None:
@@ -1652,7 +1711,7 @@ class RunnerManager:
         ElevationRequiredError. A service that quits right away -> ServiceError with the
         Listener's last error (spike-notes §12)."""
         record, name = self._require_service(record_id)
-        self._sync_proxy_env(record, self._store.load().settings.proxy)
+        self._sync_managed_env(record, self._store.load().settings)
         self._control_service(name, "start", elevate=elevate)
         info = service.wait_for(
             self._services,
@@ -1737,7 +1796,7 @@ class RunnerManager:
         if pids:
             raise ProcessError(f"runner “{record.name}” 正在运行，请先停止再转为服务")
         child_env = _proxy_env(config.settings.proxy)
-        self._sync_proxy_env(record, config.settings.proxy)
+        self._sync_managed_env(record, config.settings)
         with closing(self._client_factory()) as client:
             tokens = [
                 client.create_remove_token(record.owner, record.repo).token.get_secret_value(),
@@ -1816,11 +1875,12 @@ class RunnerManager:
         )
 
     @staticmethod
-    def _sync_proxy_env(record: RunnerRecord, proxy: str | None) -> None:
-        """Before a start: put settings.proxy into `.env` where a managed key is missing
-        (runners added before M4, imported ones). Values already there are left alone:
-        apply_proxy migrates ours, the others are the user's. Best effort, never raises."""
-        wanted = _proxy_env(proxy)
+    def _sync_managed_env(record: RunnerRecord, settings: AppSettings) -> None:
+        """Before a start: put settings.proxy / settings.pip_index_url into `.env` where a
+        managed key is missing (runners added before the setting, imported ones). Values
+        already there are left alone: apply_proxy / apply_pip_index migrate ours, the others
+        are the user's. Best effort, never raises."""
+        wanted = _managed_env(settings)
         if not wanted:
             return
         runner_dir = Path(record.path)
@@ -1830,13 +1890,39 @@ class RunnerManager:
             if missing:
                 installer.write_env_file(runner_dir, missing)
         except RunnerDeckError as e:
-            log.warning("could not write the proxy into %s/.env: %s", runner_dir, e)
+            log.warning("could not write managed keys into %s/.env: %s", runner_dir, e)
+
+    def read_env(self, key: str) -> str:
+        """The runner's `.env` text for the editor ("" when it has none)."""
+        record = resolve_runner(self._store.load(), key)
+        return installer.read_env_text(Path(record.path))
+
+    def write_env(self, key: str, text: str) -> None:
+        """Replace the runner's `.env` with edited text (installer.replace_env_file); the
+        Listener reads it when it starts."""
+        record = resolve_runner(self._store.load(), key)
+        installer.replace_env_file(Path(record.path), text)
 
     def apply_proxy(self, old: str | None, new: str | None) -> ProxyApplyResult:
         """settings.proxy changed from `old` to `new`: rewrite each runner's managed `.env`
         keys that are missing or still hold `old` (deleted when `new` is empty). A key with
         any other value is the user's own and is left alone (reported in `custom`)."""
         before, after = _proxy_env(old) or {}, _proxy_env(new) or {}
+        return self._apply_managed_env("proxy", PROXY_ENV_KEYS, before, after)
+
+    def apply_pip_index(self, old: str | None, new: str | None) -> ProxyApplyResult:
+        """settings.pip_index_url changed from `old` to `new`: PIP_INDEX_URL in each runner's
+        `.env`, by the same rules as apply_proxy."""
+        before, after = _pip_env(old) or {}, _pip_env(new) or {}
+        return self._apply_managed_env("pip index", PIP_ENV_KEYS, before, after)
+
+    def _apply_managed_env(
+        self,
+        what: str,
+        keys: tuple[str, ...],
+        before: Mapping[str, str],
+        after: Mapping[str, str],
+    ) -> ProxyApplyResult:
         updated: list[str] = []
         custom: list[str] = []
         failed: list[tuple[str, str]] = []
@@ -1848,7 +1934,7 @@ class RunnerManager:
                 current = installer.read_env_values(runner_dir)
                 changes: dict[str, str | None] = {}
                 kept = False
-                for key in PROXY_ENV_KEYS:
+                for key in keys:
                     value = current.get(key.casefold())
                     target = after.get(key)
                     if value == target:
@@ -1865,7 +1951,9 @@ class RunnerManager:
             except RunnerDeckError as e:
                 failed.append((record.name, str(e)))
         log.info(
-            "proxy applied: %d updated, %d custom, %d failed", *map(len, (updated, custom, failed))
+            "%s applied: %d updated, %d custom, %d failed",
+            what,
+            *map(len, (updated, custom, failed)),
         )
         return ProxyApplyResult(tuple(updated), tuple(custom), tuple(failed))
 
@@ -1889,11 +1977,11 @@ class RunnerManager:
         """
         if record.mode is RunnerMode.SERVICE:
             raise InvalidInputError(f"runner “{record.name}” 以 Windows 服务运行，请用启动服务")
-        proxy = self._store.load().settings.proxy
-        self._sync_proxy_env(record, proxy)
+        settings = self._store.load().settings
+        self._sync_managed_env(record, settings)
         return RunnerProcess(
             Path(record.path),
-            env=_proxy_env(proxy),
+            env=_proxy_env(settings.proxy),
             on_line=on_line,
             on_state=on_state,
             on_job_finished=on_job_finished,

@@ -1,0 +1,69 @@
+{
+ "total_count": 1,
+ "jobs": [
+  {
+   "id": 121383315166,
+   "run_id": 40264339523,
+   "name": "spike",
+   "workflow_name": "spike",
+   "head_branch": "main",
+   "status": "completed",
+   "conclusion": "failure",
+   "started_at": "2026-10-26T03:29:43Z",
+   "completed_at": "2026-10-26T03:30:31Z",
+   "runner_id": 28,
+   "runner_name": "TESTPC-runnerdeck-sandbox",
+   "html_url": "https://github.com/nablejohne/runnerdeck-sandbox/actions/runs/40264339523/job/121383315166",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1,
+     "started_at": "2026-10-26T03:29:45Z",
+     "completed_at": "2026-10-26T03:29:45Z"
+    },
+    {
+     "name": "Probe (account, PATH, proxy)",
+     "status": "completed",
+     "conclusion": "skipped",
+     "number": 2,
+     "started_at": "2026-10-26T03:29:45Z",
+     "completed_at": "2026-10-26T03:29:45Z"
+    },
+    {
+     "name": "Sleep",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3,
+     "started_at": "2026-10-26T03:29:45Z",
+     "completed_at": "2026-10-26T03:30:25Z"
+    },
+    {
+     "name": "PowerShell probe (records whether the execution policy allows scripts)",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4,
+     "started_at": "2026-10-26T03:30:25Z",
+     "completed_at": "2026-10-26T03:30:25Z"
+    },
+    {
+     "name": "Fail on request",
+     "status": "completed",
+     "conclusion": "failure",
+     "number": 5,
+     "started_at": "2026-10-26T03:30:25Z",
+     "completed_at": "2026-10-26T03:30:25Z"
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6,
+     "started_at": "2026-10-26T03:30:25Z",
+     "completed_at": "2026-10-26T03:30:25Z"
+    }
+   ]
+  }
+ ]
+}

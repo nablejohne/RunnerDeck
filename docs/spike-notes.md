@@ -287,3 +287,15 @@ The runner no longer exists on the server. Cleaning up local configuration.
 
 - **服务名过长会被截断**：`LAPTOP-8LU6A21K-runnerdeck-sandbox2` 转服务后服务名是 `actions.runner.nablejohne-runnerdeck-sandbox2.LAPTOP-8LU6A21K-runnerdeck-sa-5752`（截断并加编号），显示名仍是完整的。服务名一律从 `.service` 读，不要自己拼。
 - **取消注销（D2，Windows 11 26200，结论：程序内修不了）**：开始注销时 RunnerDeck 收到 `WM_QUERYENDSESSION`（`commitDataRequest`，23:09:18 给进程 runner 发了停止信号），随后**被 Windows 直接结束**——没有 `aboutToQuit`、没有 `WM_ENDSESSION(FALSE)`，“正在关闭 2 个应用并注销”界面只列出阻止注销的窗口和一个资源管理器窗口；Tailscale、v2rayN 同样被关掉（XM 的 SSH 随即断开）。点“取消”时 RunnerDeck 早已不在，`app/session_end.py` 的恢复逻辑没有机会运行。M3 记录的“取消注销后不恢复”根因也是这个。处理：README / CHANGELOG 记为已知限制，建议需要扛住注销的 runner 用服务模式；恢复代码保留（无害，系统真的发 `WM_ENDSESSION(FALSE)` 时生效）。
+
+## 13. job 步骤与日志 spike（2026-10-26，runnerdeck-sandbox `spike.yml`，runner 2.338.1）
+
+在开发机轮询 GitHub API，XM 上的进程 runner（GitHub id 28）跑 `seconds=40 fail=true` 和 `seconds=30` 两个 job：
+
+- `GET /repos/{o}/{r}/actions/runs/{run}/jobs`：job 一开始（`in_progress`）就带 `runner_id` / `runner_name`；步骤状态是实时的（约 5 s 内看到 `in_progress` 的步骤），pending 步骤没有 `started_at`
+- `GET /actions/jobs/{id}/logs`：运行中也回 302，但跳转到的日志 blob 是 **404**；job 完成后立即可下载（纯文本，带 BOM）。所以运行中拿不到输出，只能看步骤状态
+- 日志格式：每行 `2026-10-26T03:29:45.7028124Z <text>`，带 ANSI 颜色；标记 `##[group]Run …` / `##[endgroup]` / `##[error]` / `##[warning]`；跳过的步骤不出现
+- 步骤的 `started_at` / `completed_at` 只到秒，相邻步骤常在同一秒：**不能**按时间戳把日志切到步骤 → 失败摘要取“第一条 `##[error]` 之前的 30 行”
+- 11 分钟的 AudioTestSystem3.0 构建日志只有 66 KB，整份下载没问题（上限 8 MB，超出保留末尾）
+- 找某台 runner 的 job：没有按 runner 查 job 的接口，只能列最新的运行（`runs?per_page=10`）再逐个看 jobs，按 `runner_id` 匹配；已知 job id 时 `GET /actions/jobs/{id}` 一次请求
+

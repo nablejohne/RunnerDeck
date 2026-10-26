@@ -376,3 +376,97 @@ def test_workflow_tab_loads_and_renders(
     assert "这台 runner 可以接" in page.workflowView.toPlainText()
     errors = insights_html(RepoInsights(workflow_error="缺少 Contents", runs_error="缺少 Actions"))
     assert "缺少 Contents" in errors and "缺少 Actions" in errors
+
+
+# --- Job tab (spike-notes §13) ----------------------------------------------------------------
+
+
+def _job_snapshot(status: str = "completed", **kw: object) -> object:
+    from runnerdeck.core.models import JobSnapshot, JobStep, WorkflowJob
+
+    start = datetime(2026, 10, 26, 3, 0, tzinfo=UTC)
+    done = status == "completed"
+    steps = [
+        JobStep(number=1, name="Set up job", status="completed", conclusion="success",
+                started_at=start, completed_at=start),
+        JobStep(number=2, name="Install dependencies",
+                status="completed" if done else "in_progress",
+                conclusion="failure" if done else None, started_at=start,
+                completed_at=start.replace(minute=9) if done else None),
+    ]  # fmt: skip
+    job = WorkflowJob(
+        id=9, run_id=1, name="build", workflow_name="Build Windows", status=status,
+        conclusion="failure" if done else None, started_at=start,
+        completed_at=start.replace(minute=9) if done else None,
+        html_url="https://github.com/octo/demo/actions/runs/1/job/9", steps=steps,
+    )  # fmt: skip
+    return JobSnapshot(job=job, **kw)  # type: ignore[arg-type]
+
+
+def test_job_tab_loads_and_shows_a_running_job(
+    page: RunnerDetailPage, fake_with_records: FakeController
+) -> None:
+    from runnerdeck.ui.pages.runner_detail_page import TAB_JOB
+
+    fake = fake_with_records
+    rid = fake.records[0].id
+    page.show_record(rid)
+    page.switch_tab(TAB_JOB)
+    assert fake.calls_of("load_job") == [((rid,), {})]
+    fake.job_snapshot_loaded.emit(rid, _job_snapshot("in_progress"))
+    text = page.jobView.toPlainText()
+    assert "Build Windows → build" in text and "⟳" in text and "运行中只能看到步骤状态" in text
+    assert page.jobTimer.isActive()  # live job: refreshed every 10 s
+    assert page.jobGithubButton.isEnabled() and page.jobLogView.isHidden()
+    fake.job_snapshot_loaded.emit("other", _job_snapshot())  # another runner: ignored
+    assert "运行中" in page.jobView.toPlainText()
+
+
+def test_job_tab_shows_a_failed_job_with_errors_and_log(
+    page: RunnerDetailPage, fake_with_records: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from runnerdeck.ui.pages.runner_detail_page import TAB_JOB
+
+    fake = fake_with_records
+    rid = fake.records[0].id
+    page.show_record(rid)
+    page.switch_tab(TAB_JOB)
+    snapshot = _job_snapshot(
+        errors=("Process completed with exit code 1.",),
+        excerpt=(
+            "03:09:00  ▸ Run pip install",
+            "03:09:01  错误：Process completed with exit code 1.",
+        ),
+        log=("03:00:00  Current runner version: '2.338.1'", "03:09:01  错误：boom"),
+    )
+    fake.job_snapshot_loaded.emit(rid, snapshot)
+    text = page.jobView.toPlainText()
+    assert "失败 · 9m00s" in text and "✗" in text
+    assert "Process completed with exit code 1." in text and "出错前的输出" in text
+    assert not page.jobTimer.isActive()  # finished and the runner is idle
+    assert not page.jobLogView.isHidden() and "boom" in page.jobLogView.text()
+    opened: list[str] = []
+    monkeypatch.setattr(
+        QDesktopServices, "openUrl", staticmethod(lambda url: opened.append(url.toString()) or True)
+    )
+    page.jobGithubButton.click()
+    assert opened == ["https://github.com/octo/demo/actions/runs/1/job/9"]
+
+
+def test_job_tab_error_and_empty_states(
+    page: RunnerDetailPage, fake_with_records: FakeController
+) -> None:
+    from runnerdeck.core.models import JobSnapshot
+    from runnerdeck.ui.pages.runner_detail_page import TAB_JOB, job_html
+
+    fake = fake_with_records
+    rid = fake.records[0].id
+    page.show_record(rid)
+    page.switch_tab(TAB_JOB)
+    fake.job_snapshot_loaded.emit(rid, JobSnapshot(error="缺少 Actions: Read"))
+    assert "无法读取 job：缺少 Actions: Read" in page.jobView.toPlainText()
+    assert "没有这台 runner 接过的 job" in job_html(JobSnapshot())
+    assert "还没提供这个 job 的日志" in job_html(_job_snapshot(log_pending=True))  # type: ignore[arg-type]
+    page.show_record(fake.records[1].id)  # another runner: the tab starts over
+    assert page.jobView.toPlainText() == ""
+    assert fake.calls_of("load_job")[-1] == ((fake.records[1].id,), {})
