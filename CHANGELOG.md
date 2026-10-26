@@ -5,6 +5,30 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-26
+
+### Added
+- Settings → runner → **pip 镜像源**: pick a PyPI mirror (Tencent, Huawei, Tsinghua, USTC,
+  Aliyun or PyPI itself) for CI jobs. It is written into every runner's `.env` as
+  `PIP_INDEX_URL` (which pip prefers over the machine's `pip.ini`); running runners pick it
+  up on restart. `runnerdeck-cli settings set pip_index_url <tencent|...|URL|none>` does the
+  same from the command line.
+- A **测速** button on that card downloads the same file from every mirror (at most 16 MB or
+  5 s each, through the configured proxy like the runners' pip) and lists them fastest first,
+  with a button to switch to the fastest.
+- Runner card menu → **编辑环境变量（.env）**: edit a runner's `.env` in place. Every line is
+  checked before saving (KEY=VALUE, valid and unique keys, no comments, which the runner does
+  not support); keys RunnerDeck manages are pointed out. An idle process runner can be saved
+  and restarted in one step.
+- Runner detail page → **Job** tab: the runner's current or latest job with its steps (✓ ✗ ⟳,
+  durations), refreshed every 10 s while it runs; once it ends, the errors, the lines that led
+  to the first error and the whole log (GitHub serves no log while a job runs). A failed job
+  is also summed up in 实时输出, on the runner card (a link to the Job tab) and in the tray
+  notification, which now names the failed step. Needs the PAT's Actions: Read.
+- README: a "using it from a GitHub repository" section and CI troubleshooting FAQs (jobs
+  waiting for a runner, github.com unreachable, missing pwsh, setup-python needing
+  administrator rights, `EBUSY` from git's fsmonitor, slow pip).
+
 ## [1.0.2] - 2026-10-24
 
 ### Fixed
