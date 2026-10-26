@@ -1,104 +1,172 @@
+<div align="center">
+
+<img src="src/runnerdeck/ui/resources/runnerdeck.png" width="88" alt="RunnerDeck" />
+
 # RunnerDeck
 
-Windows 桌面应用：用一个 PAT 把本机注册成多个个人仓库的 GitHub Actions self-hosted runner，并统一启停、查看状态和日志。
+**在 Windows 托盘里管理多个仓库的 GitHub Actions 自托管 runner**
 
-方案见 [docs/PLAN.md](docs/PLAN.md)，进度见 [docs/PROGRESS.md](docs/PROGRESS.md)。
+一个 PAT 登录，几步向导注册；启停、状态、日志、通知都在托盘里。
 
-## 下载与安装
+[![最新版本](https://img.shields.io/github/v/release/nablejohne/RunnerDeck?style=flat-square&label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC)](https://github.com/nablejohne/RunnerDeck/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/nablejohne/RunnerDeck/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/nablejohne/RunnerDeck/actions/workflows/ci.yml)
+[![下载量](https://img.shields.io/github/downloads/nablejohne/RunnerDeck/total?style=flat-square&label=%E4%B8%8B%E8%BD%BD)](https://github.com/nablejohne/RunnerDeck/releases)
+[![Windows 10 / 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?style=flat-square&logo=windows&logoColor=white)](#quick-start)
+[![GPL-3.0](https://img.shields.io/github/license/nablejohne/RunnerDeck?style=flat-square)](LICENSE)
 
-到 [Releases](https://github.com/nablejohne/RunnerDeck/releases) 下载其中一种：
+**简体中文** · [English](README.en.md)
 
-- **安装包** `RunnerDeck-<版本>-setup.exe`（推荐）：装到 `%LOCALAPPDATA%\Programs\RunnerDeck`，不需要管理员权限；开始菜单里有快捷方式，在“设置 → 应用”里可以卸载。升级时直接运行新版安装包（先退出 RunnerDeck）。
-- **免安装** `RunnerDeck-<版本>-win-x64.zip`：解压到任意目录（不要放在需要管理员权限的位置），双击 `RunnerDeck.exe`。同目录下的 `runnerdeck-helper.exe`（优雅停止 runner 用，必需）和 `runnerdeck-cli.exe`（命令行、服务模式的管理员操作用）不要删。
+[快速开始](#quick-start) · [功能](#features) · [工作原理](#how-it-works) · [进程 vs 服务](#modes) · [PAT 权限](#pat) · [FAQ](#faq)
 
-首次启动会弹出登录框，粘贴你的 PAT（见下文权限）。
+</div>
 
-**卸载会保留什么**：设置（`%APPDATA%\RunnerDeck`）、runner 目录、凭据管理器里的 PAT 都保留；以 Windows 服务运行的 runner 不依赖 RunnerDeck，卸载后仍在运行。要彻底清理，先在 RunnerDeck 里“移除”不需要的 runner 再卸载。
+<img src="docs/assets/dashboard.png" alt="RunnerDeck 概览页：三个 runner，分别空闲、以服务运行并在执行 job、已停止" />
 
-**SmartScreen 提示“未知发布者”属正常**：程序没有代码签名证书，点“更多信息 → 仍要运行”即可。运行前可以校验文件：
+> [!WARNING]
+> **公开仓库慎用自托管 runner**：任何人提交的 fork PR 都可能在你的电脑上执行代码。添加 runner 时 RunnerDeck 会提醒；请在仓库 Settings → Actions → General 打开“fork PR 的工作流需要批准”。
+
+<a id="features"></a>
+
+## ✨ 功能
+
+| | |
+| --- | --- |
+| 🧭 **添加向导** | 选仓库 → 填名称和标签 → 自动下载 actions/runner、校验 SHA256、注册；失败自动回滚 |
+| 🖥️ **托盘常驻** | 图标颜色即状态（灰 停止 · 绿 空闲 · 蓝 运行 job · 红 异常）；开机自启，runner 随 RunnerDeck 启动；job 成功 / 失败通知 |
+| 🛡️ **服务模式** | 以 Windows 服务运行：开机即运行、不需要登录、退出 RunnerDeck 也不停；只需一次 UAC，之后启停不再弹窗 |
+| 🔍 **Workflow 检查** | 详情页列出仓库里会用到这台 runner 的 job，标签对不上（job 会一直排队）直接指出；附最近运行记录 |
+| 📜 **实时输出与日志** | 实时输出、`_diag` 诊断日志（已脱敏）；导入已有 runner 目录、接管其他进程运行的 runner |
+| 📦 **安装与校验** | 按用户安装，不需要管理员；每个版本附 `SHA256SUMS.txt` 和 GitHub 构建来源证明；设置页检查更新 |
+
+<a id="quick-start"></a>
+
+## 🚀 快速开始
+
+1. 到 [Releases](https://github.com/nablejohne/RunnerDeck/releases/latest) 下载 `RunnerDeck-<版本>-setup.exe` 并安装（或下载 zip 解压即用）。
+2. 首次启动粘贴一个 [fine-grained PAT](https://github.com/settings/personal-access-tokens/new)（[权限见下](#pat)）。
+3. 点“添加 runner”，选仓库、填标签，需要的话勾选“以 Windows 服务运行”。
+
+<img src="docs/assets/add-service.png" alt="添加向导第二步：名称、标签、以 Windows 服务运行，以及即将执行的摘要" />
+
+<a id="how-it-works"></a>
+
+## ⚙️ 工作原理
+
+```mermaid
+flowchart LR
+    GH[("GitHub<br/>REST API")]
+    RD["RunnerDeck<br/>托盘应用"]
+    P["进程模式 runner<br/>你的账号运行"]
+    S["服务模式 runner<br/>NETWORK SERVICE"]
+    RD -- "注册 token · 状态 · workflow" --> GH
+    RD -- "config.cmd / run.cmd" --> P
+    RD -- "一次 UAC 安装 · 免授权启停" --> S
+    P -- "拉取 job" --> GH
+    S -- "拉取 job" --> GH
+```
+
+RunnerDeck 只用两样东西：GitHub REST API（取注册 token、查状态）和 runner 自带的 `config.cmd` / `run.cmd`。注册关系以 GitHub 为准，本地以每个 runner 目录的 `.runner` 为准；PAT 只存在 Windows 凭据管理器。
+
+<a id="modes"></a>
+
+## 🔀 进程模式 vs 服务模式
+
+| | 进程（默认） | Windows 服务 |
+| --- | --- | --- |
+| 谁在运行 | RunnerDeck 启动的子进程，你的账号 | Windows 服务，`NETWORK SERVICE` |
+| 什么时候运行 | RunnerDeck 运行时（可随它自动启动） | 开机即运行，不需要登录 |
+| 退出 RunnerDeck / 注销 | runner 优雅停止 | 不受影响 |
+| job 能用你的用户目录、PATH、系统代理 | ✅ | ❌（代理写进 runner 的 `.env`） |
+| 管理员授权 | 不需要 | 添加 / 转换 / 移除时各一次 UAC |
+
+<img src="docs/assets/detail-workflow.png" alt="详情页 Workflow 页签：哪些 job 能被这台 runner 接、缺少哪个标签、最近运行" />
+
+<a id="pat"></a>
+
+## 🔑 PAT 权限
+
+| 权限 | 必需 | 用途 |
+| --- | --- | --- |
+| Administration: Read and write | ✅ | 注册、注销 runner，查询 runner 状态 |
+| Contents: Read | 可选 | 详情页读取 workflow，检查标签 |
+| Actions: Read | 可选 | 详情页的最近运行记录 |
+
+Fine-grained token 在 Repository access 里选中要用的仓库；classic token 勾选 `repo` 即可。
+
+<a id="faq"></a>
+
+## ❓ FAQ
+
+<details>
+<summary><b>打开时 SmartScreen 提示“未知发布者”？</b></summary>
+
+程序没有代码签名证书，属正常。点“更多信息 → 仍要运行”。运行前可以先按下一条校验文件。
+</details>
+
+<details>
+<summary><b>怎么确认下载的文件没被篡改？</b></summary>
 
 ```powershell
 Get-FileHash .\RunnerDeck-<版本>-setup.exe -Algorithm SHA256   # 与 Release 里的 SHA256SUMS.txt 对照
+gh attestation verify RunnerDeck-<版本>-setup.exe -R nablejohne/RunnerDeck   # 确认由本仓库的 GitHub Actions 构建
 ```
+</details>
 
-```bash
-gh attestation verify RunnerDeck-<版本>-setup.exe -R nablejohne/RunnerDeck   # 构建来源证明：确认文件由本仓库的 GitHub Actions 构建
-```
+<details>
+<summary><b>卸载会删掉什么？</b></summary>
 
-## PAT 权限
+只删程序本身和指向它的开机自启项。设置（`%APPDATA%\RunnerDeck`）、runner 目录、凭据管理器里的 PAT 都保留；服务模式的 runner 不依赖 RunnerDeck，卸载后仍在运行。要彻底清理，先在 RunnerDeck 里“移除”不需要的 runner。
+</details>
 
-- **Fine-grained token**（推荐）：Repository access 选中要注册 runner 的仓库；Repository permissions 里 **Administration: Read and write**（必需）。想在详情页看 workflow 标签匹配和最近运行，再加 **Contents: Read**、**Actions: Read**（可选）。
-- **Classic token**：勾选 `repo`。
+<details>
+<summary><b>服务模式的 job 找不到 Python / uv 等工具？</b></summary>
 
-PAT 只保存在 Windows 凭据管理器，不写入文件和日志。
+服务以 `NETWORK SERVICE` 运行，读不到你的用户目录，也拿不到用户级 PATH。把需要的工具装到系统级位置（如 `C:\Program Files`），或改用进程模式。runner 根目录也不能放在用户目录里。
+</details>
 
-## 进程模式与服务模式
+<details>
+<summary><b>UAC 弹出的 <code>runnerdeck-cli.exe</code> 是什么？</b></summary>
 
-- **进程**（默认）：RunnerDeck 启动 runner，退出 RunnerDeck 时优雅停止它们；job 以你的账号运行，能用你的用户目录、PATH 和系统代理。
-- **Windows 服务**：添加时勾选“以 Windows 服务运行”，或对已停止的 runner 用“转为服务…”（会重新注册，GitHub 上的 runner id 会变）。需要一次管理员授权（UAC），之后启停不再弹窗。服务以 `NT AUTHORITY\NETWORK SERVICE` 运行：开机即运行、不需要登录，退出或卸载 RunnerDeck 都不影响它。注意：
-  - job 看不到你的用户目录，也拿不到用户级 PATH（例如装在用户目录里的 Python、uv）；需要的工具请装到系统级位置。
-  - 服务不使用你的系统代理：设置里的代理会写进 runner 目录的 `.env`，对两种模式都生效。
-  - runner 根目录不能在用户目录里（NETWORK SERVICE 无法列出它的上级目录，服务会启动失败）。
-  - 导入的服务 runner（别处装的）第一次启停前可以用“授权启停…”授权一次。
+服务模式需要管理员权限的那一步（安装 / 移除服务、授权启停）。它只执行一条预先定义的操作，参数逐项校验，请求文件读完即删、超过 10 分钟作废。信任前提与手动以管理员身份运行 `config.cmd --runasservice` 相同。
+</details>
 
-**已知限制**：注销 Windows 时 RunnerDeck 会让进程模式的 runner 优雅停止；如果你在“正在关闭 N 个应用并注销”界面点了“取消”，Windows 11 此时已经把 RunnerDeck 关掉了，需要重新打开 RunnerDeck（设为随 RunnerDeck 启动的 runner 会跟着启动）。不想受注销影响的 runner 用服务模式。
-  - UAC 弹出的是 `runnerdeck-cli.exe`：它只执行一条预先定义好的操作（注册并安装服务、注销并删除服务、启停、授权），参数逐项校验，请求文件读到就删、超过 10 分钟作废。它和 runner 目录都在你自己可写的位置，所以和手动以管理员身份运行 `config.cmd --runasservice` 一样，前提是你信任以你身份运行的其他程序。
+<details>
+<summary><b>注销时点了“取消”，runner 没有恢复？</b></summary>
 
-## 功能概览
+Windows 11 一开始注销就会关闭 RunnerDeck，等你点“取消”时它已经不在了。重新打开 RunnerDeck 即可（设为随它启动的 runner 会跟着启动）；不想受注销影响的 runner 用服务模式。
+</details>
 
-- 登录一次，列出你的仓库，几步向导把本机注册成某个仓库的 runner（自动下载并校验 actions/runner）。
-- 概览页为每个 runner 显示状态（本地进程 + GitHub 端，自动轮询）和当前 job，可单个或全部启停、打开目录、移除；点卡片进详情页看实时输出和诊断日志。
-- 常驻托盘、开机自启、随 RunnerDeck 自动启动 runner、job 失败通知。
-- 导入已有的 runner 目录；发现不归 RunnerDeck 管的 runner 进程时可以结束或接管。
-- 详情页的 Workflow 页签：仓库里哪些 job 会用到这台 runner，标签不匹配（job 会一直排队）时直接指出；最近运行记录。
-- 设置页：runner 根目录（可一键加固权限）、默认标签、代理、轮询间隔、启动与托盘、通知、主题、检查更新、更换 PAT / 退出登录。
+<details>
+<summary><b>日志在哪里？</b></summary>
 
-## 托盘
+RunnerDeck 的日志在 `%LOCALAPPDATA%\RunnerDeck\logs`（设置页“日志目录”可直接打开）；runner 自己的日志在 runner 目录的 `_diag`，详情页“诊断日志”可直接查看。
+</details>
 
-RunnerDeck 常驻任务栏右下角的托盘。图标右下角的小圆点表示整体状态：灰色全部停止，绿色在线空闲，蓝色正在执行 job，红色有 runner 出错或需要处理。
+<details>
+<summary><b>支持组织级 / 企业级 runner 吗？</b></summary>
 
-- 左键单击托盘图标打开主窗口；右键菜单可以全部启动 / 全部停止、单独启停每个 runner、退出。
-- 关闭窗口默认只是隐藏到托盘，runner 继续运行（设置 →“关闭窗口时最小化到托盘”可关掉）。
-- 托盘菜单的“退出”才真正退出：先确认（会列出正在执行的 job），再优雅停止所有 runner。
-- 再次双击 `RunnerDeck.exe` 不会开第二个实例，而是把已有窗口切到前面。
-- Windows 注销或关机时会通知所有 runner 停止，不会卡住注销。
+目前只支持仓库级 runner。
+</details>
 
-## 开机自启
+## 🛠️ 开发
 
-设置 → 启动与托盘 →“开机自启”。打开后 RunnerDeck 写入当前用户的启动项（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，不需要管理员权限），登录后以 `RunnerDeck.exe --autostart` 启动：只在托盘，不弹窗口。
+<details>
+<summary>从源码运行、测试、打包</summary>
 
-- 想让某个 runner 开机后自动上线，在添加向导里勾选“随 RunnerDeck 自动启动”，或在卡片菜单 / 详情页打开“随 RunnerDeck 启动”。RunnerDeck 启动时会拉起这些 runner；如果该目录已经有别的进程在跑，会跳过并提示。
-- 挪动了解压目录也没关系：每次启动都会检查启动项，路径不对就改写。
-- 如果在任务管理器的“启动”页把 RunnerDeck 禁用了，设置页会提示，请回任务管理器启用（RunnerDeck 不会替你改回来）。
-- 平时手动启动也想只在托盘里，打开“启动时最小化到托盘”。
-
-## 导入已有的 runner
-
-已经用官方脚本配置好的 runner 目录（含 `.runner` 文件）可以直接交给 RunnerDeck 管理：概览页“导入”→ 选择目录。导入只登记，不重新注册、不移动目录；PAT 需要能访问这个 runner 注册的仓库。
-
-- RunnerDeck 会扫描 runner 根目录：发现未登记的 runner 目录、或者不是 RunnerDeck 启动的 runner 进程，概览页顶部会出现横幅，可以逐个导入或结束进程。
-- 卡片菜单里的“取消登记”只删除 RunnerDeck 的记录，目录和 GitHub 上的注册原样保留（和“移除”不同，“移除”会注销并删除目录）。
-
-## 接管其他进程运行的 runner
-
-如果一个已登记的 runner 正被别的进程运行（比如在终端里用 `runnerdeck-cli start` 启动的），卡片会显示“被其他进程运行”，主按钮变成“接管”：RunnerDeck 结束那个进程，再自己启动它。强制结束后 GitHub 端的旧会话大约 3 分钟才过期，这段时间会显示“等待旧会话过期”，之后恢复空闲；如果当时正在执行 job，强杀会在 GitHub 上留下一个僵尸 job，确认框会提醒。
-
-## 通知
-
-job 结束时托盘弹通知，默认“仅失败”（失败或被放弃的 job），可在设置里改成“全部”或“关闭”。runner 进入出错状态时也会通知；窗口隐藏在托盘时，新发现未登记的 runner 目录或残留进程也会提示。
-
-## 从源码运行
-
-需要 Windows、Python 3.11 和 [uv](https://docs.astral.sh/uv/)：
+需要 Python 3.11 和 [uv](https://docs.astral.sh/uv/)。
 
 ```powershell
-uv sync
-uv run python -m runnerdeck          # 图形界面（加 --autostart 只在托盘启动）
-uv run runnerdeck-cli --help         # 调试 CLI
-uv run pytest                        # 测试（macOS/Linux 上 Windows 专属用例自动跳过）
-pwsh scripts/build.ps1               # 打包到 dist\RunnerDeck 和 dist\*.zip
+uv sync                                   # 安装依赖
+uv run python -m runnerdeck               # 运行
+uv run runnerdeck-cli --help              # 命令行（排障用）
+uv run pytest                             # 测试
+pwsh scripts/build.ps1                    # 打包 zip + setup.exe（需要 Inno Setup 6）
+uv run python scripts/screenshots.py      # 重新生成 README 截图
 ```
 
-## 许可
+方案见 [docs/PLAN.md](docs/PLAN.md)，进度见 [docs/PROGRESS.md](docs/PROGRESS.md)，runner 实测结论见 [docs/spike-notes.md](docs/spike-notes.md)。
+</details>
 
-GPL-3.0，见 [LICENSE](LICENSE)。
+## 📄 许可
+
+[GPL-3.0](LICENSE)
